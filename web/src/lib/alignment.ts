@@ -28,6 +28,7 @@
 import { nfc } from "./hebrew.ts";
 import { extractPlainText, PARAGRAPH_TAGS, isWordLabelNode } from "./usfm.ts";
 import { tokenizeEditableText } from "./replace.ts";
+import { topLevelRefs } from "./bridgeSource.ts";
 
 export interface SourceWord {
   id: string;
@@ -42,6 +43,11 @@ export interface SourceWord {
   occurrence: string;
   occurrences: string;
   content?: string;
+  // `x-ref` ("9:12"): the source verse this word sits in. tCore writes it on
+  // every milestone of a bridged verse, where x-occurrence counts within that
+  // one source verse rather than across the whole bridge (#1401). Absent on
+  // most milestones; a bridge milestone without it counts across the bridge.
+  ref?: string;
 }
 
 export interface TargetWord {
@@ -221,6 +227,7 @@ function sourceOf(node: ParsedNode): SourceWord {
   if (node["lemma"] !== undefined) out.lemma = String(node["lemma"]);
   if (node["morph"] !== undefined) out.morph = String(node["morph"]);
   if (node["content"] !== undefined) out.content = String(node["content"]);
+  if (node["ref"] !== undefined) out.ref = String(node["ref"]);
   return out;
 }
 
@@ -262,6 +269,9 @@ function sameSourceChain(a: SourceWord[], b: SourceWord[]): boolean {
     if (a[i].strong !== b[i].strong) return false;
     if (effectiveOccurrence(a[i]) !== effectiveOccurrence(b[i])) return false;
     if (nfc(a[i].content ?? "") !== nfc(b[i].content ?? "")) return false;
+    // Inside a bridge each verse numbers its own occurrences: אֶת 1/1 in 9:11
+    // and אֶת 1/1 in 9:12 are different tokens (#1401).
+    if ((a[i].ref ?? "") !== (b[i].ref ?? "")) return false;
   }
   return true;
 }
@@ -427,8 +437,12 @@ function finalize(state: Omit<AlignmentState, "groups" | "unaligned">): Alignmen
 // strip עַל(2) out of its compound and the second עַל silently vanishes from
 // the cards (its source word stays bound — hover still bridges it — but no
 // chip renders).
+//
+// A word with an x-ref adds it: inside a bridge, occurrence counts per source
+// verse, so the same content|occurrence can name a token in each verse (#1401).
 export function sourceWordKey(s: SourceWord): string {
-  return `${nfc(s.content ?? "")}|${s.occurrence}`;
+  const key = `${nfc(s.content ?? "")}|${s.occurrence}`;
+  return s.ref ? `${key}|${s.ref}` : key;
 }
 
 // Whole-chain key, used to fuse adjacent groups that wrap the same source.
@@ -510,7 +524,7 @@ export function cardKey(g: AlignmentGroup, sourcePos: Map<string, number>): stri
         const p = sourcePos.get(s.id) ?? -1;
         return p >= 0
           ? `p${p}.${s.occurrence}`
-          : `${s.strong}|${nfc(s.content ?? "")}|${s.occurrence}`;
+          : `${s.strong}|${nfc(s.content ?? "")}|${s.occurrence}${s.ref ? `|${s.ref}` : ""}`;
       })
       .join("~")
   );
@@ -848,6 +862,11 @@ interface CollectedSourceWord {
   text: string;
   textKey: string;
   textOccurrence: number;
+  // In a joined bridge source only (bridgeSource.ts): the source verse this
+  // word sits in, spelled as tCore's x-ref, and its occurrence counted within
+  // that verse. Undefined / equal to textOccurrence everywhere else.
+  ref?: string;
+  refOccurrence: number;
 }
 
 // The ALIGNER's source-word walk. Deliberately NOT highlight.ts's
@@ -863,6 +882,9 @@ interface CollectedSourceWord {
 function collectAlignerSourceWords(verseObjects: unknown[]): CollectedSourceWord[] {
   const out: CollectedSourceWord[] = [];
   const textCounts = new Map<string, number>();
+  const refCounts = new Map<string, number>();
+  // Set per top-level node when this is a joined bridge source (#1401).
+  let ref: string | undefined;
   let pos = 0;
   const walkSrc = (nodes: unknown[]) => {
     for (const n of nodes ?? []) {
@@ -873,7 +895,13 @@ function collectAlignerSourceWords(verseObjects: unknown[]): CollectedSourceWord
         const textKey = nfc(text);
         const tOcc = (textCounts.get(textKey) ?? 0) + 1;
         textCounts.set(textKey, tOcc);
-        out.push({
+        let rOcc = tOcc;
+        if (ref !== undefined) {
+          const rk = refTextKey(ref, textKey);
+          rOcc = (refCounts.get(rk) ?? 0) + 1;
+          refCounts.set(rk, rOcc);
+        }
+        const word: CollectedSourceWord = {
           position: pos++,
           strong: String(o["strong"] ?? ""),
           lemma: String(o["lemma"] ?? ""),
@@ -881,7 +909,10 @@ function collectAlignerSourceWords(verseObjects: unknown[]): CollectedSourceWord
           text,
           textKey,
           textOccurrence: tOcc,
-        });
+          refOccurrence: rOcc,
+        };
+        if (ref !== undefined) word.ref = ref;
+        out.push(word);
       } else if (
         o["type"] === "milestone" ||
         // \d (Psalm superscription) — tag alone, not `type:"section"`:
@@ -901,8 +932,34 @@ function collectAlignerSourceWords(verseObjects: unknown[]): CollectedSourceWord
       }
     }
   };
-  walkSrc(verseObjects);
+  const refs = Array.isArray(verseObjects) ? topLevelRefs(verseObjects) : null;
+  if (refs) {
+    verseObjects.forEach((n, i) => {
+      ref = refs[i];
+      walkSrc([n]);
+    });
+  } else {
+    walkSrc(verseObjects);
+  }
   return out;
+}
+
+function refTextKey(ref: string, textKey: string): string {
+  return `${ref}\u0000${textKey}`;
+}
+
+// The source words a milestone's x-occurrence counts over. Inside a joined
+// bridge source, a word whose x-ref names one of the bridged verses counts
+// within that verse (tCore's format, #1401); every other word (no x-ref, an
+// x-ref this source does not hold, or a single-verse source) counts across
+// the whole source, as before.
+function occurrenceScope(
+  sourceWords: CollectedSourceWord[],
+  s: SourceWord,
+): CollectedSourceWord[] {
+  if (!s.ref) return sourceWords;
+  const scoped = sourceWords.filter((sw) => sw.ref === s.ref);
+  return scoped.length > 0 ? scoped : sourceWords;
 }
 
 function findSourcePosition(
@@ -910,11 +967,12 @@ function findSourcePosition(
   s: SourceWord,
 ): number {
   const want = parseInt(s.occurrence, 10) || 1;
+  const scope = occurrenceScope(sourceWords, s);
   if (s.content) {
     const wantKey = nfc(s.content);
     let count = 0;
     let firstPos = -1;
-    for (const sw of sourceWords) {
+    for (const sw of scope) {
       if (sw.textKey === wantKey) {
         count++;
         if (firstPos === -1) firstPos = sw.position;
@@ -926,7 +984,7 @@ function findSourcePosition(
   if (s.strong) {
     let count = 0;
     let firstPos = -1;
-    for (const sw of sourceWords) {
+    for (const sw of scope) {
       if (sw.strong === s.strong) {
         count++;
         if (firstPos === -1) firstPos = sw.position;
@@ -1048,8 +1106,7 @@ export function reformGluedMilestones(
   const sourceWords = collectAlignerSourceWords(sourceVerseObjects);
   if (sourceWords.length === 0) return targetVerseObjects;
   const folds = sourceWords.map((sw) => sourceFold(sw.text));
-  const totals = new Map<string, number>();
-  for (const sw of sourceWords) totals.set(sw.textKey, (totals.get(sw.textKey) ?? 0) + 1);
+  const totals = sourceOccurrenceTotals(sourceWords);
 
   // Every contiguous UHB run whose concatenated fold equals `contentFold`; a
   // unique match disambiguates, anything else is refused.
@@ -1081,13 +1138,18 @@ export function reformGluedMilestones(
             const chain: SourceWord[] = [];
             for (let k = run.start; k < run.start + run.len; k++) {
               const sw = sourceWords[k];
+              // Keep the glued milestone's own convention: an x-ref'd one in a
+              // bridge counts per source verse (#1401), anything else across
+              // the whole source.
+              const perVerse = o["ref"] !== undefined && sw.ref !== undefined;
               const reW: SourceWord = {
                 id: uid(),
                 strong: sw.strong,
-                occurrence: String(sw.textOccurrence),
-                occurrences: String(totals.get(sw.textKey) ?? 1),
+                occurrence: String(perVerse ? sw.refOccurrence : sw.textOccurrence),
+                occurrences: String(totals.get(perVerse ? refTextKey(sw.ref!, sw.textKey) : sw.textKey) ?? 1),
                 content: sw.text,
               };
+              if (perVerse) reW.ref = sw.ref;
               if (sw.lemma) reW.lemma = sw.lemma;
               if (sw.morph) reW.morph = sw.morph;
               chain.push(reW);
@@ -1206,17 +1268,18 @@ function resolveExactPosition(
 ): number {
   const want = parseInt(s.occurrence, 10) || 1;
   const content = s.content;
+  const scope = occurrenceScope(sourceWords, s);
   if (content) {
     const wantKey = nfc(content);
     let count = 0;
-    for (const sw of sourceWords) {
+    for (const sw of scope) {
       if (sw.textKey === wantKey && ++count === want) return sw.position;
     }
     return -1;
   }
   if (s.strong) {
     let count = 0;
-    for (const sw of sourceWords) {
+    for (const sw of scope) {
       if (sw.strong === s.strong && ++count === want) return sw.position;
     }
   }
@@ -1271,7 +1334,9 @@ export function detectDoubledSourceMilestones(
 function zalnDedupKey(node: ParsedNode): string | null {
   const content = node["content"];
   if (typeof content !== "string" || content === "") return null;
-  return `${nfc(content)}|${String(node["occurrence"] ?? "1")}`;
+  const key = `${nfc(content)}|${String(node["occurrence"] ?? "1")}`;
+  // Per-verse occurrence inside a bridge (#1401): the verse is part of the token.
+  return node["ref"] !== undefined ? `${key}|${String(node["ref"])}` : key;
 }
 
 function subtreeHasZalnKey(nodes: unknown[], key: string): boolean {
@@ -1386,7 +1451,11 @@ function renumberSourceOccurrences(
     if (g.source.length === 0) return g;
     const candidates: CollectedSourceWord[][] = [];
     for (const s of g.source) {
-      const matches = s.content ? byKey.get(nfc(s.content)) : undefined;
+      let matches = s.content ? byKey.get(nfc(s.content)) : undefined;
+      // An x-ref'd word in a bridge counts within its own source verse (#1401).
+      if (matches && s.ref && sourceWords.some((sw) => sw.ref === s.ref)) {
+        matches = matches.filter((sw) => sw.ref === s.ref);
+      }
       if (!matches || matches.length === 0) return g; // no anchor — never guess
       candidates.push(matches);
     }
@@ -1535,30 +1604,53 @@ function withSourceCoverage(
   // Keyed by textKey (NFC) — textOccurrence was counted per textKey in
   // collectAlignerSourceWords, so totals must use the same key or two raw-different
   // / NFC-equal tokens get occurrence=2 with occurrences=1 (malformed).
-  const textTotals = new Map<string, number>();
-  for (const sw of sourceWords) {
-    textTotals.set(sw.textKey, (textTotals.get(sw.textKey) ?? 0) + 1);
-  }
+  const textTotals = sourceOccurrenceTotals(sourceWords);
   const placeholders: AlignmentGroup[] = [];
   for (const sw of sourceWords) {
     if (covered.has(sw.position)) continue;
     placeholders.push({
       id: uid(),
-      source: [
-        {
-          id: uid(),
-          strong: sw.strong,
-          lemma: sw.lemma,
-          morph: sw.morph,
-          occurrence: String(sw.textOccurrence),
-          occurrences: String(textTotals.get(sw.textKey) ?? 1),
-          content: sw.text,
-        },
-      ],
+      source: [{ id: uid(), ...collectedSourceAttrs(sw, textTotals) }],
       targets: [],
     });
   }
   return { ...base, sourceGroups: [...base.sourceGroups, ...placeholders] };
+}
+
+// Total occurrences per surface, keyed the way collectedSourceAttrs reads them:
+// across the whole source, and per bridged source verse (#1401).
+function sourceOccurrenceTotals(sourceWords: CollectedSourceWord[]): Map<string, number> {
+  const totals = new Map<string, number>();
+  for (const sw of sourceWords) {
+    totals.set(sw.textKey, (totals.get(sw.textKey) ?? 0) + 1);
+    if (sw.ref !== undefined) {
+      const rk = refTextKey(sw.ref, sw.textKey);
+      totals.set(rk, (totals.get(rk) ?? 0) + 1);
+    }
+  }
+  return totals;
+}
+
+// Milestone attributes for a source word built from the source text: an empty
+// placeholder card, which is what every newly aligned word starts as. Inside a
+// joined bridge source this is tCore's format: x-occurrence counted within the
+// word's own source verse, and x-ref naming that verse (#1401). Elsewhere it
+// counts across the source and writes no x-ref, as before.
+function collectedSourceAttrs(
+  sw: CollectedSourceWord,
+  totals: Map<string, number>,
+): Omit<SourceWord, "id"> {
+  const perVerse = sw.ref !== undefined;
+  const out: Omit<SourceWord, "id"> = {
+    strong: sw.strong,
+    lemma: sw.lemma,
+    morph: sw.morph,
+    occurrence: String(perVerse ? sw.refOccurrence : sw.textOccurrence),
+    occurrences: String(totals.get(perVerse ? refTextKey(sw.ref!, sw.textKey) : sw.textKey) ?? 1),
+    content: sw.text,
+  };
+  if (perVerse) out.ref = sw.ref;
+  return out;
 }
 
 function buildMilestone(source: SourceWord, children: ParsedNode[]): ParsedNode {
@@ -1575,6 +1667,8 @@ function buildMilestone(source: SourceWord, children: ParsedNode[]): ParsedNode 
   if (source.occurrence)           out["occurrence"] = source.occurrence;
   if (source.occurrences)          out["occurrences"] = source.occurrences;
   if (source.content !== undefined) out["content"] = source.content;
+  // tCore writes x-ref last, after x-content (#1401).
+  if (source.ref !== undefined)     out["ref"] = source.ref;
   out["children"] = children;
   out["endTag"] = "zaln-e\\*";
   return out;

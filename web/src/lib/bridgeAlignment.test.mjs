@@ -16,6 +16,7 @@ import {
   moveSource,
   moveTargets,
   moveTarget,
+  dropDuplicateSourceMilestones,
 } from "./alignment.ts";
 import { buildSourceIndexMap, resolveSourcePos } from "./alignmentHover.ts";
 import { concatSourceRange } from "./verseRange.ts";
@@ -132,13 +133,16 @@ const baseline = (() => {
   const state = parseAlignment(vo, svo);
   const word = state.stream.find((x) => x.kind === "word" && x.word.text === "Ophir");
   const out = serializeAlignment(moveTarget(state, word.word.id, "u"));
-  const want = verseUsfm(freshTarget().json, vo).replace(
-    /\\w Ophir\|x-occurrence="1" x-occurrences="1"\\w\*\\zaln-e\\\*/,
-    "\\zaln-e\\*\n\\w Ophir|x-occurrence=\"1\" x-occurrences=\"1\"\\w*",
+  // The מֵאוֹפִיר milestone now closes after "to"; "Ophir" stands outside it.
+  const want = baseline.replace(
+    String.raw`\w to|x-occurrence="4" x-occurrences="7"\w*` + "\n" + String.raw`\w Ophir|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*,`,
+    String.raw`\w to|x-occurrence="4" x-occurrences="7"\w*\zaln-e\*` + "\n" + String.raw`\w Ophir|x-occurrence="1" x-occurrences="1"\w*,`,
   );
   const got = verseUsfm(json, out);
   assert(want !== baseline, "expected text differs from the baseline only at 'Ophir'");
   assert(got === want, "only the 'Ophir' milestone boundary changed");
+  const after = milestones(out);
+  assert(after.length === 65 && after.every((m) => m.ref), "all 65 milestones keep x-ref after the drag");
 }
 
 // ── 4. the panel resolves an x-ref'd word inside its own source verse ─────────
@@ -204,6 +208,16 @@ const baseline = (() => {
   const base = usfm.toUSFM(tj, { forcedNewLines: true });
   tj.chapters["7"]["4"].verseObjects = serializeAlignment(parseAlignment(vo, sj.chapters["7"]["4"].verseObjects));
   assert(usfm.toUSFM(tj, { forcedNewLines: true }) === base, "x-ref=\"7:4\" kept");
+}
+
+// ── 7. doubled-source dedup: same surface 1/1 in two bridged verses is not a duplicate ─
+{
+  console.log("\n[7] dropDuplicateSourceMilestones keeps אֶת 1/1 of 9:11 and אֶת 1/1 of 9:12 in one card");
+  const z = (ref, children) => ({ tag: "zaln", type: "milestone", strong: "H0853", content: "אֶת", occurrence: "1", occurrences: "1", ref, children, endTag: "zaln-e\\*" });
+  const card = [z("9:11", [z("9:12", [{ text: "them", tag: "w", type: "word", occurrence: "1", occurrences: "1" }])])];
+  assert(dropDuplicateSourceMilestones(card) === card, "two verses' tokens are not collapsed");
+  const dup = [z("9:12", [z("9:12", [{ text: "them", tag: "w", type: "word", occurrence: "1", occurrences: "1" }])])];
+  assert(dropDuplicateSourceMilestones(dup) !== dup, "the same verse's token twice is still collapsed");
 }
 
 if (failed) {

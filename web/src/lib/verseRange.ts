@@ -13,6 +13,7 @@
 // reading `verses[bv][n]` directly.
 
 import type { VerseDto } from "../sync/api";
+import { markBridgeSource, type BridgeVerseStart } from "./bridgeSource.ts";
 import {
   countQuoteMatches,
   highlightsFor,
@@ -309,6 +310,7 @@ function buildSourceRange(
   end: number,
 ): VerseDto | null {
   const combined: unknown[] = [];
+  const verseStarts: BridgeVerseStart[] = [];
   let lastVerseSeen: VerseDto | null = null;
   for (const row of rows) {
     if (!row) continue;
@@ -319,9 +321,14 @@ function buildSourceRange(
       // Light separator so consecutive sources don't run together visually.
       combined.push({ type: "text", text: " " });
     }
+    verseStarts.push({ index: combined.length, ref: `${row.chapter}:${row.verse}` });
     combined.push(...content.verseObjects);
   }
   if (combined.length === 0 || !lastVerseSeen) return null;
+  // Where each source verse starts, for the aligner's per-verse x-occurrence
+  // and x-ref inside a bridge (#1401). A side table, so other walkers of this
+  // array see exactly the nodes they did before.
+  markBridgeSource(combined, verseStarts);
 
   // Return a synthetic DTO; never persisted, never PATCHed. Carries the
   // span so the AlignmentPanel title can show "UHB 6-9".
