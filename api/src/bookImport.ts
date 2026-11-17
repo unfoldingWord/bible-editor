@@ -203,7 +203,8 @@ books.delete("/:book/lock", requireEditor, async (c) => {
 });
 
 // POST /api/books/:book/lock/push — push a just-locked book to Door43 right
-// now, across every resource, instead of waiting for the nightly export.
+// now, for the resources the admin ticked (all five when the body names
+// none, #1406), instead of waiting for the nightly export.
 // Scenario this exists for: a book is unlocked for an editor to fix
 // something, then re-locked — without this, those edits sit in D1 until the
 // next 05:30 UTC cron, or someone remembers to trigger a manual export.
