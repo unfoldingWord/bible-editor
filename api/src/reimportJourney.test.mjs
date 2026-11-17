@@ -6347,7 +6347,7 @@ console.log("\n[issue #1404: whole-verse sort_order]");
       .prepare(`SELECT version, updated_by, last_change_action, last_change_source FROM tn_rows WHERE id = 'm53p'`)
       .all()[0];
     eq([m53p.version, m53p.updated_by], [1, PERSON], "(2) no version bump, and the row stays the person's");
-    eq([m53p.last_change_action, m53p.last_change_source], ["sync_reorder", "dcs_sync"], "(2) stamped like the sort-only fast path");
+    eq([m53p.last_change_action, m53p.last_change_source], [null, null], "(2) provenance untouched: a renumber is not anyone's change");
     eq(sqlite.prepare(`SELECT COUNT(*) AS n FROM edit_log`).all()[0].n, 0, "(2) no edit_log row: order is not content");
 
     const again = await applyTsvRows(env, NUM, "tn", nfc, null);
@@ -6440,6 +6440,68 @@ console.log("\n[issue #1404: whole-verse sort_order]");
     );
     eq(counts.updated, 2, "(5) the two rewritten questions update");
     eq(order(sqlite, "tq_rows", 2, 1), "q1q1 q2q2 q3q3", "(5) tq keeps master's order too (before #1404: q1q1 q3q3 q2q2)");
+  }
+
+  // (6) Review F1: the person dragged the verse, then edited every dragged
+  //     row, so no `reorder` stamp is left. Any user change newer than the
+  //     confirmed export still keeps D1's order.
+  {
+    const { sqlite, env } = freshEnv();
+    seedReordered(sqlite, 500);
+    sqlite.prepare(`UPDATE tn_rows SET last_change_action = 'update', updated_at = 550 WHERE book = ?`).run(NUM);
+    await applyTsvRows(env, NUM, "tn", masterABC(), null, { confirmedAt: 400, editId: null });
+    eq(order(sqlite, "tn_rows", 3, 4), "c3cc a1aa b2bb", "(6) a later edit over the reorder stamp does not hand the order to master");
+  }
+
+  // (7) Master adds a note to a verse already in its order: the new note is
+  //     numbered between its neighbours and no other row is written.
+  {
+    const { sqlite, env } = freshEnv();
+    for (const [id, sort] of [["a1aa", 100], ["b2bb", 300], ["c3cc", 500]]) seedTn(sqlite, tnAt(id, 7, 1), { sort });
+    const counts = await applyTsvRows(
+      env, NUM, "tn", [tnAt("a1aa", 7, 1), tnAt("b2bb", 7, 1), tnAt("n4nn", 7, 1), tnAt("c3cc", 7, 1)], null,
+    );
+    eq(counts.inserted, 1, "(7) the new note is inserted");
+    eq(order(sqlite, "tn_rows", 7, 1), "a1aa b2bb n4nn c3cc", "(7) …in master's place");
+    eq([sortOf(sqlite, "tn_rows", "n4nn"), counts.reordered], [400, 0], "(7) …between its neighbours, with nothing renumbered");
+  }
+
+  // (8) A person-owned verse with no integer room for master's new note is
+  //     renumbered in the person's order (Codex review: the old fallback
+  //     dropped the note in at master position x 100).
+  {
+    const { sqlite, env } = freshEnv();
+    seedPerson(sqlite);
+    const stamp = { action: "reorder", source: "user", updatedAt: 500 };
+    seedTn(sqlite, tnAt("c3cc", 8, 1), { sort: 100, ...stamp });
+    seedTn(sqlite, tnAt("a1aa", 8, 1), { sort: 101, ...stamp });
+    seedTn(sqlite, tnAt("b2bb", 8, 1), { sort: 102, ...stamp });
+    await applyTsvRows(
+      env, NUM, "tn", [tnAt("a1aa", 8, 1), tnAt("n4nn", 8, 1), tnAt("b2bb", 8, 1), tnAt("c3cc", 8, 1)], null,
+      { confirmedAt: 400, editId: null },
+    );
+    eq(order(sqlite, "tn_rows", 8, 1), "c3cc a1aa n4nn b2bb", "(8) no room: the verse is renumbered in the person's order");
+    const stamps = sqlite.prepare(`SELECT last_change_action AS a FROM tn_rows WHERE id IN ('a1aa','b2bb','c3cc')`).all();
+    eq(stamps.every((s) => s.a === "reorder"), true, "(8) …and the person's reorder stamps survive the renumber");
+  }
+
+  // (9) Review F2: a renumber must not erase a named Door43 change, which
+  //     keeps an AI-written note a person fixed on Door43 out of AI
+  //     replacement (keptNotes.ts isDoor43PersonChange).
+  {
+    const { sqlite, env } = freshEnv();
+    seedTn(sqlite, tnAt("a1aa", 9, 1), { sort: 200, action: "sync_merge", source: "dcs_sync" });
+    sqlite.prepare(`UPDATE tn_rows SET last_change_actor = 'Door43 (commits by Richard)' WHERE id = 'a1aa'`).run();
+    seedTn(sqlite, tnAt("b2bb", 9, 1), { sort: 100 });
+    const counts = await applyTsvRows(env, NUM, "tn", [tnAt("a1aa", 9, 1), tnAt("b2bb", 9, 1)], null);
+    eq(order(sqlite, "tn_rows", 9, 1), "a1aa b2bb", "(9) master's order is adopted");
+    eq(counts.reordered, 2, "(9) …as a renumber");
+    const a = sqlite.prepare(`SELECT last_change_action, last_change_actor, updated_at FROM tn_rows WHERE id = 'a1aa'`).all()[0];
+    eq(
+      [a.last_change_action, a.last_change_actor, a.updated_at],
+      ["sync_merge", "Door43 (commits by Richard)", 100],
+      "(9) …and the row keeps its named Door43 provenance and updated_at",
+    );
   }
 }
 

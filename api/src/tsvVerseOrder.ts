@@ -12,31 +12,38 @@
 // so m53p moved from 5th to 8th.
 //
 // This module decides, per verse and BEFORE any write, which number each row
-// should carry, so every write path and one final sort-only batch agree:
+// should carry, so every write path and one final sort-only batch agree.
 //
-//  - Who owns the verse's order. A person's in-app reorder (rows.ts's
-//    reorder fast path stamps `last_change_action='reorder'`,
-//    `last_change_source='user'`) newer than the last export master is
-//    confirmed to hold has not reached master yet, so D1's order wins (the
-//    HOS 11 reorder-revert fix, kept). Otherwise master owns the order. tq
-//    has no in-app reorder, so master always owns a tq verse.
+//  1. Who owns the verse's order. If a person changed anything in the verse
+//     in-app since the last export master is confirmed to hold (a live row
+//     with `last_change_source='user'` and `updated_at` after
+//     `master_confirmed_at`), D1's order stands: that person's reorder (the
+//     HOS 11 reorder-revert fix) may not have reached master yet. Any user
+//     action counts, not only `reorder`, because a later edit, preserve or
+//     trash on a dragged row replaces its `reorder` stamp. With no confirmed
+//     export at all, only a `reorder` stamp counts (otherwise every verse a
+//     person ever touched would hold master's order back forever). Otherwise
+//     master owns the order. tq has no in-app reorder, so master always owns
+//     a tq verse.
 //
-//  - Master-owned verse. If D1's current order already equals master's (with
-//    D1-only rows, such as unexported in-app notes, kept after the row they
-//    follow now), every row keeps its current number: no churn on a clean
-//    verse, and a content rewrite no longer moves the row. Otherwise the
-//    whole verse is renumbered 100, 200, ... in that order, so written and
-//    unwritten rows never mix scales.
+//  2. The target order. Master-owned: master's order, with each D1-only row
+//     (an unexported in-app note, say) kept right after the row it follows in
+//     D1 now. D1-owned: D1's order, with each row entering from master placed
+//     right after its master predecessor.
 //
-//  - Locally-owned verse. Existing rows keep their numbers, including a row
-//    whose content master rewrote. A row entering the verse from master gets
-//    a number between its master predecessor and the next local row when the
-//    gap allows; otherwise it falls back to master position x 100 (the old
-//    behavior), and the caller handles that.
+//  3. The numbers. If the existing rows' numbers already rise along the
+//     target order, they are kept (no churn on a clean verse, and a content
+//     rewrite no longer moves its row), and each run of entering rows gets
+//     numbers between its neighbours. If they do not rise, a number is NULL,
+//     or an entering run has no room, the whole verse is renumbered 100, 200,
+//     ... along the target order, so written and unwritten rows never mix
+//     scales.
 //
-// Known limit: there is no stored "order at last export" to compare with, so
-// when BOTH a person and master reordered the same verse since that export,
-// the person's order wins and the next export carries it to master.
+// Known limits: there is no stored "order at last export" to compare with, so
+// when both a person and master reordered the same verse since that export,
+// the person's order wins and the next export carries it to master. And if
+// master rewrites every row a person touched AND that night's export is held,
+// the user-change evidence is gone the night after.
 //
 // Pure: no D1, no clock. bookReimport.ts reads the rows and applies the plan.
 
@@ -64,16 +71,17 @@ export function verseOrderKey(id: string, chapter: number, verse: number): strin
 export interface VerseOrderPlan {
   /** verseOrderKey -> planned sort_order. Absent = no plan (caller keeps its old numbering). */
   planned: Map<string, number>;
-  /** Verses whose order a pending in-app reorder owns (kept as D1 has them). */
+  /** Verses whose order D1 keeps because a person changed the verse since the last confirmed export. */
   localOwnedVerses: number;
-  /** Master-owned verses whose order disagreed with master and are renumbered. */
+  /** Verses renumbered as a whole. */
   renumberedVerses: number;
 }
 
-/** A person's in-app reorder that master has not yet been confirmed to hold. */
-export function isPendingUserReorder(r: LiveOrderRow, confirmedAt: number | null): boolean {
-  if (r.last_change_action !== "reorder" || r.last_change_source !== "user") return false;
-  return confirmedAt == null || (r.updated_at ?? 0) > confirmedAt;
+/** A person's in-app change that master has not yet been confirmed to hold. */
+export function isPendingUserChange(r: LiveOrderRow, confirmedAt: number | null): boolean {
+  if (r.last_change_source !== "user") return false;
+  if (confirmedAt == null) return r.last_change_action === "reorder";
+  return (r.updated_at ?? 0) > confirmedAt;
 }
 
 // The export's order: sort_order ascending with NULLs last, then id.
@@ -83,6 +91,25 @@ function compareLive(a: LiveOrderRow, b: LiveOrderRow): number {
   if (an !== bn) return an ? 1 : -1;
   if (!an && a.sort_order !== b.sort_order) return (a.sort_order as number) - (b.sort_order as number);
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+// Insert each `others` id (in its given order) right after the nearest
+// preceding id from `order` that is already in `base`; at the front when
+// nothing precedes it. `order` is the sequence the anchors are read from.
+function anchorInto(base: string[], order: string[], others: Set<string>): string[] {
+  const target = [...base];
+  let lastPlaced: string | null = null;
+  let front = 0;
+  for (const id of order) {
+    if (!others.has(id)) {
+      if (target.includes(id)) lastPlaced = id;
+      continue;
+    }
+    if (lastPlaced == null) target.splice(front++, 0, id);
+    else target.splice(target.indexOf(lastPlaced) + 1, 0, id);
+    lastPlaced = id;
+  }
+  return target;
 }
 
 export function planVerseSortOrders(
@@ -113,92 +140,64 @@ export function planVerseSortOrders(
 
   for (const [k, { chapter, verse, ids: masterIds }] of masterByVerse) {
     const local = (liveByVerse.get(k) ?? []).slice().sort(compareLive);
-    const key = (id: string) => verseOrderKey(id, chapter, verse);
-
-    if (kind === "tn" && local.some((r) => isPendingUserReorder(r, confirmedAt))) {
-      localOwnedVerses++;
-      planLocalOwned(masterIds, local, key, planned);
-      continue;
-    }
-
-    // Master-owned: master's order, with each D1-only row kept right after
-    // the row it follows in D1 now (or at the front when nothing precedes it).
+    const localIds = local.map((r) => r.id);
+    const localSet = new Set(localIds);
     const masterSet = new Set(masterIds);
-    const target = [...masterIds];
-    let lastPlaced: string | null = null;
-    let front = 0;
-    for (const r of local) {
-      if (masterSet.has(r.id)) {
-        lastPlaced = r.id;
-        continue;
-      }
-      if (lastPlaced == null) target.splice(front++, 0, r.id);
-      else target.splice(target.indexOf(lastPlaced) + 1, 0, r.id);
-      lastPlaced = r.id;
+
+    let target: string[];
+    if (kind === "tn" && local.some((r) => isPendingUserChange(r, confirmedAt))) {
+      localOwnedVerses++;
+      // D1's order; rows entering from master go after their master predecessor.
+      target = anchorInto(localIds, masterIds, new Set(masterIds.filter((id) => !localSet.has(id))));
+    } else {
+      // Master's order; D1-only rows stay after the row they follow in D1.
+      target = anchorInto(masterIds, localIds, new Set(localIds.filter((id) => !masterSet.has(id))));
     }
-    const localIds = new Set(local.map((r) => r.id));
-    const targetLocal = target.filter((id) => localIds.has(id));
-    const sameOrder =
-      targetLocal.length === local.length && targetLocal.every((id, i) => id === local[i].id);
-    const entering = masterIds.some((id) => !localIds.has(id));
-    // A NULL number has no scale to keep, so it forces a renumber too.
-    const allNumbered = local.every((r) => r.sort_order != null);
-    if (sameOrder && !entering && allNumbered) {
-      for (const r of local) planned.set(key(r.id), r.sort_order as number);
-      continue;
+
+    const numbers = keepNumbers(target, new Map(local.map((r) => [r.id, r.sort_order])));
+    const key = (id: string) => verseOrderKey(id, chapter, verse);
+    if (numbers) {
+      for (const [id, n] of numbers) planned.set(key(id), n);
+    } else {
+      renumberedVerses++;
+      target.forEach((id, i) => planned.set(key(id), (i + 1) * 100));
     }
-    renumberedVerses++;
-    target.forEach((id, i) => planned.set(key(id), (i + 1) * 100));
   }
   return { planned, localOwnedVerses, renumberedVerses };
 }
 
-// Locally-owned verse: existing rows keep their numbers; each run of rows
-// entering from master is slotted between its master predecessor and the
-// next local row when there is room for it.
-function planLocalOwned(
-  masterIds: string[],
-  local: LiveOrderRow[],
-  key: (id: string) => string,
-  planned: Map<string, number>,
-): void {
-  const numbered = local.filter((r) => r.sort_order != null);
-  for (const r of numbered) planned.set(key(r.id), r.sort_order as number);
-  if (numbered.length === 0) return;
-  const localIds = new Set(local.map((r) => r.id));
-  const posOf = new Map(numbered.map((r, i) => [r.id, i]));
-
-  let i = 0;
-  while (i < masterIds.length) {
-    if (localIds.has(masterIds[i])) {
-      i++;
+// Keep every existing row's number and slot the rest between their
+// neighbours, or return null when that cannot give a strictly rising
+// sequence along `target` (existing numbers out of order, a NULL number, or
+// no integer room for an entering run).
+function keepNumbers(target: string[], current: Map<string, number | null>): Map<string, number> | null {
+  const out = new Map<string, number>();
+  let prev: number | null = null;
+  let run: string[] = [];
+  const flush = (next: number | null): boolean => {
+    if (run.length === 0) return true;
+    const lo = prev ?? 0;
+    if (next == null) {
+      run.forEach((id, n) => out.set(id, lo + (n + 1) * 100));
+    } else {
+      const step = (next - lo) / (run.length + 1);
+      const values = run.map((_, n) => Math.floor(lo + step * (n + 1)));
+      if (!values.every((v, n) => v > lo && v < next && (n === 0 || v > values[n - 1]))) return false;
+      run.forEach((id, n) => out.set(id, values[n]));
+    }
+    run = [];
+    return true;
+  };
+  for (const id of target) {
+    if (!current.has(id)) {
+      run.push(id);
       continue;
     }
-    // A run of entering rows; its anchor is the nearest numbered local row
-    // before it in master's order.
-    const run: string[] = [];
-    let j = i;
-    while (j < masterIds.length && !localIds.has(masterIds[j])) run.push(masterIds[j++]);
-    let anchor = -1;
-    for (let p = i - 1; p >= 0; p--) {
-      const pos = posOf.get(masterIds[p]);
-      if (pos != null) {
-        anchor = pos;
-        break;
-      }
-    }
-    const prev = anchor >= 0 ? (numbered[anchor].sort_order as number) : 0;
-    const nextRow = numbered[anchor + 1];
-    if (nextRow == null) {
-      run.forEach((id, n) => planned.set(key(id), prev + (n + 1) * 100));
-    } else {
-      const next = nextRow.sort_order as number;
-      const step = (next - prev) / (run.length + 1);
-      const values = run.map((_, n) => Math.floor(prev + step * (n + 1)));
-      const fits = values.every((v, n) => v > prev && v < next && (n === 0 || v > values[n - 1]));
-      // No room: leave these unplanned so the caller keeps master position x 100.
-      if (fits) run.forEach((id, n) => planned.set(key(id), values[n]));
-    }
-    i = j;
+    const n = current.get(id);
+    if (n == null || (prev != null && n <= prev)) return null;
+    if (!flush(n)) return null;
+    out.set(id, n);
+    prev = n;
   }
+  return flush(null) ? out : null;
 }

@@ -1861,7 +1861,7 @@ function parseTsvRow(r: Record<string, string>, kind: TsvKind): ParsedTsvRow | n
 // sort_order: for tn/tq, a whole-verse plan made before any write
 // (planVerseSortOrders, tsvVerseOrder.ts, issue #1404): a verse whose D1 order
 // already matches master keeps its numbers, a verse that disagrees is
-// renumbered as a whole, and a verse a person reordered in-app since the last
+// renumbered as a whole, and a verse a person changed in-app since the last
 // confirmed export keeps D1's order. twl keeps the per-verse file ordinal
 // (makeVerseSortOrder); its canonical post-pass owns twl order. The pristine guard +
 // version-CAS stay ON each UPDATE, so a translator edit landing between the read
@@ -3428,27 +3428,30 @@ export async function applyTsvRows(
     }
   }
 
-  // Issue #1404: apply the whole-verse order plan to every live row the
-  // writes above did not already number — content-identical rows, rows a
-  // person edited (m53p in NUM 1:2), protected rows, and D1-only rows. Before
-  // this, those rows kept a number from an older import while rewritten rows
-  // took master position x 100, and the mixed scales scrambled the verse.
-  // Version-neutral and no edit_log row, like the sort-only batch above and
-  // rows.ts's reorder fast path (#687: order is not content). The WHERE pins
-  // the verse and the number this run read, because an in-app drag does not
-  // bump version: a drag (or a move) landing after the read leaves 0 changes
-  // and wins.
+  // Issue #1404: apply the whole-verse order plan to every live row whose
+  // number still differs from it: content-identical rows, rows a person edited
+  // (m53p in NUM 1:2), protected rows, D1-only rows, and any row whose own
+  // write above lost its version-CAS race (otherwise that one row would keep
+  // its old-scale number while its siblings moved). A row whose write above
+  // already landed its planned number fails the `sort_order IS` guard and is
+  // left alone. Before this, rows nobody rewrote kept an older import's number
+  // while rewritten rows took master position x 100, and the mixed scales
+  // scrambled the verse.
+  //
+  // sort_order ONLY: no version bump and no edit_log row (#687: order is not
+  // content), and deliberately no `updated_at` or provenance stamp either,
+  // unlike the sort-only batch above. Provenance here is load-bearing:
+  // keptNotes.ts isDoor43PersonChange keeps a note out of AI replacement only
+  // while its last change is a named-person Door43 sync_merge, and
+  // planVerseSortOrders reads a person's recent in-app change from
+  // last_change_source/updated_at. Restamping a whole verse would erase both.
+  //
+  // The WHERE pins the verse and the number this run read, because an in-app
+  // drag does not bump version: a drag (or a move) landing after the read
+  // leaves that row's write at 0 changes.
   if (orderPlan) {
-    const carried = new Set<string>([
-      ...updates.map((u) => u.row.id),
-      ...reorders.map((u) => u.id),
-      ...aiReseeds.map((u) => u.row.id),
-      ...resurrects.map((u) => u.row.id),
-      ...reclaims.map((u) => u.row.id),
-    ]);
     const verseReorders: Array<{ r: LiveOrderRow; sortOrder: number }> = [];
     for (const r of liveForOrder) {
-      if (carried.has(r.id)) continue;
       const p = orderPlan.planned.get(verseOrderKey(r.id, r.chapter, r.verse));
       if (p != null && p !== r.sort_order) verseReorders.push({ r, sortOrder: p });
     }
@@ -3458,16 +3461,10 @@ export async function applyTsvRows(
         const results = await env.DB.batch(
           slice.map(({ r, sortOrder }) =>
             env.DB.prepare(
-              // #686: sync_reorder — master's order, attributed like the
-              // sort-only batch above.
-              `UPDATE ${TSV_TABLE[kind]} SET sort_order = ?1, updated_at = ?2, ${provenanceSet(3)}
-                 WHERE id = ?6 AND book = ?7 AND deleted_at IS NULL
-                   AND chapter = ?8 AND verse = ?9 AND sort_order IS ?10`,
-            ).bind(
-              sortOrder, now,
-              ...provenanceValues({ action: "sync_reorder", source: "dcs_sync", actor: door43 }),
-              r.id, book, r.chapter, r.verse, r.sort_order,
-            ),
+              `UPDATE ${TSV_TABLE[kind]} SET sort_order = ?1
+                 WHERE id = ?2 AND book = ?3 AND deleted_at IS NULL
+                   AND chapter = ?4 AND verse = ?5 AND sort_order IS ?6`,
+            ).bind(sortOrder, r.id, book, r.chapter, r.verse, r.sort_order),
           ),
         );
         results.forEach((res) => {
