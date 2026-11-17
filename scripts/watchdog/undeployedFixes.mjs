@@ -20,9 +20,9 @@ import { execFileSync } from "node:child_process";
 export const DATA_LOSS_LABEL = "data-loss";
 export const REPO_SLUG = "unfoldingWord/bible-editor";
 export const VERSION_URL = "https://bible-editor-api.unfoldingword.workers.dev/version.json";
-// Newest-first; a fix older than this many merged labelled PRs has long since
-// shipped, and every PR costs one compare call.
-const PR_LIMIT = 50;
+// Every labelled PR costs one compare call. If the list ever fills this, the
+// oldest PRs may be missing, which collectUndeployedFixes reports (never silent).
+export const PR_LIMIT = 200;
 
 // "3d 1h", "1h 45m", "12m": how long a fix has been waiting.
 export function formatAge(ms) {
@@ -90,16 +90,23 @@ export function undeployedLines(result, { deployedCommit } = {}) {
   return lines;
 }
 
-const defaultRun = (cmd, args) => execFileSync(cmd, args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+// timeout: a hung gh must not hang the whole watchdog run.
+const defaultRun = (cmd, args) =>
+  execFileSync(cmd, args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"], timeout: 60_000 });
 
-// The commit production runs. The query string is a cache-buster: without it
-// the edge served the previous commit right after a deploy.
-export function fetchDeployedVersion(run = defaultRun, now = Date.now()) {
-  const v = JSON.parse(run("curl", ["-s", "-m", "20", `${VERSION_URL}?x=${now}`]));
+// "unknown" (a build with no git) and anything else that is not a sha cannot be
+// compared, and must not read as "nothing is undeployed".
+export function assertDeployedVersion(v) {
   if (typeof v?.commit !== "string" || !/^[0-9a-f]{7,40}$/.test(v.commit)) {
     throw new Error(`version.json has no usable commit: ${JSON.stringify(v).slice(0, 200)}`);
   }
   return v;
+}
+
+// The commit production runs. The query string is a cache-buster: without it
+// the edge served the previous commit right after a deploy.
+export function fetchDeployedVersion(run = defaultRun, now = Date.now()) {
+  return assertDeployedVersion(JSON.parse(run("curl", ["-s", "-m", "20", `${VERSION_URL}?x=${now}`])));
 }
 
 // Merged, labelled PRs into main. Never writes.
@@ -132,8 +139,10 @@ export function mergeShaInDeploy(mergeSha, deployedCommit, run = defaultRun) {
   return null;
 }
 
-export function collectUndeployedFixes({ run = defaultRun, nowMs = Date.now() } = {}) {
-  const deployed = fetchDeployedVersion(run, nowMs);
+// `deployed` lets the caller reuse the version.json it already fetched, so the
+// report's "Deployed:" line and this check cannot name different commits.
+export function collectUndeployedFixes({ run = defaultRun, nowMs = Date.now(), deployed: given = null } = {}) {
+  const deployed = given ? assertDeployedVersion(given) : fetchDeployedVersion(run, nowMs);
   const prs = listMergedDataLossPrs(run);
   const result = findUndeployedFixes({
     deployedCommit: deployed.commit,
@@ -141,5 +150,8 @@ export function collectUndeployedFixes({ run = defaultRun, nowMs = Date.now() } 
     isAncestor: (sha, deployedCommit) => mergeShaInDeploy(sha, deployedCommit, run),
     nowMs,
   });
+  if (prs.length >= PR_LIMIT) {
+    result.unchecked.push({ number: "?", title: `PR list reached its ${PR_LIMIT} limit`, reason: "older merged data-loss PRs were not checked" });
+  }
   return { deployed, ...result };
 }

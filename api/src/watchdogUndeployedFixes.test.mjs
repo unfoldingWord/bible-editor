@@ -10,6 +10,7 @@ import {
   findUndeployedFixes,
   formatAge,
   mergeShaInDeploy,
+  PR_LIMIT,
   undeployedLines,
 } from "../../scripts/watchdog/undeployedFixes.mjs";
 
@@ -82,6 +83,14 @@ assert(formatAge(45 * 60_000) === "45m" && formatAge(105 * 60_000) === "1h 45m" 
   const shipped = collectUndeployedFixes({ run: (cmd, args) => (args[0] === "api" ? "ahead\n" : run(cmd, args)), nowMs: NOW });
   assert(shipped.undeployed.length === 0, "collect: 'ahead' (deployed contains the merge commit) means shipped");
   assert(mergeShaInDeploy("a", "b", () => "identical\n") === true && mergeShaInDeploy("a", "b", () => "diverged\n") === false && mergeShaInDeploy("a", "b", () => "weird") === null, "mergeShaInDeploy maps compare statuses");
+  const reused = collectUndeployedFixes({ run: (cmd, args) => { if (cmd === "curl") throw new Error("must not refetch"); return run(cmd, args); }, nowMs: NOW, deployed: { commit: "4b47dbf" } });
+  assert(reused.undeployed.length === 1, "collect: a deployed version the caller already fetched is reused, not refetched");
+  const full = collectUndeployedFixes({
+    run: (cmd, args) => (args[0] === "pr" ? JSON.stringify(Array.from({ length: PR_LIMIT }, (_, i) => ({ number: i + 1, title: "t", url: "u", mergedAt: "2026-11-01T00:00:00Z", mergeCommit: { oid: "c" + i } }))) : args[0] === "api" ? "ahead\n" : run(cmd, args)),
+    nowMs: NOW,
+    deployed: { commit: "4b47dbf" },
+  });
+  assert(full.undeployed.length === 0 && full.unchecked.some((u) => /limit/.test(u.title)), "collect: a PR list that hit its limit is flagged, not silently truncated");
   let threw = false;
   try { fetchDeployedVersion(() => "{\"commit\":\"unknown\"}"); } catch { threw = true; }
   assert(threw, "an unusable deployed commit (unknown) is an error, not 'nothing undeployed'");
