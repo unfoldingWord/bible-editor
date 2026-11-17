@@ -405,5 +405,57 @@ const only = (rows, src) => lintTnQuotes(rows, src);
     "two distinct accented surfaces each numbered 1/1 pass (the ULT convention)");
 }
 
+// ── Bridged target verses: per-source-verse counting (#1396) ─────────────────
+// 2CH UST 9:10-12 / 32:3-4: published tCore-aligned UST (DEU, MAT) counts a
+// word's occurrences per SOURCE verse inside a target bridge, so אֶת found once
+// in 9:11 and once in 9:12 is aligned 1/1 twice. bible-editor's own 2CH data
+// also holds the span convention (1/2 and 2/2). Both must pass; a total that
+// matches neither must still flag.
+{
+  const ET = "אֶת";
+  const ASHER = "אֲשֶׁר";
+  const src = [
+    sourceVerse(9, 10, ["וְ⁠גַם", "עַבְדֵי", "חוּרָם"]),
+    sourceVerse(9, 11, ["וַ⁠יַּעַשׂ", "הַ⁠מֶּלֶךְ", ET, "עֲצֵי", ASHER, "הֵבִיאוּ"]),
+    sourceVerse(9, 12, ["נָתַן", ET, "כָּל", "חֶפְצָהּ", ASHER, "שָׁאָלָה", ASHER, "הֵבִיאָה"]),
+  ];
+  const bridge = (milestones) => [{ ...alignedVerse(9, 10, "UST", milestones), verse_end: 12 }];
+
+  const perVerse = bridge([
+    { content: ET, occurrence: 1, occurrences: 1, words: ["the"] },
+    { content: ASHER, occurrence: 1, occurrences: 1, words: ["that"] },
+    { content: ET, occurrence: 1, occurrences: 1, words: ["everything"] },
+    { content: ASHER, occurrence: 1, occurrences: 2, words: ["that"] },
+    { content: ASHER, occurrence: 2, occurrences: 2, words: ["which"] },
+  ]);
+  const perVerseIssues = lintAlignmentOccurrences(perVerse, src);
+  assert(perVerseIssues.length === 0,
+    `a bridge counted per source verse (the tCore/published convention) passes: ${JSON.stringify(perVerseIssues.map((i) => i.message))}`);
+
+  const span = bridge([
+    { content: ET, occurrence: 1, occurrences: 2, words: ["the"] },
+    { content: ET, occurrence: 2, occurrences: 2, words: ["everything"] },
+    { content: ASHER, occurrence: 1, occurrences: 3, words: ["that"] },
+    { content: ASHER, occurrence: 3, occurrences: 3, words: ["which"] },
+  ]);
+  assert(lintAlignmentOccurrences(span, src).length === 0,
+    "a bridge counted across the whole span still passes");
+
+  // A total that matches neither the span (2) nor any single verse (1).
+  const wrongTotal = bridge([{ content: ET, occurrence: 1, occurrences: 3, words: ["the"] }]);
+  const wt = lintAlignmentOccurrences(wrongTotal, src);
+  assert(wt.length === 1 && wt[0].check === "Alignment declares the wrong occurrence count",
+    "a bridge total matching neither convention is flagged");
+
+  // The ZEC 8:1 shape inside a bridge: occurrence 2 of a total of 1.
+  const outOfRange = bridge([
+    { content: ET, occurrence: 1, occurrences: 1, words: ["the"] },
+    { content: ET, occurrence: 2, occurrences: 1, words: ["everything"] },
+  ]);
+  const oor = lintAlignmentOccurrences(outOfRange, src);
+  assert(oor.length === 1 && oor[0].check === "Alignment occurrence out of range",
+    "an occurrence beyond its own declared total in a bridge is flagged");
+}
+
 if (failures) { console.error(`\n${failures} assertion(s) failed`); process.exit(1); }
 console.log("\nall lintQuotes assertions passed");
