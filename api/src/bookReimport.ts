@@ -3471,6 +3471,10 @@ export async function applyTsvRows(
           if ((res?.meta.changes ?? 0) > 0) counts.reordered++;
         });
       } catch (e) {
+        // Withhold the watermark: the SHA gate would otherwise skip this
+        // chapter until master changes again, and tonight's export would push
+        // the uncorrected order to master (Codex review).
+        counts.apply_incomplete = true;
         counts.errors.push(`${kind} verse reorder batch: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
