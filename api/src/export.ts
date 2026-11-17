@@ -1303,6 +1303,13 @@ export interface KeepMasterPlan {
 // person re-syncs first (#1403).
 export const MASTER_MOVED_REFUSE_THRESHOLD = 20;
 
+// A Reference compared for meaning: whitespace and the dash used in a range
+// ("1:1-3" vs "1:1–3") are formatting, and must not read as a Door43 move,
+// which refuses the whole push.
+function refKey(ref: string | undefined): string {
+  return (ref ?? "").normalize("NFC").replace(/\s+/g, "").replace(/[‐-―−]/g, "-");
+}
+
 // Null unless the header starts with exactly `headers`: the plan indexes cells
 // by position and splices master's raw line into ours, so a reordered or
 // foreign column layout must not be read as ours.
@@ -1310,7 +1317,7 @@ function tsvRowsByUniqueId(
   raw: string,
   headers: readonly string[],
 ): { rows: Map<string, string[]>; dupes: Set<string> } | null {
-  const lines = raw.split(/\r?\n/).filter((l) => l.length > 0);
+  const lines = raw.replace(/^\uFEFF/, "").split(/\r?\n/).filter((l) => l.length > 0);
   if (lines.length === 0) return null;
   if (lines[0].split("\t").slice(0, headers.length).join("\t") !== headers.join("\t")) return null;
   const rows = new Map<string, string[]>();
@@ -1362,11 +1369,11 @@ export function planKeepMasterRows(
     const masterCells = master.rows.get(id);
     if (!baseCells || !masterCells) continue; // new or deleted row: the shrink guard's territory
     const oursUnchanged =
-      (oursCells[refIdx] ?? "") === (baseCells[refIdx] ?? "") &&
+      refKey(oursCells[refIdx]) === refKey(baseCells[refIdx]) &&
       [...contentIdx, tagsIdx].every((i) => oursSame(oursCells, baseCells, i));
     if (!oursUnchanged) continue; // we changed it: today's behaviour
     const fields = contentIdx.filter((i) => !same(masterCells, baseCells, i)).map((i) => headers[i]);
-    const refMoved = (masterCells[refIdx] ?? "") !== (baseCells[refIdx] ?? "");
+    const refMoved = refKey(masterCells[refIdx]) !== refKey(baseCells[refIdx]);
     if (fields.length === 0 && !refMoved) continue; // master did not move substantively
     const row = { id, ref: masterCells[refIdx] ?? "", fields: refMoved ? ["Reference", ...fields] : fields };
     if (refMoved) {

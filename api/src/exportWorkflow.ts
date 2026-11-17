@@ -1258,13 +1258,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           // D1's own render beside the pushed one, so the next export compares
           // D1 against what D1 was (not against the kept rows we pushed), which
           // keeps the kept rows kept until D1 itself changes them. Tied to the
-          // pushed bytes by sha; baseBlobSha/baseMode let a step.do retry of
+          // pushed bytes by sha; basesha/basemode let a step.do retry of
           // this instance reuse this run's verdict. Written FIRST: if the put
           // below then fails, the step retries before anything is recorded.
           const pushedSha = await gitBlobSha(built.content);
           await this.env.BLOBS.put(d1RenderKey(r2Key), d1Render, {
             httpMetadata: { contentType: "text/tab-separated-values" },
-            customMetadata: { pushedBlobSha: pushedSha, baseBlobSha: guard.baseBlobSha, baseMode: guard.mode },
+            // Lowercase keys: R2 metadata travels as HTTP headers in some paths.
+            customMetadata: { pushedsha: pushedSha, basesha: guard.baseBlobSha, basemode: guard.mode },
           });
           // The R2 copy at r2Key must hold the bytes that ship: it is the
           // pushed render the next export and the sync read back by hash.
@@ -3597,8 +3598,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       let mode: "full" | "carry" | null = null;
       if (retry) {
         const marker = await this.env.BLOBS.head(d1RenderKey(r2Key));
-        if (marker?.customMetadata?.baseBlobSha === pointer.blobSha) {
-          mode = marker.customMetadata?.baseMode === "carry" ? "carry" : "full";
+        if (marker?.customMetadata?.basesha === pointer.blobSha) {
+          mode = marker.customMetadata?.basemode === "carry" ? "carry" : "full";
         }
       } else if (prior.pushed_read_at != null && prior.master_confirmed_at === prior.pushed_read_at) {
         mode = "full";
@@ -3626,7 +3627,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       let d1Base: string | null = null;
       if (pointer.r2Key) {
         const d1 = await this.env.BLOBS.get(d1RenderKey(pointer.r2Key));
-        if (d1 && d1.customMetadata?.pushedBlobSha === pointer.blobSha) d1Base = await d1.text();
+        if (d1 && d1.customMetadata?.pushedsha === pointer.blobSha) d1Base = await d1.text();
       }
       if (mode == null) {
         if (d1Base == null) return notMeasured("base_not_proven_on_master");

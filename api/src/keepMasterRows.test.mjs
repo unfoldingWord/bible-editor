@@ -124,6 +124,15 @@ console.log("\n[review round 1: what still counts as our change, and as a Door43
   const swapped = base.replace("SupportReference\tQuote", "Quote\tSupportReference");
   ok(planKeepMasterRows(base, base, swapped, "tn") === null, "a master with reordered columns → null");
 
+  // Review round 2: a Reference that differs only in spacing or dash form is
+  // not a move (it would refuse the whole push), and a BOM does not switch
+  // the guard off.
+  const ranged = tn([row("1:1-3", "aa11", "Same note.")]);
+  const dashOnly = planKeepMasterRows(ranged, ranged, tn([row("1:1–3 ", "aa11", "Same note.")]), "tn");
+  ok(dashOnly.moved.length === 0 && dashOnly.kept.length === 0, "a dash/space-only Reference difference is not a move");
+  const bomMaster = "﻿" + tn([row("1:1", "aa11", "Door43 wording.")]);
+  ok(planKeepMasterRows(base, base, bomMaster, "tn")?.kept.length === 1, "a master file with a BOM is still measured");
+
   // onlyIds restricts the plan (carry mode).
   const two = tn([row("1:1", "aa11", "A."), row("1:2", "bb22", "B.")]);
   const twoMaster = tn([row("1:1", "aa11", "A fixed."), row("1:2", "bb22", "B fixed.")]);
