@@ -22,6 +22,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { classifyVisibleAdoptionChange } from "../../api/src/visibleAdoptionChange.ts";
+import { collectUndeployedFixes, undeployedLines } from "./undeployedFixes.mjs";
 import { TSV_KINDS, classifyTsvReviewFlags, sinceEpoch, tsvReviewFlagsLine, tsvReviewFlagsSql } from "./tsvReviewFlags.mjs";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -64,8 +65,13 @@ function step(name, fn) {
 }
 
 bundle.deployed = step("deployed version", () =>
-  JSON.parse(execFileSync("curl", ["-s", "-m", "20", "https://bible-editor-api.unfoldingword.workers.dev/version.json"], { encoding: "utf8" })),
+  // Cache-buster: without it the edge served the previous commit right after a deploy.
+  JSON.parse(execFileSync("curl", ["-s", "-m", "20", `https://bible-editor-api.unfoldingword.workers.dev/version.json?x=${Date.now()}`], { encoding: "utf8" })),
 );
+
+// #1405: merged `data-loss` PRs the deployed commit does not contain. Read-only
+// (curl + gh GETs). A fix merged but not deployed stays live until someone ships.
+bundle.undeployedFixes = step("undeployed data-loss fixes", () => collectUndeployedFixes({ deployed: bundle.deployed }));
 
 bundle.syncRun = step("sync_run_log", () => ({
   byStatus: q(`SELECT event_type, status, count(*) n FROM sync_run_log
@@ -341,6 +347,7 @@ const summary = [
       ].filter(Boolean).join("; "),
   ``,
   `- Deployed: ${bundle.deployed?.commit ?? "unknown"}`,
+  `- Merged data-loss fixes not yet deployed: ${bundle.undeployedFixes == null ? "unknown (check failed)" : `${bundle.undeployedFixes.undeployed.length}${bundle.undeployedFixes.unchecked.length ? ` (plus ${bundle.undeployedFixes.unchecked.length} UNCHECKED, so not a clean result)` : ""}`} (see section below)`,
   `- Nightly run rows (nightly-${day}): ${byStatus == null ? "unknown" : byStatus.map((r) => `${r.event_type}/${r.status}=${r.n}`).join(", ") || "none"}`,
   `- Item rows not success/skip: ${n(bundle.syncRun?.notable?.length)}`,
   runCompletedLine(bundle.syncRun?.completed),
@@ -351,6 +358,10 @@ const summary = [
     : `- Open review rows: unknown (query failed)`,
   tsvReviewFlagsLine(bundle.openReviews.tsv, { failed: tsvFailed }),
   `- Proposed resolve: ${proven.length} row(s), ${qualifying.length} editor alert(s)${proven.length ? " — see proposed-resolve.sql" : ""}`,
+  ``,
+  `## Undeployed data-loss fixes`,
+  ``,
+  ...undeployedLines(bundle.undeployedFixes, { deployedCommit: bundle.undeployedFixes?.deployed?.commit ?? bundle.deployed?.commit }),
   ``,
   `## export_revert alerts`,
   ``,
