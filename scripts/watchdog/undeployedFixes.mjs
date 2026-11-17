@@ -113,7 +113,8 @@ export function fetchDeployedVersion(run = defaultRun, now = Date.now()) {
 export function listMergedDataLossPrs(run = defaultRun) {
   const raw = run("gh", [
     "pr", "list", "--repo", REPO_SLUG, "--state", "merged", "--label", DATA_LOSS_LABEL, "--base", "main",
-    "--limit", String(PR_LIMIT), "--json", "number,title,url,mergedAt,mergeCommit",
+    // One past the limit, so "exactly PR_LIMIT" and "more than PR_LIMIT" differ.
+    "--limit", String(PR_LIMIT + 1), "--json", "number,title,url,mergedAt,mergeCommit",
   ]);
   return JSON.parse(raw).map((p) => ({
     number: p.number,
@@ -143,15 +144,17 @@ export function mergeShaInDeploy(mergeSha, deployedCommit, run = defaultRun) {
 // report's "Deployed:" line and this check cannot name different commits.
 export function collectUndeployedFixes({ run = defaultRun, nowMs = Date.now(), deployed: given = null } = {}) {
   const deployed = given ? assertDeployedVersion(given) : fetchDeployedVersion(run, nowMs);
-  const prs = listMergedDataLossPrs(run);
+  const listed = listMergedDataLossPrs(run);
+  const truncated = listed.length > PR_LIMIT;
+  const prs = truncated ? listed.slice(0, PR_LIMIT) : listed;
   const result = findUndeployedFixes({
     deployedCommit: deployed.commit,
     prs,
     isAncestor: (sha, deployedCommit) => mergeShaInDeploy(sha, deployedCommit, run),
     nowMs,
   });
-  if (prs.length >= PR_LIMIT) {
-    result.unchecked.push({ number: "?", title: `PR list reached its ${PR_LIMIT} limit`, reason: "older merged data-loss PRs were not checked" });
+  if (truncated) {
+    result.unchecked.push({ number: "?", title: `PR list passed its ${PR_LIMIT} limit`, reason: "older merged data-loss PRs were not checked" });
   }
   return { deployed, ...result };
 }

@@ -90,7 +90,13 @@ assert(formatAge(45 * 60_000) === "45m" && formatAge(105 * 60_000) === "1h 45m" 
     nowMs: NOW,
     deployed: { commit: "4b47dbf" },
   });
-  assert(full.undeployed.length === 0 && full.unchecked.some((u) => /limit/.test(u.title)), "collect: a PR list that hit its limit is flagged, not silently truncated");
+  assert(full.undeployed.length === 0 && !full.unchecked.some((u) => /limit/.test(u.title)), "collect: exactly PR_LIMIT PRs is a complete list, not flagged");
+  const over = collectUndeployedFixes({
+    run: (cmd, args) => (args[0] === "pr" ? JSON.stringify(Array.from({ length: PR_LIMIT + 1 }, (_, i) => ({ number: i + 1, title: "t", url: "u", mergedAt: "2026-11-01T00:00:00Z", mergeCommit: { oid: "c" + i } }))) : args[0] === "api" ? "ahead\n" : run(cmd, args)),
+    nowMs: NOW,
+    deployed: { commit: "4b47dbf" },
+  });
+  assert(over.unchecked.some((u) => /limit/.test(u.title)), "collect: a PR list past its limit is flagged, not silently truncated");
   let threw = false;
   try { fetchDeployedVersion(() => "{\"commit\":\"unknown\"}"); } catch { threw = true; }
   assert(threw, "an unusable deployed commit (unknown) is an error, not 'nothing undeployed'");
