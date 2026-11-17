@@ -70,5 +70,9 @@ export const RunExportBody = z
 export const LockPushBody = z
   .object({
     branchName: z.string().min(1).max(80).optional(),
+    // #1406: which resources to push. Absent = all five, so a client that never
+    // sends it behaves as before. Empty is rejected rather than read as "all":
+    // a caller who unticked everything did not ask for a full push.
+    resources: z.array(z.enum(["tn", "tq", "twl", "ult", "ust"])).min(1).max(5).optional(),
   })
   .strict();

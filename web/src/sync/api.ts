@@ -1871,10 +1871,12 @@ export const api = {
   // review" (pushes to the named branch, no auto-merge, PR left for a
   // maintainer). Use it for a PUBLISHED book, where re-cutting the release is
   // the maintainer's call, not ours.
-  pushLockedBookToDoor43: (book: string, branchName?: string) =>
+  // `resources` (#1406) limits the push to those resources; the server pushes
+  // all five when it is absent.
+  pushLockedBookToDoor43: (book: string, branchName?: string, resources?: Resource[]) =>
     request<PushLockedBookResponse>(`/api/books/${encodeURIComponent(book)}/lock/push`, {
       method: "POST",
-      ...(branchName ? { body: JSON.stringify({ branchName }) } : {}),
+      ...(branchName || resources ? { body: JSON.stringify({ branchName, resources }) } : {}),
     }),
 
   // Trigger a server-side import of a book from DCS. Long-running: ~5-60s

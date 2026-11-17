@@ -27,7 +27,14 @@ import {
 import LockIcon from "@mui/icons-material/Lock";
 import LockOpenIcon from "@mui/icons-material/LockOpen";
 import HelpOutlineIcon from "@mui/icons-material/HelpOutline";
-import { ApiError, api, reviewBranchFor, type BookListEntry, type PushLockedBookResponse } from "../sync/api";
+import {
+  ApiError,
+  api,
+  reviewBranchFor,
+  type BookListEntry,
+  type PushLockedBookResponse,
+  type Resource,
+} from "../sync/api";
 import { BOOKS, bookName } from "../lib/bookNames";
 
 interface Props {
@@ -45,6 +52,16 @@ interface Props {
 
 const NOT_ADMIN_MESSAGE = "Only Benjamin, Rich, or Perry can change book locks.";
 
+// The resources a lock & push can send, in the order the dialog lists them.
+const PUSH_RESOURCES: { id: Resource; label: string }[] = [
+  { id: "ult", label: "ULT" },
+  { id: "ust", label: "UST" },
+  { id: "tn", label: "tN" },
+  { id: "tq", label: "tQ" },
+  { id: "twl", label: "tWL" },
+];
+const ALL_PUSH_RESOURCES: Resource[] = PUSH_RESOURCES.map((r) => r.id);
+
 export function BookLocksDialog({ open, onClose, onChanged, books, canManageLocks, refresh }: Props) {
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -58,6 +75,9 @@ export function BookLocksDialog({ open, onClose, onChanged, books, canManageLock
   // Defaults to staging: the safe intent should be the one you get by not
   // thinking about it, since the unsafe one rewrites a released book.
   const [stageForReview, setStageForReview] = useState(true);
+  // #1406: which resources to push. All ticked by default, so not touching
+  // the checkboxes pushes everything, as before.
+  const [pushResources, setPushResources] = useState<Resource[]>(ALL_PUSH_RESOURCES);
   const [pushState, setPushState] = useState<"idle" | "pushing" | "done" | "error">("idle");
   const [pushResult, setPushResult] = useState<PushLockedBookResponse | null>(null);
   const [pushError, setPushError] = useState<string | null>(null);
@@ -121,6 +141,8 @@ export function BookLocksDialog({ open, onClose, onChanged, books, canManageLock
     // master, for a book nobody made that decision about. The safe default has
     // to be re-chosen each time, per book.
     setStageForReview(true);
+    // Same for the resource choice: it was made for one book, not the next.
+    setPushResources(ALL_PUSH_RESOURCES);
   };
 
   const doPushNow = async () => {
@@ -128,7 +150,11 @@ export function BookLocksDialog({ open, onClose, onChanged, books, canManageLock
     setPushState("pushing");
     setPushError(null);
     try {
-      const res = await api.pushLockedBookToDoor43(pushPrompt, stageForReview ? reviewBranchFor(pushPrompt) : undefined);
+      const res = await api.pushLockedBookToDoor43(
+        pushPrompt,
+        stageForReview ? reviewBranchFor(pushPrompt) : undefined,
+        pushResources,
+      );
       setPushResult(res);
       setPushState("done");
     } catch (e) {
@@ -274,9 +300,30 @@ export function BookLocksDialog({ open, onClose, onChanged, books, canManageLock
             <Stack spacing={1.5}>
               <Typography variant="body2">
                 {bookName(pushPrompt)} is now locked. Push it to Door43 now instead of waiting for the
-                nightly export? This sends every resource (ULT, UST, tN, tQ, tWL), bypassing the lock
-                just for this push.
+                nightly export? This sends the resources ticked below, bypassing the lock just for
+                this push.
               </Typography>
+              <Box>
+                {PUSH_RESOURCES.map(({ id, label }) => (
+                  <FormControlLabel
+                    key={id}
+                    control={
+                      <Checkbox
+                        size="small"
+                        checked={pushResources.includes(id)}
+                        onChange={(e) =>
+                          setPushResources((prev) =>
+                            e.target.checked
+                              ? ALL_PUSH_RESOURCES.filter((r) => r === id || prev.includes(r))
+                              : prev.filter((r) => r !== id),
+                          )
+                        }
+                      />
+                    }
+                    label={label}
+                  />
+                ))}
+              </Box>
               {/* Two genuinely different intents, and the dialog used to offer only
                   the riskier one. "Publish now" is right when you own the change and
                   want it live. Staging is right for a PUBLISHED book, where merging
@@ -345,7 +392,7 @@ export function BookLocksDialog({ open, onClose, onChanged, books, canManageLock
           {pushState === "idle" && (
             <>
               <Button onClick={closePushPrompt}>Not now</Button>
-              <Button onClick={doPushNow} variant="contained">
+              <Button onClick={doPushNow} variant="contained" disabled={pushResources.length === 0}>
                 {stageForReview ? "Stage for review" : "Publish now"}
               </Button>
             </>
