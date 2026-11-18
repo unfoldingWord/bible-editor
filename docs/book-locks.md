@@ -64,16 +64,16 @@ the constant. **The detector never influences the gate.** A new release becomes 
 reviewed human event, which is right: the night a new release lands, a dozen more
 books go quiet, and a cron should not decide that by itself.
 
-### Evidence behind the current constant (measured 2026-09-27)
+### Evidence behind the current constant (measured 2026-11-18)
 
-- Latest release in `en_ult`, `en_ust`, `en_tn`, `en_tq`, `en_twl` is **v91**,
-  target branch `release_v91`, published 2026-09-26.
-- Listing each repo at `?ref=v91` returns **59 books, and the set is identical
+- Latest release in `en_ult`, `en_ust`, `en_tn`, `en_tq`, `en_twl` is **v92**,
+  target branch `release_v92`, published 2026-11-18.
+- Listing each repo at `?ref=v92` returns **61 books, and the set is identical
   across all five repos**. `master` has 66.
-- The 7 unpublished books: `NUM 1CH 2CH ECC ISA JER EZK`. (v90 added HOS and
-  MIC; v91 added AMO, DAN and ZEC.)
+- The 5 unpublished books: `1CH 2CH ISA JER EZK`. (v90 added HOS and
+  MIC; v91 added AMO, DAN and ZEC; v92 added NUM and ECC.)
 - Release cadence is roughly 3 per year (v84 2024-08 → v89 2026-06 → v90
-  2026-08 → v91 2026-09).
+  2026-08 → v91 2026-09 → v92 2026-11).
 
 Two traps the code guards against, both found while measuring:
 
