@@ -133,6 +133,7 @@ import { evaluateStaleBaseReplacement, type StaleBaseHold } from "./staleBaseGat
 import { recordStaleBaseHold, raiseStaleBaseHoldAlert, clearStaleBaseHold } from "./staleBaseHolds";
 import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
+import { planVerseSortOrders, verseOrderKey, type LiveOrderRow, type VerseOrderPlan } from "./tsvVerseOrder";
 import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
 import type { TwlRow, VerseRow, CheckLane } from "./types";
@@ -1857,10 +1858,12 @@ function parseTsvRow(r: Record<string, string>, kind: TsvKind): ParsedTsvRow | n
 // large books — DO NOT revert it (PR #180 batched this; a later refactor
 // reverted it; PR #195 re-batched). See the nightly-sync-subrequest-cap memory.
 //
-// sort_order is a per-verse ordinal (makeVerseSortOrder): deterministic and
-// chunk-independent, so an unchanged DCS file produces no churn; a reordered/
-// extended verse renumbers only that verse. `incoming` is the chapter's rows in
-// file order, so the ordinal tracks source order exactly. The pristine guard +
+// sort_order: for tn/tq, a whole-verse plan made before any write
+// (planVerseSortOrders, tsvVerseOrder.ts, issue #1404): a verse whose D1 order
+// already matches master keeps its numbers, a verse that disagrees is
+// renumbered as a whole, and a verse a person changed in-app since the last
+// confirmed export keeps D1's order. twl keeps the per-verse file ordinal
+// (makeVerseSortOrder); its canonical post-pass owns twl order. The pristine guard +
 // version-CAS stay ON each UPDATE, so a translator edit landing between the read
 // and the batch matches 0 rows (no clobber) and is counted skipped_edited.
 // Exported for the integration test ONLY (reimportJourney.test.mjs). Issue #427:
@@ -1954,6 +1957,47 @@ export async function applyTsvRows(
       [...existing].filter(([, cur]) => isPristineTsv(kind, cur)).map(([id]) => id),
     );
     skipDupIdx = planTnContentDedup(incoming, existsPristineId, existsAnyId);
+  }
+
+  // Issue #1404: plan every tn/tq verse's numbering as a whole before any
+  // write (see tsvVerseOrder.ts). Needs every LIVE row in the incoming
+  // chapters, not only the incoming ids: a note created in-app and not yet
+  // exported is in D1's verse but not in master's, and it has to keep its
+  // place when the verse is renumbered. One read per call (one chapter on the
+  // nightly path, the whole book on runReimport). twl is left out: its
+  // canonical post-pass (canonicalizeTwlOrder) owns twl order.
+  let orderPlan: VerseOrderPlan | null = null;
+  let liveForOrder: LiveOrderRow[] = [];
+  if (kind !== "twl") {
+    let minCh = Infinity;
+    let maxCh = -Infinity;
+    for (const r of incoming) {
+      if (r.chapter < minCh) minCh = r.chapter;
+      if (r.chapter > maxCh) maxCh = r.chapter;
+    }
+    const rs = await env.DB.prepare(
+      `SELECT id, chapter, verse, sort_order, last_change_action, last_change_source, updated_at
+         FROM ${TSV_TABLE[kind]} WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3 AND deleted_at IS NULL`,
+    )
+      .bind(book, minCh, maxCh)
+      .all<LiveOrderRow>();
+    liveForOrder = (rs.results ?? []).map((r) => ({
+      ...r,
+      id: String(r.id),
+      chapter: Number(r.chapter),
+      verse: Number(r.verse),
+      sort_order: r.sort_order == null ? null : Number(r.sort_order),
+      updated_at: r.updated_at == null ? null : Number(r.updated_at),
+    }));
+    orderPlan = planVerseSortOrders(kind, incoming, liveForOrder, masterConfirmedAt);
+    if (orderPlan.localOwnedVerses > 0 || orderPlan.renumberedVerses > 0) {
+      console.log("reimport: verse order plan", {
+        book,
+        resource: kind,
+        renumberedVerses: orderPlan.renumberedVerses,
+        localOwnedVerses: orderPlan.localOwnedVerses,
+      });
+    }
   }
 
   // Classify. Inserts run per-row (DCS-new rows are rare); updates +
@@ -2055,7 +2099,10 @@ export async function applyTsvRows(
   const insertedThisPass = new Set<string>();
   for (let i = 0; i < incoming.length; i++) {
     const row = incoming[i];
-    const sortOrder = nextSort(row.chapter, row.verse);
+    // nextSort runs for every row so the twl ordinal (and the tn/tq fallback,
+    // when the plan leaves a row out) still counts from the verse's first row.
+    const fileSort = nextSort(row.chapter, row.verse);
+    const sortOrder = orderPlan?.planned.get(verseOrderKey(row.id, row.chapter, row.verse)) ?? fileSort;
     const cur = existing.get(row.id);
     if (!cur) {
       if (insertedThisPass.has(row.id)) {
@@ -2191,7 +2238,10 @@ export async function applyTsvRows(
     // adopt-from-master path. See classifyReimportRow for the full rationale.
     // NOTE: for twl this only preserves the row through the loop; canonical
     // (ULT-position) order is (re)asserted afterwards by the twl canonical
-    // post-pass in runReimport, which owns twl sort_order.
+    // post-pass in runReimport, which owns twl sort_order. For tn, the noop
+    // only keeps this row out of the content write: the verse's order is
+    // decided by the whole-verse plan above, and the sort-only batch at the
+    // end of this function applies it (issue #1404).
     const contentMatches =
       tsvRowSignature(kind, storedTsvRowToParsed(kind, cur)) === tsvRowSignature(kind, row);
     const sortMatches = (cur.sort_order == null ? null : Number(cur.sort_order)) === sortOrder;
@@ -3375,6 +3425,58 @@ export async function applyTsvRows(
     } catch (e) {
       counts.apply_incomplete = true;
       counts.errors.push(`${kind} edited-merge batch: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  // Issue #1404: apply the whole-verse order plan to every live row whose
+  // number still differs from it: content-identical rows, rows a person edited
+  // (m53p in NUM 1:2), protected rows, D1-only rows, and any row whose own
+  // write above lost its version-CAS race (otherwise that one row would keep
+  // its old-scale number while its siblings moved). A row whose write above
+  // already landed its planned number fails the `sort_order IS` guard and is
+  // left alone. Before this, rows nobody rewrote kept an older import's number
+  // while rewritten rows took master position x 100, and the mixed scales
+  // scrambled the verse.
+  //
+  // sort_order ONLY: no version bump and no edit_log row (#687: order is not
+  // content), and deliberately no `updated_at` or provenance stamp either,
+  // unlike the sort-only batch above. Provenance here is load-bearing:
+  // keptNotes.ts isDoor43PersonChange keeps a note out of AI replacement only
+  // while its last change is a named-person Door43 sync_merge, and
+  // planVerseSortOrders reads a person's recent in-app change from
+  // last_change_source/updated_at. Restamping a whole verse would erase both.
+  //
+  // The WHERE pins the verse and the number this run read, because an in-app
+  // drag does not bump version: a drag (or a move) landing after the read
+  // leaves that row's write at 0 changes.
+  if (orderPlan) {
+    const verseReorders: Array<{ r: LiveOrderRow; sortOrder: number }> = [];
+    for (const r of liveForOrder) {
+      const p = orderPlan.planned.get(verseOrderKey(r.id, r.chapter, r.verse));
+      if (p != null && p !== r.sort_order) verseReorders.push({ r, sortOrder: p });
+    }
+    for (let i = 0; i < verseReorders.length; i += WRITE_BATCH) {
+      const slice = verseReorders.slice(i, i + WRITE_BATCH);
+      try {
+        const results = await env.DB.batch(
+          slice.map(({ r, sortOrder }) =>
+            env.DB.prepare(
+              `UPDATE ${TSV_TABLE[kind]} SET sort_order = ?1
+                 WHERE id = ?2 AND book = ?3 AND deleted_at IS NULL
+                   AND chapter = ?4 AND verse = ?5 AND sort_order IS ?6`,
+            ).bind(sortOrder, r.id, book, r.chapter, r.verse, r.sort_order),
+          ),
+        );
+        results.forEach((res) => {
+          if ((res?.meta.changes ?? 0) > 0) counts.reordered++;
+        });
+      } catch (e) {
+        // Withhold the watermark: the SHA gate would otherwise skip this
+        // chapter until master changes again, and tonight's export would push
+        // the uncorrected order to master (Codex review).
+        counts.apply_incomplete = true;
+        counts.errors.push(`${kind} verse reorder batch: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
   }
 
