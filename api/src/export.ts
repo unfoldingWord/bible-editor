@@ -1256,6 +1256,155 @@ export function tsvRevertReport(
   return { entries, totalRows: master.size };
 }
 
+// ── Keep master's row where only master moved (#1403) ─────────────────────
+//
+// The one export guard that acts on a revert instead of only reporting it.
+// Three versions of each tn/tq/twl row:
+//   - base: what D1 rendered for our last push that provably reached master
+//     (the caller decides "provably"; see ExportWorkflow.masterMovedGuard),
+//   - ours: what D1 renders now,
+//   - master: Door43 master now.
+// When ours still equals base (nobody in Bible Editor changed the row since
+// that push) and master differs from base substantively, shipping ours can
+// only undo someone else's Door43 edit: the NUM/ECC TN revert of 2026-11-16
+// (#1407), where preserved notes had skipped the sync. So the render keeps
+// master's row instead.
+//
+// "Substantive" is the revert report's class (tsvRevertReport): a content
+// field differs after canonicalizeForRevertCompare. Whitespace-only and
+// Tags-only moves stay ours, as today. "Ours unchanged" ignores only NFC and
+// whitespace runs, so a renderer reflow does not switch the guard off but a
+// translator's Tags or line-break edit still counts as ours. Reference must be
+// byte-equal between ours and base for the row to count as unchanged.
+//
+// A row Door43 moved to another Reference (with or without a text change) is
+// NOT kept: substituting it in place would leave it under the wrong verse in
+// our ordering, and shipping ours would undo the move. It is returned in
+// `moved`, and the caller refuses the push so a person decides.
+//
+// Only IDs that appear exactly once in all three files are considered. Fails
+// open (null) when any side does not parse, so the caller ships as today.
+export interface KeptMasterRow {
+  id: string;
+  ref: string;
+  fields: string[];
+}
+
+export interface KeepMasterPlan {
+  // `rendered` with each kept row's line replaced by master's line. Equal to
+  // `rendered` when nothing is kept.
+  content: string;
+  kept: KeptMasterRow[];
+  moved: KeptMasterRow[];
+}
+
+// More kept rows than this in one book+resource means D1 is badly out of date
+// for it (a missed sync, not one person's fix), so the push is refused and a
+// person re-syncs first (#1403).
+export const MASTER_MOVED_REFUSE_THRESHOLD = 20;
+
+// A Reference compared for meaning: whitespace and the dash used in a range
+// ("1:1-3" vs "1:1–3") are formatting, and must not read as a Door43 move,
+// which refuses the whole push.
+function refKey(ref: string | undefined): string {
+  return (ref ?? "").normalize("NFC").replace(/\s+/g, "").replace(/[‐-―−]/g, "-");
+}
+
+// Null unless the header starts with exactly `headers`: the plan indexes cells
+// by position and splices master's raw line into ours, so a reordered or
+// foreign column layout must not be read as ours.
+function tsvRowsByUniqueId(
+  raw: string,
+  headers: readonly string[],
+): { rows: Map<string, string[]>; dupes: Set<string> } | null {
+  const lines = raw.replace(/^\uFEFF/, "").split(/\r?\n/).filter((l) => l.length > 0);
+  if (lines.length === 0) return null;
+  if (lines[0].split("\t").slice(0, headers.length).join("\t") !== headers.join("\t")) return null;
+  const rows = new Map<string, string[]>();
+  const dupes = new Set<string>();
+  for (const line of lines.slice(1)) {
+    const cells = line.split("\t");
+    const id = cells[1]?.trim();
+    if (!id) return null;
+    if (rows.has(id)) dupes.add(id);
+    rows.set(id, cells);
+  }
+  return { rows, dupes };
+}
+
+export function planKeepMasterRows(
+  renderedTsv: string,
+  baseTsv: string,
+  masterTsv: string,
+  kind: "tn" | "tq" | "twl",
+  // Restrict the plan to these IDs (the rows an unproven push kept; see
+  // ExportWorkflow.masterMovedGuard). Absent = every row.
+  onlyIds: ReadonlySet<string> | null = null,
+): KeepMasterPlan | null {
+  const headers = kind === "tn" ? TN_HEADERS : kind === "tq" ? TQ_HEADERS : TWL_HEADERS;
+  const refIdx = headers.indexOf("Reference");
+  const tagsIdx = headers.indexOf("Tags");
+  const contentIdx = headers
+    .map((h, i) => (h === "Reference" || h === "ID" || h === "Tags" ? -1 : i))
+    .filter((i) => i >= 0);
+  const ours = tsvRowsByUniqueId(renderedTsv, headers);
+  const base = tsvRowsByUniqueId(baseTsv, headers);
+  const master = tsvRowsByUniqueId(masterTsv, headers);
+  if (ours === null || base === null || master === null) return null;
+  // Did master move? The revert report's "substantive" test.
+  const same = (a: string[], b: string[], i: number) =>
+    canonicalizeForRevertCompare(a[i] ?? "") === canonicalizeForRevertCompare(b[i] ?? "");
+  // Did we move? Stricter: only NFC and whitespace runs are ignored (renderer
+  // churn). A literal `\n` line break and a Tags edit are a translator's
+  // change and must still ship.
+  const ourCanon = (s: string) => s.normalize("NFC").replace(/\s+/g, " ").trim();
+  const oursSame = (a: string[], b: string[], i: number) => ourCanon(a[i] ?? "") === ourCanon(b[i] ?? "");
+  const kept: KeptMasterRow[] = [];
+  const moved: KeptMasterRow[] = [];
+  const keepLine = new Map<string, string>();
+  for (const [id, oursCells] of ours.rows) {
+    if (onlyIds && !onlyIds.has(id)) continue;
+    if (ours.dupes.has(id) || base.dupes.has(id) || master.dupes.has(id)) continue;
+    const baseCells = base.rows.get(id);
+    const masterCells = master.rows.get(id);
+    if (!baseCells || !masterCells) continue; // new or deleted row: the shrink guard's territory
+    const oursUnchanged =
+      refKey(oursCells[refIdx]) === refKey(baseCells[refIdx]) &&
+      [...contentIdx, tagsIdx].every((i) => oursSame(oursCells, baseCells, i));
+    if (!oursUnchanged) continue; // we changed it: today's behaviour
+    const fields = contentIdx.filter((i) => !same(masterCells, baseCells, i)).map((i) => headers[i]);
+    const refMoved = refKey(masterCells[refIdx]) !== refKey(baseCells[refIdx]);
+    if (fields.length === 0 && !refMoved) continue; // master did not move substantively
+    const row = { id, ref: masterCells[refIdx] ?? "", fields: refMoved ? ["Reference", ...fields] : fields };
+    if (refMoved) {
+      // Door43 put this row under another verse; we cannot place it in our
+      // order, and shipping ours would undo the move. A person decides.
+      moved.push(row);
+      continue;
+    }
+    kept.push(row);
+    const line = masterCells.slice();
+    // tn/tq Tags are blanked on every export (exportTags); keep that true here.
+    line[tagsIdx] = exportTags(kind, line[tagsIdx]);
+    keepLine.set(id, line.join("\t"));
+  }
+  if (keepLine.size === 0) return { content: renderedTsv, kept, moved };
+  const lines = renderedTsv.split("\n");
+  for (let i = 1; i < lines.length; i++) {
+    const id = lines[i].split("\t")[1]?.trim();
+    const replacement = id ? keepLine.get(id) : undefined;
+    if (replacement !== undefined) lines[i] = lines[i].endsWith("\r") ? replacement + "\r" : replacement;
+  }
+  return { content: lines.join("\n"), kept, moved };
+}
+
+// Ship, keep, or refuse (#1403). Separate from planKeepMasterRows so the
+// threshold is one tested decision: any `moved` row, or more than
+// MASTER_MOVED_REFUSE_THRESHOLD kept rows, refuses the push.
+export function masterMovedGuardRefuses(plan: Pick<KeepMasterPlan, "kept" | "moved">): boolean {
+  return plan.moved.length > 0 || plan.kept.length > MASTER_MOVED_REFUSE_THRESHOLD;
+}
+
 // ── Partitioning the revert report by master's measured lineage (#1231) ───
 //
 // The per-row base above is our LAST push. When that push never merged,
@@ -1918,7 +2067,9 @@ export function exportRevertRaceAlertSource(
 // hand-edit or two that our render legitimately supersedes (normal churn); a
 // double-digit pile in one run reads more like our render systematically
 // clobbering content nobody meant to lose, which is worth Benjamin's attention
-// even though it still ships.
+// even though it still ships. (A row only master moved is kept as master's,
+// before this report runs: the keep-master guard, #1403. What reaches this
+// report is a row we changed too, or one the guard could not measure.)
 const SYSTEMIC_REVERTS = 15;
 
 export function classifyRevertSeverity(
@@ -1987,7 +2138,11 @@ export function isMasterConfirmed(commit: Pick<DcsCommitResult, "branchTouched">
 // as settled.
 //
 // This is purely observational, same as classifyRevertSeverity: no `block`
-// field, and it must never be used to gate shipping. Formatting/tags_only/
+// field, and it is not used to gate shipping. The one export step that does
+// act on this kind of revert is the keep-master guard (#1403,
+// planKeepMasterRows), and only for a tn/tq/twl row Bible Editor provably did
+// not change since a push that reached master; everything this alert sees
+// still ships. Formatting/tags_only/
 // whitespace_only reverts are excluded on purpose — those are cosmetic
 // normalization we'd expect to win regardless of who last touched the row.
 export function mechanicalOverwriteAlert(
