@@ -75,7 +75,7 @@ function fakeDispatchEnv() {
             job_id: "job-dispatch",
             user_id: 1,
             pipeline_type: "notes",
-            book: "NUM",
+            book: "ISA",
             start_chapter: 27,
             end_chapter: 27,
             session_key: "sess-dispatch",
@@ -405,7 +405,7 @@ function seedDispatchingJob(sqlite, { jobId, updatedAt, errorKind = null, errorM
       `INSERT INTO pipeline_jobs
          (job_id, user_id, pipeline_type, book, start_chapter, end_chapter,
           session_key, state, error_kind, error_message, updated_at)
-       VALUES (?, 1, 'notes', 'NUM', 27, 27, 'sess', 'dispatching', ?, ?, ?)`,
+       VALUES (?, 1, 'notes', 'ISA', 27, 27, 'sess', 'dispatching', ?, ?, ?)`,
     )
     .run(jobId, errorKind, errorMessage, updatedAt);
 }

@@ -56,11 +56,11 @@ function assert(cond, msg) {
 {
   console.log("\n[forceStopPhrase]");
   assert(
-    forceStopPhrase("NUM", 27, 27) === "STOP THE AI FOR NUM 27",
+    forceStopPhrase("ISA", 27, 27) === "STOP THE AI FOR ISA 27",
     "single chapter",
   );
   assert(
-    forceStopPhrase("NUM", 27, 30) === "STOP THE AI FOR NUM 27-30",
+    forceStopPhrase("ISA", 27, 30) === "STOP THE AI FOR ISA 27-30",
     "chapter range",
   );
 }
@@ -216,7 +216,7 @@ function fakeDispatchEnv({ promoteChanges = 1, username = "translator" } = {}) {
             job_id: "job-dispatch",
             user_id: 1,
             pipeline_type: "notes",
-            book: "NUM",
+            book: "ISA",
             start_chapter: 27,
             end_chapter: 27,
             session_key: "sess-dispatch",
@@ -310,7 +310,7 @@ const baseJob = {
   user_id: 1,
   state: "running",
   upstream_job_id: "stream_81_upstream",
-  book: "NUM",
+  book: "ISA",
   start_chapter: 27,
   end_chapter: 27,
 };
@@ -345,7 +345,7 @@ async function withFetch(impl, fn, trace) {
   const result = await forceFailJob(env, {
     jobId: "job-1",
     userId: 1,
-    confirm: "STOP THE AI FOR NUM 26", // wrong chapter
+    confirm: "STOP THE AI FOR ISA 26", // wrong chapter
   });
   assert(result.kind === "confirm_mismatch", "wrong phrase is rejected");
 }
@@ -357,7 +357,7 @@ async function withFetch(impl, fn, trace) {
   const result = await forceFailJob(env, {
     jobId: "job-2",
     userId: 1,
-    confirm: "STOP THE AI FOR NUM 27",
+    confirm: "STOP THE AI FOR ISA 27",
   });
   assert(result.kind === "cannot_force_fail", "queued is refused");
   assert(result.state === "queued", "reports the actual state");
@@ -391,7 +391,7 @@ async function withFetch(impl, fn, trace) {
   const result = await forceFailJob(env, {
     jobId: "job-3",
     userId: 99,
-    confirm: "STOP THE AI FOR NUM 27",
+    confirm: "STOP THE AI FOR ISA 27",
   });
   assert(result.kind === "ok", "non-owner editor's force-stop succeeds");
   assert(
@@ -412,7 +412,7 @@ async function withFetch(impl, fn, trace) {
   const result = await forceFailJob(env, {
     jobId: "job-3b",
     userId: 1,
-    confirm: "STOP THE AI FOR NUM 27",
+    confirm: "STOP THE AI FOR ISA 27",
   });
   assert(result.kind === "ok", "owner's force-stop succeeds");
   assert(
@@ -433,7 +433,7 @@ await withFetch(
     const result = await forceFailJob(env, {
       jobId: "job-4",
       userId: 1,
-      confirm: "STOP THE AI FOR NUM 27",
+      confirm: "STOP THE AI FOR ISA 27",
     });
     assert(result.kind === "ok", "running job force-stops");
     assert(result.jobId === "job-4", "returns the job id");
@@ -472,7 +472,7 @@ await withFetch(
     const result = await forceFailJob(env, {
       jobId: "job-5",
       userId: 1,
-      confirm: "STOP THE AI FOR NUM 27",
+      confirm: "STOP THE AI FOR ISA 27",
     });
     assert(result.kind === "ok", "local fail lands even though upstream 404s");
   },
@@ -489,7 +489,7 @@ await withFetch(
     const result = await forceFailJob(env, {
       jobId: "job-6",
       userId: 1,
-      confirm: "STOP THE AI FOR NUM 27",
+      confirm: "STOP THE AI FOR ISA 27",
     });
     assert(result.kind === "ok", "local fail lands even though upstream is unreachable");
   },
@@ -502,7 +502,7 @@ await withFetch(
   const result = await forceFailJob(env, {
     jobId: "job-7",
     userId: 1,
-    confirm: "STOP THE AI FOR NUM 27",
+    confirm: "STOP THE AI FOR ISA 27",
   });
   assert(result.kind === "ok", "dispatching job force-stops");
 }
@@ -514,7 +514,7 @@ await withFetch(
   const result = await forceFailJob(env, {
     jobId: "job-8",
     userId: 1,
-    confirm: "STOP THE AI FOR NUM 27",
+    confirm: "STOP THE AI FOR ISA 27",
   });
   assert(result.kind === "cannot_force_fail", "0 rows changed -> refused");
   assert(result.state === "done", "reports the state it actually landed in");
@@ -529,7 +529,7 @@ await withFetch(
   await forceFailJob(env, {
     jobId: "job-11",
     userId: 1,
-    confirm: "STOP THE AI FOR NUM 27",
+    confirm: "STOP THE AI FOR ISA 27",
   });
   const casQuery = env.queries.find((q) => /SET state = 'failed'/.test(q));
   assert(Boolean(casQuery), "the force-fail CAS UPDATE was prepared");
@@ -552,7 +552,7 @@ await withFetch(
   await forceFailJob(env, {
     jobId: "job-9",
     userId: 1,
-    confirm: "STOP THE AI FOR NUM 27",
+    confirm: "STOP THE AI FOR ISA 27",
   });
   assert(
     env.lastErrorMessage ===
@@ -566,7 +566,7 @@ await withFetch(
   await forceFailJob(anon, {
     jobId: "job-10",
     userId: 1,
-    confirm: "STOP THE AI FOR NUM 27",
+    confirm: "STOP THE AI FOR ISA 27",
   });
   assert(
     anon.lastErrorMessage ===
@@ -601,7 +601,7 @@ await withFetch(
       upstream_job_id: "stream_12_upstream",
       user_id: 1,
       pipeline_type: "notes",
-      book: "NUM",
+      book: "ISA",
       start_chapter: 27,
       end_chapter: 27,
       session_key: "sess-12",
@@ -696,7 +696,7 @@ const followUpPolledJob = {
   upstream_job_id: "stream_f3_upstream",
   user_id: 1,
   pipeline_type: "notes",
-  book: "NUM",
+  book: "ISA",
   start_chapter: 27,
   end_chapter: 27,
   session_key: "sess-f3",
@@ -784,7 +784,7 @@ const forceStoppedMidPollJob = {
   upstream_job_id: "stream_midpoll_upstream",
   user_id: 1,
   pipeline_type: "notes",
-  book: "NUM",
+  book: "ISA",
   start_chapter: 27,
   end_chapter: 27,
   session_key: "sess-midpoll",
@@ -1210,7 +1210,7 @@ await (async () => {
       const result = await forceFailJob(env, {
         jobId: "job-f6",
         userId: 1,
-        confirm: "STOP THE AI FOR NUM 27",
+        confirm: "STOP THE AI FOR ISA 27",
       });
       assert(result.kind === "ok", "force-fail still succeeds");
     },
@@ -1412,7 +1412,7 @@ await withFetch(
       upstream_job_id: "stream_841_upstream",
       user_id: 1,
       pipeline_type: "notes",
-      book: "NUM",
+      book: "ISA",
       start_chapter: 27,
       end_chapter: 27,
       session_key: "sess-841",

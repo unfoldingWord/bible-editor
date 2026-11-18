@@ -7,6 +7,7 @@
 
 import {
   PUBLISHED_BOOKS,
+  PUBLISHED_RELEASE_TAG,
   PUBLISHED_SET_MIN_BOOKS,
   isPublishedBook,
   pickLatestStableRelease,
@@ -28,13 +29,13 @@ function assert(cond, msg) {
 }
 
 // --- PUBLISHED_BOOKS composition ---
-const UNPUBLISHED = ["NUM", "1CH", "2CH", "ECC", "ISA", "JER", "EZK"];
+const UNPUBLISHED = ["1CH", "2CH", "ISA", "JER", "EZK"];
 
-assert(PUBLISHED_BOOKS.size === 59, `PUBLISHED_BOOKS has 59 books (got ${PUBLISHED_BOOKS.size})`);
+assert(PUBLISHED_BOOKS.size === 61, `PUBLISHED_BOOKS has 61 books (got ${PUBLISHED_BOOKS.size})`);
 for (const book of UNPUBLISHED) {
   assert(!PUBLISHED_BOOKS.has(book), `${book} is absent from PUBLISHED_BOOKS (unpublished)`);
 }
-assert(PUBLISHED_BOOKS.size + UNPUBLISHED.length === 66, "59 published + 7 unpublished === 66");
+assert(PUBLISHED_BOOKS.size + UNPUBLISHED.length === 66, "61 published + 5 unpublished === 66");
 
 // --- isPublishedBook ---
 assert(isPublishedBook("gen"), "isPublishedBook is case-insensitive (lowercase)");
@@ -42,6 +43,7 @@ assert(isPublishedBook("Gen"), "isPublishedBook is case-insensitive (mixed case)
 assert(isPublishedBook("GEN"), "isPublishedBook true for GEN");
 assert(!isPublishedBook("EZK"), "isPublishedBook false for unpublished EZK");
 assert(isPublishedBook("ZEC"), "isPublishedBook true for ZEC (added at v91)");
+assert(isPublishedBook("NUM") && isPublishedBook("ECC"), "isPublishedBook true for NUM and ECC (added at v92)");
 assert(!isPublishedBook("XYZ"), "isPublishedBook false for unknown code");
 
 // --- pickLatestStableRelease ---
@@ -189,7 +191,7 @@ assert(
     drift.noLongerPublished.length === 1 && drift.noLongerPublished[0] === "EXO",
     "reports the no-longer-published book",
   );
-  assert(drift.message.includes("v91"), "message names the release tag");
+  assert(PUBLISHED_RELEASE_TAG === "v92" && drift.message.includes("v92"), "message names the release tag");
   assert(drift.message.includes("ISA") && drift.message.includes("EXO"), "message names the differing books");
 }
 
