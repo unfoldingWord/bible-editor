@@ -7,7 +7,11 @@
 // verse's copy.
 
 import usfm from "usfm-js";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { buildTnQuickRequest } from "./tnQuickRequest.ts";
+import { nfc } from "./hebrew.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -92,6 +96,78 @@ console.log("\n[Case] single verse unchanged (#968)");
   };
   const v2 = buildTnQuickRequest(note(2), data);
   assert(v2.ok && v2.request.ult.selection === "LORD", `single verse: LORD (got ${v2.ok ? v2.request.ult.selection : v2.error.reason})`);
+}
+
+// --- English input on a bridge with x-ref (#1426) ---------------------------
+// Real Door43 data: 2CH UST 9:10-12 is one bridged row whose milestones count
+// per source verse and name it in x-ref (אֶת 1/1 x-ref 9:11 twice, אֶת 1/1
+// x-ref 9:12); the ULT keeps 9:10, 9:11 and 9:12 separate. An English quote
+// typed on 9:12 must send only 9:12's UST English to the AI.
+{
+  const here = dirname(fileURLToPath(import.meta.url));
+  const samples = resolve(here, "../../../docs/samples");
+  const read = (f) => readFileSync(resolve(samples, f), "utf8");
+  const plainOfVo = (vo) => {
+    const out = [];
+    const walk = (ns) => { for (const n of ns ?? []) { if (n?.type === "word") out.push(n.text); else if (n?.children) walk(n.children); } };
+    walk(vo);
+    return out.join(" ");
+  };
+  const row2ch = (verse, verseEnd, verseObjects, bv) => ({
+    book: "2CH", chapter: 9, verse, verse_end: verseEnd, bible_version: bv,
+    plain_text: plainOfVo(verseObjects), version: 1, updated_by: null, updated_at: 0, content: { verseObjects },
+  });
+  const uhbJson = usfm.toJSON(read("hbo_uhb_14-2CH-9_10-12.usfm"));
+  const ultJson = usfm.toJSON(read("en_ult_14-2CH-9_10-12.usfm"));
+  const UHB = {};
+  const ULT = {};
+  for (const v of [10, 11, 12]) {
+    UHB[v] = row2ch(v, null, uhbJson.chapters["9"][String(v)].verseObjects, "UHB");
+    ULT[v] = row2ch(v, null, ultJson.chapters["9"][String(v)].verseObjects, "ULT");
+  }
+  const ustBridge = (raw) => row2ch(10, 12, usfm.toJSON(raw).chapters["9"]["10-12"].verseObjects, "UST");
+  const ustRaw = read("en_ust_14-2CH-9_10-12.usfm");
+  const note2ch = (verse, quote) => ({
+    id: "t1", book: "2CH", chapter: 9, verse, ref_raw: `9:${verse}`,
+    support_reference: "rc://*/ta/man/translate/figs-explicit", quote, occurrence: 1,
+  });
+
+  console.log("\n[Case] English input on 9:12: UST selection is 9:12's English only (#1426)");
+  {
+    const data = { verses: { ULT, UST: { 10: ustBridge(ustRaw) }, UHB } };
+    const r = buildTnQuickRequest(note2ch(12, "all"), data);
+    assert(
+      r.ok && r.request.ust.selection === "many things in Jerusalem",
+      `UST selection leaves out 9:11's "that wood … it" (got ${r.ok ? JSON.stringify(r.request.ust.selection) : r.error.reason})`,
+    );
+  }
+
+  console.log("\n[Case] English input on a bridged ULT with x-ref finds the note's own verse's Hebrew (#1426)");
+  {
+    // The UST bridge stands in for a bridged ULT. "King Solomon" occurs in
+    // 9:12 first (document order), then 9:10 and 9:11; a 9:11 note must
+    // derive 9:11's הַמֶּלֶךְ, not 9:12's וְהַמֶּלֶךְ שְׁלֹמֹה.
+    const data = { verses: { ULT: { 10: { ...ustBridge(ustRaw), bible_version: "ULT" } }, UST: { 10: ustBridge(ustRaw) }, UHB } };
+    const r = buildTnQuickRequest(note2ch(11, "King Solomon"), data);
+    assert(
+      r.ok && nfc(r.request.hebrewGuess) === nfc("הַ֠⁠מֶּלֶךְ"),
+      `hebrewGuess is 9:11's הַמֶּלֶךְ (got ${r.ok ? JSON.stringify(r.request.hebrewGuess) : r.error.reason})`,
+    );
+    assert(
+      r.ok && r.request.ust.selection === "King Solomon He",
+      `UST selection is 9:11's English (got ${r.ok ? JSON.stringify(r.request.ust.selection) : r.error.reason})`,
+    );
+  }
+
+  console.log("\n[Case] English input on a bridge WITHOUT x-ref is unchanged (#1426)");
+  {
+    const data = { verses: { ULT, UST: { 10: ustBridge(ustRaw.replace(/ x-ref="[^"]*"/g, "")) }, UHB } };
+    const r = buildTnQuickRequest(note2ch(12, "all"), data);
+    assert(
+      r.ok && r.request.ust.selection === "many things in Jerusalem that wood it",
+      `no x-ref: whole-bridge match as before (got ${r.ok ? JSON.stringify(r.request.ust.selection) : r.error.reason})`,
+    );
+  }
 }
 
 if (failed) {
