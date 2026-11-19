@@ -413,6 +413,121 @@ console.log("\n[#1418 review A2 — a per-step cap of 2 rows: the mirror spreads
   }
 }
 
+// A non-content action as rows.ts writes it: the provenance stamp (setTnBit,
+// setTnTrashed, dismiss-review) plus its edit_log row (source NULL).
+function userAction(sqlite, id, action, at, payload = null) {
+  sqlite
+    .prepare(`UPDATE tn_rows SET last_change_source = 'user', last_change_action = ?, updated_at = ? WHERE book = ? AND id = ?`)
+    .run(action, at, BOOK, id);
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, source, payload_json, created_at)
+       SELECT 'tn', id, book, 42, version, version, ?, NULL, ?, ? FROM tn_rows WHERE book = ? AND id = ?`,
+    )
+    .run(action, payload, at, BOOK, id);
+}
+const quietMaster = (t) => t.sqlite.prepare(`UPDATE book_resource_syncs SET source_sha = ? WHERE book = ?`).run(SHA_1, BOOK);
+
+console.log("\n[#1428 item 1 — a write that loses its version check withholds the watermark; the next night heals it]");
+{
+  const t = seed({ locked: true });
+  quietMaster(t);
+  // bbbb's version moves between the mirror's read and its write (the race a
+  // CAS guards against).
+  let inTnMirror = false;
+  let bumped = false;
+  const batch = t.env.DB.batch;
+  t.env.DB.batch = async (stmts) => {
+    if (inTnMirror && !bumped) {
+      bumped = true;
+      t.sqlite.prepare(`UPDATE tn_rows SET version = version + 1 WHERE book = ? AND id = 'bbbb'`).run(BOOK);
+    }
+    return batch(stmts);
+  };
+  const racing = {
+    async do(name, optsOrFn, maybeFn) {
+      inTnMirror = name === `reimport-mirror-${BOOK}-tn-0`;
+      try {
+        return await step.do(name, optsOrFn, maybeFn);
+      } finally {
+        inTnMirror = false;
+      }
+    },
+  };
+  await night(t, { sha: SHA_1, files: { tn: MASTER_TN, tq: MASTER_TQ } }, racing);
+  eq(bumped, true, "the race fired inside the tn mirror step");
+  eq(d1Tn(t.sqlite).find((r) => r.includes("|bbbb|")), "1:1|bbbb|B", "night 1: the raced row is still D1's");
+  eq(syncOf(t.sqlite, "tn"), "withheld", "night 1: tn watermark is withheld, not certified at master's SHA");
+  eq(withholdOf(t.sqlite, "tn"), "apply_incomplete", "night 1: and the reason is apply_incomplete");
+  t.env.DB.batch = batch;
+  await night(t, { sha: SHA_1, files: { tn: MASTER_TN, tq: MASTER_TQ } });
+  eq(d1Tn(t.sqlite).find((r) => r.includes("|bbbb|")), "1:1|bbbb|B changed on Door43", "night 2: the row takes Door43's text");
+  eq(syncOf(t.sqlite, "tn"), SHA_1, "night 2: the watermark is certified");
+}
+
+console.log("\n[#1428 item 2 — preserve/hint toggles after the push are not content; trash is]");
+{
+  const t = seed({ locked: true });
+  quietMaster(t);
+  userAction(t.sqlite, "bbbb", "preserve", T0 + 100);
+  t.sqlite.prepare(`UPDATE tn_rows SET preserve = 1 WHERE id = 'bbbb'`).run();
+  userAction(t.sqlite, "cccc", "hint", T0 + 100);
+  userAction(t.sqlite, "cccc", "unhint", T0 + 110);
+  // A trash after the push is a removal the pending push ships (the export
+  // leaves trashed notes out), so it stays pending.
+  userAction(t.sqlite, "aaaa", "trash", T0 + 100);
+  t.sqlite.prepare(`UPDATE tn_rows SET trashed_at = ? WHERE id = 'aaaa'`).run(T0 + 100);
+  // A toggle on a row in a verse Door43 reordered: the stamp may hide an
+  // earlier in-app drag, so that verse's order is left as D1 has it.
+  userAction(t.sqlite, "hhhh", "preserve", T0 + 100);
+  const res = await night(t, { sha: SHA_1, files: { tn: MASTER_TN, tq: MASTER_TQ } });
+  const rows = d1Tn(t.sqlite);
+  eq(rows.find((r) => r.includes("|bbbb|")), "1:1|bbbb|B changed on Door43", "a preserve toggle: the row takes Door43's text");
+  eq(flagOf(t.sqlite, "tn_rows", "bbbb"), null, "…and is not flagged mirror_kept");
+  eq(rows.find((r) => r.includes("|cccc|")), "1:2|cccc|C changed on Door43", "hint then unhint: the row takes Door43's text");
+  eq(flagOf(t.sqlite, "tn_rows", "cccc"), null, "…and is not flagged mirror_kept");
+  eq(rows.some((r) => r.includes("|aaaa|")), false, "a trash after the push stays trashed (pending removal)");
+  eq(rows.filter((r) => r.startsWith("2:1")), ["2:1|hhhh|H", "2:1|iiii|I"], "the toggled row's verse keeps D1's order");
+  eq(res.perResource.tn.mirror_kept, 2, "kept: only the two flagged rows (ffff, gggg) count");
+}
+
+console.log("\n[#1428 item 3 — a dismissed mirror_kept flag stays dismissed]");
+{
+  const t = seed({ locked: true });
+  // gggg: a person dismissed some OTHER flag after the push. That must not
+  // stop its first mirror_kept flag.
+  userAction(t.sqlite, "gggg", "dismiss_review", T0 + 150, JSON.stringify({ review_kind: "merge_conflict", review_reason: "x" }));
+  const state = { sha: SHA_1, files: { tn: MASTER_TN, tq: MASTER_TQ } };
+  await night(t, state);
+  eq(flagOf(t.sqlite, "tn_rows", "ffff"), "mirror_kept", "night 1: ffff flagged");
+  eq(flagOf(t.sqlite, "tn_rows", "gggg"), "mirror_kept", "night 1: gggg flagged despite an earlier dismissal of another kind");
+  // A person dismisses ffff's mirror_kept flag (rows.ts dismiss-review).
+  t.sqlite.prepare(`UPDATE tn_rows SET review_kind = NULL, review_reason = NULL, review_master_json = NULL WHERE id = 'ffff'`).run();
+  userAction(t.sqlite, "ffff", "dismiss_review", T0 + 300, JSON.stringify({ review_kind: "mirror_kept", review_reason: "x" }));
+  for (const n of [2, 3]) {
+    const res = await night(t, state);
+    eq(d1Tn(t.sqlite).find((r) => r.includes("|ffff|")), "1:4|ffff|F fixed in app", `night ${n}: ffff still keeps the app's text`);
+    eq(flagOf(t.sqlite, "tn_rows", "ffff"), null, `night ${n}: ffff's dismissed flag stays dismissed`);
+    eq(flagOf(t.sqlite, "tn_rows", "gggg"), "mirror_kept", `night ${n}: gggg still flagged`);
+    eq(res.perResource.tn.mirror_kept, 1, `night ${n}: kept counts the one flagged row`);
+  }
+}
+
+console.log("\n[#1428 item 5 — kept rows in a pipeline-held chapter are not counted as flagged]");
+{
+  const t = seed({ locked: true });
+  quietMaster(t);
+  t.sqlite
+    .prepare(
+      `INSERT INTO pipeline_jobs (job_id, user_id, pipeline_type, book, start_chapter, end_chapter, session_key, state)
+       VALUES ('job1', 42, 'notes', ?, 1, 1, 'sess1', 'running')`,
+    )
+    .run(BOOK);
+  const res = await night(t, { sha: SHA_1, files: { tn: MASTER_TN, tq: MASTER_TQ } });
+  eq(flagOf(t.sqlite, "tn_rows", "ffff"), null, "the held chapter's pending row is not flagged");
+  eq(res.perResource.tn.mirror_kept ?? 0, 0, "and kept does not count it");
+}
+
 console.log("\n[#1418 — locked book with no confirmed push at all: nothing is mirrored (fail safe)]");
 {
   const t = seed({ locked: true });
