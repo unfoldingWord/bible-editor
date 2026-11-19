@@ -96,7 +96,7 @@ import {
   type SourceWord,
   type VerseExtract,
 } from "./importParsers";
-import { lockedResourcesForChapter, lockedResourceFor } from "./chapterLock";
+import { bookChapterLocks, lockedResourcesForChapter, lockedResourceFor } from "./chapterLock";
 import { coerceRowId } from "./rowId";
 import { planTnContentDedup } from "./tnDedup";
 import { isCatastrophicTsvShrink } from "./shrinkGuard";
@@ -134,6 +134,13 @@ import { recordStaleBaseHold, raiseStaleBaseHoldAlert, clearStaleBaseHold } from
 import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { planVerseSortOrders, verseOrderKey, type LiveOrderRow, type VerseOrderPlan } from "./tsvVerseOrder";
+import {
+  MIRROR_KEPT,
+  planLockedMirror,
+  type MirrorKeepReason,
+  type MirrorMasterRow,
+  type MirrorStoredRow,
+} from "./lockedMirror.ts";
 import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
 import type { TwlRow, VerseRow, CheckLane } from "./types";
@@ -723,6 +730,11 @@ export interface ReimportCounts {
   // A lost CAS race is NOT this — that's an honest skipped_edited (a human wrote
   // first; nothing of theirs was clobbered). Only a thrown batch sets it.
   apply_incomplete?: boolean;
+  // Issue #1418, diagnostic only (gates nothing): rows the locked-book mirror
+  // pass changed to match Door43 master (content writes, inserts, removals,
+  // reorders), and pending rows it kept and flagged mirror_kept instead.
+  mirrored?: number;
+  mirror_kept?: number;
 }
 
 export interface ReimportResult {
@@ -1115,6 +1127,8 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.own_publish_converged += from.own_publish_converged ?? 0;
   into.merge_record_failed = Boolean(into.merge_record_failed || from.merge_record_failed);
   into.apply_incomplete = Boolean(into.apply_incomplete || from.apply_incomplete);
+  if (from.mirrored) into.mirrored = (into.mirrored ?? 0) + from.mirrored;
+  if (from.mirror_kept) into.mirror_kept = (into.mirror_kept ?? 0) + from.mirror_kept;
   // `?? 0` for the same reason as every other counter here: a Workflow instance
   // that began before this shipped replays a memoized step result with no such
   // field. Unlike chapters_locked / prune_locked this one gates nothing (the
@@ -4057,8 +4071,21 @@ async function tryInsertTsvRow(
   sortOrder: number,
   provenance: RowProvenance,
 ): Promise<TsvInsertOutcome> {
+  return insertOutcome(await buildTsvInsertStmt(env, book, kind, row, sortOrder, provenance).run());
+}
+
+// The INSERT tryInsertTsvRow runs, as an unexecuted statement, so the locked
+// mirror (#1418) can batch inserts with their gated audit rows.
+function buildTsvInsertStmt(
+  env: Env,
+  book: string,
+  kind: TsvKind,
+  row: ParsedTsvRow,
+  sortOrder: number,
+  provenance: RowProvenance,
+): D1PreparedStatement {
   if (kind === "tn") {
-    const r = await env.DB.prepare(
+    return env.DB.prepare(
       `INSERT INTO tn_rows
          (id, book, chapter, verse, ref_raw, tags, support_reference, quote, occurrence, note, sort_order,
           last_change_action, last_change_source, last_change_actor)
@@ -4070,12 +4097,10 @@ async function tryInsertTsvRow(
         row.tags, row.support_reference ?? null, row.quote ?? null,
         row.occurrence, row.note ?? null, sortOrder,
         ...provenanceValues(provenance),
-      )
-      .run();
-    return insertOutcome(r);
+      );
   }
   if (kind === "tq") {
-    const r = await env.DB.prepare(
+    return env.DB.prepare(
       `INSERT INTO tq_rows
          (id, book, chapter, verse, ref_raw, tags, quote, occurrence, question, response, sort_order,
           last_change_action, last_change_source, last_change_actor)
@@ -4087,11 +4112,9 @@ async function tryInsertTsvRow(
         row.tags, row.quote ?? null, row.occurrence,
         row.question ?? null, row.response ?? null, sortOrder,
         ...provenanceValues(provenance),
-      )
-      .run();
-    return insertOutcome(r);
+      );
   }
-  const r = await env.DB.prepare(
+  return env.DB.prepare(
     `INSERT INTO twl_rows
        (id, book, chapter, verse, ref_raw, tags, orig_words, occurrence, tw_link, sort_order,
         last_change_action, last_change_source, last_change_actor)
@@ -4102,9 +4125,7 @@ async function tryInsertTsvRow(
       row.id, book, row.chapter, row.verse, row.refRaw,
       row.tags, row.orig_words ?? null, row.occurrence, row.tw_link ?? null, sortOrder,
       ...provenanceValues(provenance),
-    )
-    .run();
-  return insertOutcome(r);
+    );
 }
 
 // True iff this stored row has never been touched by a human and isn't pending
@@ -9067,6 +9088,16 @@ interface StagedResource {
   // Workflow instance that started before this shipped, which reads as the old
   // behavior (ledger success); nothing gates on these.
   ownPublishUnstamped?: boolean;
+  // Issue #1418: set on a tn/tq/twl entry of a LOCKED book whose master file
+  // was staged for the mirror pass (mirrorLockedTsv). Staged whatever the SHA
+  // says, so a locked book whose D1 drifted from a quiet master still heals.
+  // `cutoff` is the confirmed-push boundary paired with that fetch; a pending
+  // row is one changed in the app after it. Absent = no mirror for this entry.
+  mirror?: {
+    r2Key: string;
+    verifiedComplete: boolean;
+    cutoff: { confirmedAt: number | null; editId: number | null };
+  } | null;
   fetchFailed?: boolean;
   tsvTruncated?: boolean;
   // Issue #857: this pair's merge-ancestor boundary (getMasterConfirmedAt),
@@ -10526,6 +10557,361 @@ async function softDeleteRemovedTsvRows(
   return { deleted, skippedLocked };
 }
 
+// ── Issue #1418: locked book = Door43 is master ────────────────────────────
+//
+// For a LOCKED book (effectiveBookLock), make D1's rows for one TSV kind equal
+// master's file: text, order (tn/tq), additions and deletions. One exception:
+// a row changed in Bible Editor after the last confirmed push is kept as it is
+// and flagged `mirror_kept`. Runs as its own nightly step AFTER the ordinary
+// apply + prune, so for every book the merge runs exactly as before and this
+// pass only closes what the merge leaves different on a locked book (the
+// order-only chapters the diff gate skips, #1411; Door43 deletions of rows a
+// person once edited, which the prune refuses, #1415; edited rows the merge
+// kept or flagged). lockedMirror.ts holds the plan itself.
+//
+// "Pending" (kept) is decided from two records, either one sufficient, so the
+// test fails toward keeping:
+//   - edit_log: any entry for the row past the confirmed boundary (id past
+//     `cutoff.editId`, else created_at at or past `cutoff.confirmedAt`) that
+//     the sync did not write (source 'dcs_reimport') and that is not a
+//     review-flag dismissal. A person's PATCH/create/delete/trash, an AI
+//     apply, a bootstrap import: all keep the row.
+//   - row provenance: last_change_source 'user' or 'ai_pipeline' with
+//     updated_at at or past confirmedAt (same second keeps), unless the last
+//     action only cleared or dismissed a review flag (a dismissal is not a
+//     content change; were it pending, dismissing a mirror_kept flag would
+//     keep the row over Door43 for good). This catches the in-app reorder, which
+//     writes no edit_log row.
+// The flag writes below touch neither record (no edit_log row, no provenance,
+// no updated_at), so a kept row still reads as pending the next night.
+//
+// Fail-safe skips (the merge result stands): no confirmed boundary at all, the
+// book no longer locked (or the lock read failed), an empty master file.
+// Deletions additionally need a verifiedComplete fetch. A chapter a pipeline
+// job holds for this kind is left alone and counted into prune_locked, like
+// the prune. A thrown write batch sets apply_incomplete.
+export interface LockedMirrorResult {
+  skipped?: "no_boundary" | "not_locked" | "empty_master";
+  mirrored: number;
+  kept: number;
+  skippedLocked: number;
+  removeUnverified: number;
+  lostCas: number;
+  /** Rows the plan still has to write after this step's cap. */
+  remaining: number;
+  applyIncomplete: boolean;
+}
+
+// Per-step bound on the mirror's writes. A batch is one subrequest; 45 rows
+// (up to 90 statements, a write plus its audit row) match the merge's
+// WRITE_BATCH of 90. 2000 rows is 45 batches, so a step's whole cost (about
+// six reads plus 45 batches) stays far under the ~1000-subrequest cap.
+const MIRROR_ROWS_PER_BATCH = Math.floor(WRITE_BATCH / 2);
+let MIRROR_ROWS_PER_STEP = 2000;
+// Test-only (lockedMirrorJourney.test.mjs): shrink the per-step cap so a
+// small fixture exercises the multi-step path. Returns the previous value.
+export function setMirrorRowsPerStepForTest(n: number): number {
+  const prev = MIRROR_ROWS_PER_STEP;
+  MIRROR_ROWS_PER_STEP = n;
+  return prev;
+}
+// Steps per (book, kind) per night: 10 x 2000 rows covers a whole-book
+// rewrite of the largest file (PSA tn). Past that, the rest waits a night.
+const MIRROR_MAX_STEPS = 10;
+
+// tn/tq Tags are left out on purpose: the export blanks that column on every
+// push (exportTags, export.ts), so master's blank says nothing about D1's
+// value, and copying it would wipe app-side markers (ISSUE:MATCH_FAIL) on
+// every tagged row. twl exports its tags, so master owns them.
+const MIRROR_CONTENT_COLS: Record<TsvKind, readonly string[]> = {
+  tn: ["support_reference", "quote", "occurrence", "note"],
+  tq: ["quote", "occurrence", "question", "response"],
+  twl: ["tags", "orig_words", "occurrence", "tw_link"],
+};
+
+function mirrorSignature(kind: TsvKind, row: ParsedTsvRow): string {
+  return tsvRowSignature(kind, kind === "twl" ? row : { ...row, tags: null });
+}
+
+function mirrorKeptReason(reason: MirrorKeepReason): string {
+  return reason === "not_on_door43"
+    ? "Locked book: this row is not on Door43. It was added or changed in Bible Editor after the last confirmed push, so the nightly sync kept it. Check that the push carrying it merges."
+    : "Locked book: Door43 differs from this row. It was changed in Bible Editor after the last confirmed push, so the nightly sync kept it instead of taking Door43's version. Check that the push carrying it merges.";
+}
+
+async function mirrorLockedTsv(
+  env: Env,
+  book: string,
+  kind: TsvKind,
+  rawTsv: string,
+  cutoff: { confirmedAt: number | null; editId: number | null },
+  verifiedComplete: boolean,
+): Promise<LockedMirrorResult> {
+  const out: LockedMirrorResult = {
+    mirrored: 0, kept: 0, skippedLocked: 0, removeUnverified: 0, lostCas: 0, remaining: 0, applyIncomplete: false,
+  };
+  const confirmedAt = cutoff.confirmedAt;
+  if (confirmedAt == null) return { ...out, skipped: "no_boundary" };
+  let locked = false;
+  try {
+    locked = (await effectiveBookLock(env, book)) != null;
+  } catch (e) {
+    console.error("reimport locked mirror: lock read failed; leaving the merge result", {
+      book, resource: kind, error: e instanceof Error ? e.message : String(e),
+    });
+  }
+  if (!locked) return { ...out, skipped: "not_locked" };
+
+  const masterRows = new Map<string, ParsedTsvRow>();
+  const masterList: MirrorMasterRow[] = [];
+  for (const r of parseTsv(rawTsv).rows) {
+    const p = parseTsvRow(r, kind);
+    if (!p || p.chapter < 0) continue;
+    if (!masterRows.has(p.id)) masterRows.set(p.id, p);
+    masterList.push({ id: p.id, chapter: p.chapter, verse: p.verse, sig: mirrorSignature(kind, p) });
+  }
+  if (masterList.length === 0) return { ...out, skipped: "empty_master" };
+
+  const table = TSV_TABLE[kind];
+  const storedRs = await env.DB.prepare(
+    `SELECT id, ${TSV_STORED_COLS[kind]}, sort_order, version, deleted_at${kind === "tn" ? ", trashed_at" : ""},
+            review_kind, review_reason, review_master_json, last_change_source, last_change_action, updated_at
+       FROM ${table} WHERE book = ?1`,
+  )
+    .bind(book)
+    .all<Record<string, unknown>>();
+
+  // `book = ?2` without the legacy `OR book IS NULL` arm: every write path has
+  // set edit_log.book since migration 0017 backfilled it, a pending edit is by
+  // definition recent, and the plain equality lets this use
+  // edit_log_row_by_book (kind, book, row_key) instead of scanning the kind.
+  const pendingRs = await env.DB.prepare(
+    `SELECT DISTINCT row_key FROM edit_log
+      WHERE kind = ?1 AND book = ?2 AND ${cutoff.editId != null ? "id > ?3" : "created_at >= ?3"}
+        AND (source IS NULL OR source <> '${REIMPORT_SOURCE}')
+        AND action <> 'dismiss_review'`,
+  )
+    .bind(kind, book, cutoff.editId ?? confirmedAt)
+    .all<{ row_key: string }>();
+  const pendingIds = new Set((pendingRs.results ?? []).map((r) => String(r.row_key)));
+
+  const byId = new Map<string, Record<string, unknown>>();
+  const stored: MirrorStoredRow[] = [];
+  for (const row of storedRs.results ?? []) {
+    const id = String(row.id);
+    byId.set(id, row);
+    const src = (row.last_change_source as string | null) ?? null;
+    const action = (row.last_change_action as string | null) ?? null;
+    const flagOnly = action === "dismiss_review" || action === "review_clear";
+    const updatedAt = row.updated_at == null ? null : Number(row.updated_at);
+    stored.push({
+      id,
+      chapter: Number(row.chapter),
+      verse: Number(row.verse),
+      sig: mirrorSignature(kind, storedTsvRowToParsed(kind, row)),
+      sort_order: row.sort_order == null ? null : Number(row.sort_order),
+      removed: row.deleted_at != null || (kind === "tn" && row.trashed_at != null),
+      pending:
+        pendingIds.has(id) ||
+        ((src === "user" || src === AI_SOURCE) && !flagOnly && updatedAt != null && updatedAt >= confirmedAt),
+      review_kind: (row.review_kind as string | null) ?? null,
+    });
+  }
+
+  const plan = planLockedMirror(masterList, stored, kind !== "twl");
+
+  // A pipeline job that writes this kind owns its chapter (#828), as in the
+  // prune. One book-wide read (two at most), not one per chapter.
+  const chaptersOf = (id: string): number[] => {
+    const chs: number[] = [];
+    const m = masterRows.get(id);
+    if (m) chs.push(m.chapter);
+    const s = byId.get(id);
+    if (s) chs.push(Number(s.chapter));
+    return chs;
+  };
+  const locksFor = await bookChapterLocks(env, book);
+  const lockedResource = lockedResourceFor(kind);
+  const lockedChapters = new Set<number>();
+  const free = (id: string) => {
+    let ok = true;
+    for (const ch of chaptersOf(id)) {
+      if (locksFor(ch).has(lockedResource)) {
+        lockedChapters.add(ch);
+        ok = false;
+      }
+    }
+    return ok;
+  };
+
+  const now = Math.floor(Date.now() / 1000);
+  const syncMerge: RowProvenance = { action: "sync_merge", source: "dcs_sync", actor: DOOR43_ACTOR_UNMEASURED };
+  // Every row this pass would write, in order: content, inserts, removals,
+  // reorders, flags. Each entry is one row's statements (the write, then its
+  // changes()-gated audit row when it has one), so a row and its audit travel
+  // in the same batch. `tally` rows count as mirrored when the write changed a
+  // row (else: a lost CAS).
+  const ops: Array<{ stmts: D1PreparedStatement[]; tally: boolean }> = [];
+
+  // 1. Content (and resurrection) to master's value. Clears review flags: the
+  //    row now says what Door43 says, so a merge flag about it is stale.
+  //    updated_by is left alone: who once owned the row still matters to the
+  //    AI-run rules (keptNotes.ts) if the book is ever unlocked.
+  const cols = MIRROR_CONTENT_COLS[kind];
+  const setContent = cols.map((c, i) => `${c} = ?${i + 7}`).join(", ");
+  const p = 7 + cols.length;
+  for (const id of plan.write) {
+    if (!free(id)) continue;
+    const m = masterRows.get(id) as ParsedTsvRow;
+    const s = byId.get(id) as Record<string, unknown>;
+    const oldVersion = Number(s.version);
+    const sortOrder = plan.sortOrder.get(id) ?? (s.sort_order == null ? null : Number(s.sort_order));
+    const values = cols.map((c) => (m as unknown as Record<string, unknown>)[c] ?? null);
+    ops.push({
+      tally: true,
+      stmts: [
+        env.DB.prepare(
+          `UPDATE ${table}
+              SET deleted_at = NULL${kind === "tn" ? ", trashed_at = NULL" : ""},
+                  review_kind = NULL, review_reason = NULL, review_master_json = NULL, restored_from_version = NULL,
+                  ref_raw = ?1, chapter = ?2, verse = ?3, sort_order = ?4, version = ?5, updated_at = ?6, ${setContent},
+                  ${provenanceSet(p + 3)}
+            WHERE id = ?${p} AND book = ?${p + 1} AND version = ?${p + 2}`,
+        ).bind(
+          m.refRaw, m.chapter, m.verse, sortOrder, oldVersion + 1, now, ...values,
+          id, book, oldVersion, ...provenanceValues(syncMerge),
+        ),
+        gatedLogEditStmt(env, kind, id, book, null, oldVersion, oldVersion + 1, s.deleted_at != null ? "restore" : "update", m),
+      ],
+    });
+  }
+
+  // 2. Rows master has and D1 has no row for. ON CONFLICT DO NOTHING, so a
+  //    slot taken since the read is a 0-change (lost CAS), never an overwrite.
+  for (const id of plan.insert) {
+    if (!free(id)) continue;
+    const m = masterRows.get(id) as ParsedTsvRow;
+    ops.push({
+      tally: true,
+      stmts: [
+        buildTsvInsertStmt(env, book, kind, m, plan.sortOrder.get(id) ?? 100, syncMerge),
+        gatedLogEditStmt(env, kind, id, book, null, null, 1, "create", m),
+      ],
+    });
+  }
+
+  // 3. Rows master no longer carries. Only on a fetch positively proven whole:
+  //    an id merely missing from a partial body is not a Door43 deletion.
+  for (const id of plan.remove) {
+    if (!free(id)) continue;
+    if (!verifiedComplete) {
+      out.removeUnverified++;
+      continue;
+    }
+    const oldVersion = Number((byId.get(id) as Record<string, unknown>).version);
+    ops.push({
+      tally: true,
+      stmts: [
+        env.DB.prepare(
+          `UPDATE ${table}
+              SET deleted_at = ?1, version = version + 1, updated_at = ?1, ${provenanceSet(5)}
+            WHERE id = ?2 AND book = ?3 AND deleted_at IS NULL AND version = ?4`,
+        ).bind(now, id, book, oldVersion, ...provenanceValues({ action: "sync_prune", source: "dcs_sync", actor: DOOR43_ACTOR_UNMEASURED })),
+        env.DB.prepare(
+          `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, source)
+           SELECT ?1, ?2, ?3, NULL, ?4, ?5, 'delete', ?6 WHERE changes() > 0`,
+        ).bind(kind, id, book, oldVersion, oldVersion + 1, REIMPORT_SOURCE),
+      ],
+    });
+  }
+
+  // 4. Order only (tn/tq), for rows whose content already matched.
+  //    Version-neutral like the merge's own reorder batch (#610).
+  const written = new Set([...plan.write, ...plan.insert]);
+  for (const [id, n] of plan.sortOrder) {
+    const s = byId.get(id);
+    if (!s || written.has(id) || !free(id)) continue;
+    ops.push({
+      tally: true,
+      stmts: [
+        env.DB.prepare(
+          `UPDATE ${table} SET sort_order = ?1, updated_at = ?2, ${provenanceSet(6)}
+            WHERE id = ?3 AND book = ?4 AND deleted_at IS NULL AND version = ?5`,
+        ).bind(n, now, id, book, Number(s.version), ...provenanceValues({ action: "sync_reorder", source: "dcs_sync", actor: DOOR43_ACTOR_UNMEASURED })),
+      ],
+    });
+  }
+
+  // 5. Flags. Neither write bumps version, stamps provenance or updated_at, or
+  //    logs to edit_log, so the kept row still reads as pending tomorrow. An
+  //    identical standing flag is not rewritten.
+  for (const k of plan.keep) {
+    out.kept++;
+    if (!free(k.id)) continue;
+    if (k.reason === "deleted_in_app") continue; // a tombstone shows no flag
+    const s = byId.get(k.id) as Record<string, unknown>;
+    const reason = mirrorKeptReason(k.reason);
+    const m = masterRows.get(k.id);
+    const snapshot = m ? masterReviewSnapshot(kind, m) : null;
+    // Rewritten when Door43 moved again, so the popup's Door43 side is current.
+    if (s.review_kind === MIRROR_KEPT && s.review_reason === reason && (s.review_master_json ?? null) === snapshot) continue;
+    ops.push({
+      tally: false,
+      stmts: [
+        env.DB.prepare(
+          `UPDATE ${table} SET review_kind = '${MIRROR_KEPT}', review_reason = ?1, review_master_json = ?2
+            WHERE id = ?3 AND book = ?4 AND deleted_at IS NULL`,
+        ).bind(reason, snapshot, k.id, book),
+      ],
+    });
+  }
+  for (const id of plan.clearFlag) {
+    if (!free(id)) continue;
+    ops.push({
+      tally: false,
+      stmts: [
+        env.DB.prepare(
+          `UPDATE ${table} SET review_kind = NULL, review_reason = NULL, review_master_json = NULL
+            WHERE id = ?1 AND book = ?2 AND review_kind = '${MIRROR_KEPT}'`,
+        ).bind(id, book),
+      ],
+    });
+  }
+  out.skippedLocked = lockedChapters.size;
+
+  // Bounded per step (the ~1000-subrequest cap, STATE.md): at most
+  // MIRROR_ROWS_PER_STEP rows, MIRROR_ROWS_PER_BATCH to a batch (one
+  // subrequest each). The caller re-runs this step, re-planning from fresh D1,
+  // while rows remain; whatever is left after its last step is reported
+  // incomplete and continues the next night.
+  const take = ops.slice(0, MIRROR_ROWS_PER_STEP);
+  out.remaining = ops.length - take.length;
+  for (let i = 0; i < take.length; i += MIRROR_ROWS_PER_BATCH) {
+    const slice = take.slice(i, i + MIRROR_ROWS_PER_BATCH);
+    try {
+      const results = await env.DB.batch(slice.flatMap((o) => o.stmts));
+      let k = 0;
+      for (const o of slice) {
+        if (o.tally) {
+          if ((results[k]?.meta.changes ?? 0) > 0) out.mirrored++;
+          else out.lostCas++;
+        }
+        k += o.stmts.length;
+      }
+    } catch (e) {
+      out.applyIncomplete = true;
+      console.error("reimport locked mirror: write batch failed", {
+        book, resource: kind, error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  if (out.mirrored > 0 || out.kept > 0 || out.skippedLocked > 0 || out.removeUnverified > 0 || out.remaining > 0 || out.applyIncomplete) {
+    console.log("reimport locked mirror", { book, resource: kind, ...out });
+  }
+  return out;
+}
+
 // Issue #427, option 3: sweep a tombstone whose id no longer appears ANYWHERE
 // in master's file for this book — pure dead weight. Mutually exclusive with
 // applyTsvRows' tombstone branch above by construction: that branch only ever
@@ -10774,6 +11160,19 @@ async function planAndStageBookResources(
   const maxChapter = maxRow?.m ?? 0;
   if (maxChapter < 1) return { maxChapter, entries: [] };
 
+  // Issue #1418: a locked book's tn/tq/twl files are staged for the mirror pass
+  // (mirrorLockedTsv) every night, whatever the SHA says. A failed lock read
+  // stages nothing extra: the ordinary merge then runs exactly as before.
+  let mirrorBook = false;
+  try {
+    mirrorBook = (await effectiveBookLock(env, book)) != null;
+  } catch (e) {
+    console.error("reimport: lock read failed; no locked-book mirror tonight", {
+      book,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+
   const entries: StagedResource[] = [];
   for (const resource of resources) {
     const file = dcsResourceFile(book, resource);
@@ -10784,6 +11183,22 @@ async function planAndStageBookResources(
     // it's worth staging a file purely for the tombstone sweep. Was
     // previously computed just below, right where the actual fetch happens.
     const isTsv = resource === "tn" || resource === "tq" || resource === "twl";
+    // #1418. Not for the one resource an admin lock/push run is about to push
+    // from D1 (lockOverrideResource): that run keeps its old behavior.
+    const mirrorWanted = isTsv && mirrorBook && lockOverrideResource !== resource;
+    // Stage a fetched master body for the mirror under its own key (the
+    // tombstone sweep keeps reading only `r2Key`). A body the truncation gate
+    // distrusts is not staged, so nothing is mirrored from it.
+    const stageMirror = async (
+      body: string,
+      verified: boolean,
+      cutoff: { confirmedAt: number | null; editId: number | null },
+    ): Promise<StagedResource["mirror"]> => {
+      if (await tsvFetchLooksTruncated(env, book, resource as TsvKind, body)) return null;
+      const key = `reimport-stage/${instanceId}/${book}/${resource}-mirror`;
+      await env.BLOBS.put(key, body);
+      return { r2Key: key, verifiedComplete: verified, cutoff };
+    };
 
     // #1048: the prune cutoff as it stood BEFORE master's sha is resolved and
     // its file fetched. Any render this boundary certifies was confirmed on
@@ -10802,6 +11217,34 @@ async function planAndStageBookResources(
       : [];
     // Skip ONLY on a positive SHA match (fail-open: null/unknown → reimport).
     if (shaMatches && convergenceBacklog.length === 0) {
+      // Issue #1418: a locked book's quiet file is still fetched, so D1 that
+      // drifted from master while its SHA stood still (an order-only commit
+      // the diff gate skipped, a deletion the prune refused) heals tonight.
+      // `fetchCutoff` was read before the fetch: the older boundary, which can
+      // only make more rows read as pending (kept).
+      if (mirrorWanted) {
+        const fetched = await fetchTsvMasterVerified(env, file.repo, file.path, masterSha ?? undefined);
+        if (fetched.raw != null) {
+          const mirror = await stageMirror(fetched.raw, fetched.verifiedComplete, {
+            confirmedAt: fetchCutoff?.confirmedAt ?? null,
+            editId: fetchCutoff?.editId ?? null,
+          });
+          let r2Key: string | null = null;
+          if (await hasDueTombstones(env, book, resource as TsvKind)) {
+            r2Key = `reimport-stage/${instanceId}/${book}/${resource}`;
+            await env.BLOBS.put(r2Key, fetched.raw);
+          }
+          entries.push({
+            resource,
+            changed: false,
+            masterSha,
+            r2Key,
+            verifiedComplete: r2Key != null && fetched.verifiedComplete,
+            mirror,
+          });
+          continue;
+        }
+      }
       // Issue #604: a SHA-unchanged TSV resource is otherwise permanently
       // invisible to the tombstone sweep — runChunkedReimport only ever looks
       // at staged entries, and this resource has nothing staged. Pay for a
@@ -10959,6 +11402,15 @@ async function planAndStageBookResources(
         await env.BLOBS.put(sweepR2Key, raw);
         sweepVerifiedComplete = verifiedComplete;
       }
+      // #1418: master is our own render, so the mirror normally has nothing to
+      // do; staged anyway so drift from before that render still heals. The
+      // boundary is re-read: it just moved to the render's read time (or, if
+      // the stamp missed, it is the older one, which keeps more rows).
+      let mirror: StagedResource["mirror"] = null;
+      if (mirrorWanted) {
+        const c = await getMasterConfirmedAt(env, book, resource);
+        mirror = await stageMirror(raw, verifiedComplete, { confirmedAt: c.confirmedAt, editId: c.editId });
+      }
       entries.push({
         resource,
         changed: false,
@@ -10968,6 +11420,7 @@ async function planAndStageBookResources(
         verifiedComplete: sweepVerifiedComplete,
         // #1035: source_sha moved only if the UPDATE landed AND carried a SHA.
         ownPublishUnstamped: !stamped || !masterSha,
+        mirror,
       });
       continue;
     }
@@ -11136,6 +11589,8 @@ async function planAndStageBookResources(
       // Null on every ordinary night. Non-null ONLY on a force-released
       // stale-base adoption — see the gate above and staleBaseOverridden below.
       staleBaseOverridden,
+      // #1418: the same staged file and the same paired boundary the prune uses.
+      mirror: mirrorWanted ? { r2Key, verifiedComplete, cutoff: stagedCutoff } : null,
     });
   }
   return { maxChapter, entries };
@@ -11402,6 +11857,87 @@ export async function bookLockedForAlert(
   }
 }
 
+// Issue #1418: run the locked-book mirror (mirrorLockedTsv) for every entry the
+// plan staged one for, after the ordinary apply and prune. Each kind runs as up
+// to MIRROR_MAX_STEPS steps; each step re-plans from fresh D1 and writes at
+// most MIRROR_ROWS_PER_STEP rows, so a whole-book drift spreads over steps
+// instead of one step meeting the subrequest cap.
+//
+// A mirror that did not finish leaves the (book, kind) watermark uncertified:
+// a pipeline-held chapter, a write batch that threw, a removal skipped on an
+// unproven fetch, rows left past the last step, a missing staged file, or a
+// step that threw after its retries (caught here, so the book's remaining
+// steps still run). For an entry in `changed`, that rides perResource into the
+// reimport-sync step's own gate (prune_locked / apply_incomplete). An entry
+// NOT in `changed` never reaches that step, and its stored watermark already
+// matches master's SHA, which would certify D1 as in step with master while it
+// still holds drift (and let a later lock & push export write that drift over
+// Door43). So for those, this writes the withheld sentinel over the watermark
+// and records why: the freshness gate then refuses, and tomorrow's SHA check
+// re-stages the file through the full merge.
+async function runLockedMirrors(
+  env: Env,
+  step: WorkflowStep,
+  book: string,
+  entries: StagedResource[],
+  perResource: Record<Resource, ReimportCounts>,
+  instanceId: string,
+  alertObservedAt: number,
+): Promise<void> {
+  for (const e of entries) {
+    const kind = e.resource;
+    const mirror = e.mirror;
+    if (kind === "ult" || kind === "ust" || !mirror) continue;
+    let incomplete = false;
+    let lockedChapters = 0;
+    let kept = 0;
+    for (let n = 0; n < MIRROR_MAX_STEPS; n++) {
+      let res: LockedMirrorResult | null;
+      try {
+        res = await step.do(`reimport-mirror-${book}-${kind}-${n}`, async () => {
+          const raw = await readStaged(env, mirror.r2Key);
+          if (raw == null) return null;
+          return mirrorLockedTsv(env, book, kind, raw, mirror.cutoff, mirror.verifiedComplete);
+        });
+      } catch (err) {
+        console.error("reimport locked mirror: step failed; watermark left uncertified", {
+          book, resource: kind, step: n, error: err instanceof Error ? err.message : String(err),
+        });
+        incomplete = true;
+        break;
+      }
+      if (!res) {
+        incomplete = true;
+        break;
+      }
+      if (res.mirrored > 0) perResource[kind].mirrored = (perResource[kind].mirrored ?? 0) + res.mirrored;
+      lockedChapters = Math.max(lockedChapters, res.skippedLocked);
+      kept = res.kept; // re-counted by every step's plan: the last one stands
+      if (res.applyIncomplete || res.removeUnverified > 0) incomplete = true;
+      if (res.remaining === 0) break;
+      if (n === MIRROR_MAX_STEPS - 1) incomplete = true;
+    }
+    if (kept > 0) perResource[kind].mirror_kept = (perResource[kind].mirror_kept ?? 0) + kept;
+    if (lockedChapters > 0) perResource[kind].prune_locked += lockedChapters;
+    if (incomplete) perResource[kind].apply_incomplete = true;
+    if ((incomplete || lockedChapters > 0) && !e.changed) {
+      await step.do(`reimport-mirror-withhold-${book}-${kind}`, async () => {
+        await recordResourceSync(env, book, kind, WITHHELD_SYNC_SENTINEL_SHA, "reimport_withheld");
+        await recordSyncWithhold(
+          env,
+          book,
+          kind,
+          lockedChapters > 0 ? "prune_locked" : "apply_incomplete",
+          lockedChapters,
+          alertObservedAt,
+          instanceId,
+        );
+        console.warn("reimport locked mirror incomplete: watermark withheld", { book, resource: kind });
+      });
+    }
+  }
+}
+
 // Orchestrate a chunked, SHA-gated, diff-aware reimport of one book as a series
 // of Workflow steps. Lock-free (see section header). Returns aggregate counts.
 export async function runChunkedReimport(
@@ -11554,7 +12090,10 @@ export async function runChunkedReimport(
     // stay skipped). But `sweepCandidates` can be non-empty here: a resource
     // whose file was staged ONLY because hasDueTombstones was true still
     // needs its sweep to run, or the tombstone is starved again tonight.
-    if (sweepCandidates.length > 0) {
+    // #1418: a locked book is mirrored even on a night nothing changed.
+    await runLockedMirrors(env, step, book, plan.entries, perResource, instanceId, alertObservedAt);
+    const mirrorKeys = plan.entries.filter((e) => e.mirror && e.mirror.r2Key !== e.r2Key);
+    if (sweepCandidates.length > 0 || mirrorKeys.length > 0) {
       await runTombstoneSweep(env, step, book, sweepCandidates);
       // Same best-effort R2 cleanup as the normal-flow cleanup step below —
       // these entries were staged in planAndStageBookResources purely for
@@ -11571,6 +12110,9 @@ export async function runChunkedReimport(
               /* best-effort */
             }
           }
+        }
+        for (const e of mirrorKeys) {
+          try { await env.BLOBS.delete((e.mirror as { r2Key: string }).r2Key); cleaned++; } catch { /* best-effort */ }
         }
         return { cleaned };
       });
@@ -11674,6 +12216,11 @@ export async function runChunkedReimport(
   // included too (`r2Key` is always set when `changed:true`), so this is a
   // strict superset of the old iteration, not a narrower one.
   await runTombstoneSweep(env, step, book, sweepCandidates);
+
+  // Issue #1418: for a locked book, make D1 equal Door43 master now that the
+  // merge and prune have run (see mirrorLockedTsv). Before the twl
+  // canonical-order pass, which still owns twl order.
+  await runLockedMirrors(env, step, book, plan.entries, perResource, instanceId, alertObservedAt);
 
   // Canonical TWL order: recompute the ULT-position ordering for the book now
   // that this run's ULT + twl changes are applied. The export step canonicalizes
@@ -11905,6 +12452,9 @@ export async function runChunkedReimport(
       if (e.r2Key) { try { await env.BLOBS.delete(e.r2Key); cleaned++; } catch { /* best-effort */ } }
       if (e.confirmedBaseR2Key) {
         try { await env.BLOBS.delete(e.confirmedBaseR2Key); cleaned++; } catch { /* best-effort */ }
+      }
+      if (e.mirror && e.mirror.r2Key !== e.r2Key) {
+        try { await env.BLOBS.delete(e.mirror.r2Key); cleaned++; } catch { /* best-effort */ }
       }
     }
     return { cleaned };

@@ -179,6 +179,9 @@ function altLabelProblems(note: string): string[] {
 //                    nightly retire sweep titles correctly.
 //   ref_moved      — nothing was merged at all; the two sides disagree about
 //                    where the row belongs.
+//   mirror_kept    — a locked book's nightly mirror kept theirs over Door43's
+//                    because they changed it after the last confirmed push
+//                    (#1418; lockedMirror.ts).
 // Hard-coding "Merged Door43 edit" for every flag, as tq/twl did, told a reader
 // of the last two the reverse of what happened. `fallback` preserves each kind's
 // pre-existing wording for a flag with no mapping (tn's older "Adapted note").
@@ -187,6 +190,7 @@ export function reviewFlagTitle(reviewKind: string | null | undefined, fallback:
     case "merge_conflict":
       return "Merged Door43 edit — verify";
     case "merge_kept":
+    case "mirror_kept":
       return "Kept over Door43 — verify";
     case "ref_moved":
       return "Reference differs from Door43 — verify";
