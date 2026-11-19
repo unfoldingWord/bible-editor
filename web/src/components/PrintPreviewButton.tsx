@@ -28,6 +28,7 @@ import CloseIcon from "@mui/icons-material/Close";
 import type { VerseDto } from "../sync/api";
 import { fetchBookVerses } from "../lib/bookVerses";
 import { PRINT_PREVIEW_CSS, buildPrintPreviewDocument, renderPrintPreviewHtml } from "../lib/printPreview";
+import { annotateQuotes, quoteSummaryHtml, type QuoteSummaryContext } from "../lib/quoteMatch";
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -86,14 +87,20 @@ function PrintPreviewDialog({ book, chapter, versions, chapterVersesFor, onClose
   const [scope, setScope] = useState<Scope>("chapter");
   // Paratext-style "standard" view: tiny grey USFM markers inline.
   const [showMarkers, setShowMarkers] = useState(false);
+  // Quote matching: colour every quote mark by nesting level and flag the
+  // unbalanced ones (web/src/lib/quoteMatch.ts).
+  const [showQuotes, setShowQuotes] = useState(false);
   // Whole-book verses, fetched once per book+version while the dialog is open.
   const [bookVerses, setBookVerses] = useState<Record<string, VerseDto[]>>({});
   const bookKey = `${book}:${version}`;
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Chapter scope with Quotes on still needs the earlier chapters: a quote
+  // opened in chapter 3 may still be open in chapter 16.
+  const needBook = scope === "book" || (showQuotes && chapter > 1);
   useEffect(() => {
-    if (scope !== "book" || bookVerses[bookKey]) return;
+    if (!needBook || bookVerses[bookKey]) return;
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -113,13 +120,38 @@ function PrintPreviewDialog({ book, chapter, versions, chapterVersesFor, onClose
       cancelled = true;
       setLoading(false);
     };
-  }, [scope, version, book, bookKey, bookVerses]);
+  }, [needBook, version, book, bookKey, bookVerses]);
 
   const verses = scope === "chapter" ? chapterVersesFor(version) : (bookVerses[bookKey] ?? null);
-  const html = useMemo(
+  const baseHtml = useMemo(
     () => (verses ? renderPrintPreviewHtml({ book, bibleVersion: version, verses }) : null),
     [verses, book, version],
   );
+  // Quotes still open when the current chapter starts, from chapters 1..n-1 of
+  // the fetched book. The current chapter itself is rendered from the live
+  // chapter data, so unsaved-to-book edits there still count.
+  const allBookVerses = bookVerses[bookKey];
+  const carry = useMemo(() => {
+    if (!showQuotes || scope !== "chapter") return null;
+    if (chapter <= 1) return { open: [], earlierErrors: 0 };
+    if (!allBookVerses) return null;
+    const before = allBookVerses.filter((v) => v.chapter < chapter);
+    const r = annotateQuotes(renderPrintPreviewHtml({ book, bibleVersion: version, verses: before }));
+    return { open: r.openAtEnd, earlierErrors: r.problems.filter((p) => p.severity === "error").length };
+  }, [showQuotes, scope, chapter, allBookVerses, book, version]);
+  const html = useMemo(() => {
+    if (baseHtml === null || !showQuotes) return baseHtml;
+    const ctx: QuoteSummaryContext["carry"] =
+      scope === "book"
+        ? { state: "book" }
+        : carry
+          ? { state: "ready", earlierErrors: carry.earlierErrors }
+          : error
+            ? { state: "failed" }
+            : { state: "loading" };
+    const r = annotateQuotes(baseHtml, { carryIn: carry?.open ?? [], atBookEnd: scope === "book" });
+    return quoteSummaryHtml(r, { carry: ctx }) + r.html;
+  }, [baseHtml, showQuotes, scope, carry, error]);
   const title = scope === "chapter" ? `${book} ${chapter} · ${version}` : `${book} · ${version}`;
 
   // Hand the rendered page to a new window: the print dialog can't target a
@@ -179,6 +211,11 @@ function PrintPreviewDialog({ book, chapter, versions, chapterVersesFor, onClose
         <Tooltip title="Show USFM markers inline (Paratext standard view)">
           <ToggleButton size="small" value="markers" selected={showMarkers} onChange={() => setShowMarkers((m) => !m)}>
             Markers
+          </ToggleButton>
+        </Tooltip>
+        <Tooltip title="Match quote marks: colour each “ ‘ by nesting level and flag unbalanced ones, counting quotes still open from earlier chapters">
+          <ToggleButton size="small" value="quotes" selected={showQuotes} onChange={() => setShowQuotes((q) => !q)}>
+            Quotes
           </ToggleButton>
         </Tooltip>
         <Stack direction="row" spacing={1} sx={{ ml: "auto", alignItems: "center" }}>

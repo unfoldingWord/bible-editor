@@ -363,6 +363,24 @@ export const PRINT_PREVIEW_CSS = `
 .print-preview.show-markers .paras_usfm_f .usfm-marker { color: #666; }
 .print-preview.show-markers .implied-word-start, .print-preview.show-markers .implied-word-end { display: inline; color: #999; }
 
+/* Quotes mode (quoteMatch.ts): marks coloured by nesting level, problems flagged. */
+.print-preview .qm { font-weight: bold; font-size: 1.2em; line-height: 1; border-radius: 3px; padding: 0 1px; }
+.print-preview .qm-n { font-family: Arial, sans-serif; font-size: 0.55em; font-weight: normal; }
+.print-preview .qm-l1 { color: #1565c0; }
+.print-preview .qm-l2 { color: #2e7d32; }
+.print-preview .qm-l3 { color: #8e24aa; }
+.print-preview .qm-l4 { color: #c43e00; }
+.print-preview .qm-warn { background: #ffe082; }
+.print-preview .qm-bad { background: #d32f2f; color: #fff; }
+.print-preview .qm-open { outline: 1px dashed #e59d33; }
+.print-preview .qm-carry { font-family: Arial, sans-serif; font-size: 0.8rem; text-indent: 0; background: #fff3cd; border: 1px solid #e59d33; border-radius: 3px; padding: 0 4px; margin-right: 0.5em; vertical-align: middle; white-space: nowrap; }
+.print-preview .qm-summary { font-family: Arial, sans-serif; font-size: 0.8rem; line-height: 1.5; background: #f6f8fa; border: 1px solid #ccc; border-radius: 4px; padding: 0.6em 1em; margin: 0 0 1.5em; }
+.print-preview .qm-summary .qm-problems { margin: 0.3em 0; padding-left: 1.4em; }
+.print-preview .qm-sum-bad { color: #b71c1c; }
+.print-preview .qm-sum-warn { color: #8a5a00; }
+.print-preview .qm-legend { color: #555; margin-top: 0.3em; }
+.print-preview .qm-legend .qm { font-size: 1.2em; }
+
 @media print {
   @page { margin: 20mm 25mm; }
   .print-preview { max-width: none; padding: 0; font-size: 11pt; }
