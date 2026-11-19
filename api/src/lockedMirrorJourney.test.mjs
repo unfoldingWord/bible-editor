@@ -326,13 +326,26 @@ console.log("\n[#1418 — locked book: an in-app reorder after the push (no edit
   const t = seed({ locked: true });
   // Master still holds the pushed order H, I; a person swapped them in the app
   // after the push. A reorder writes only sort_order + provenance.
-  t.sqlite.prepare(`UPDATE tn_rows SET sort_order = 300, last_change_source = 'user', last_change_action = 'reorder', updated_at = ? WHERE id = 'hhhh'`).run(T0 + 100);
+  t.sqlite.prepare(`UPDATE tn_rows SET sort_order = 300, last_change_source = 'user', last_change_action = 'reorder', updated_at = ? WHERE id = 'hhhh'`).run(T0); // same second as the push: still kept
   const masterOldOrder = MASTER_TN.replace(`${tnLine("2:1", "iiii", "I")}\n${tnLine("2:1", "hhhh", "H")}`, `${tnLine("2:1", "hhhh", "H")}\n${tnLine("2:1", "iiii", "I")}`);
   const state = { sha: SHA_1, files: { tn: masterOldOrder, tq: MASTER_TQ } };
   for (const n of [1, 2]) {
     await night(t, state);
     eq(d1Tn(t.sqlite).filter((r) => r.startsWith("2:1")), ["2:1|iiii|I", "2:1|hhhh|H"], `night ${n}: the app's order for 2:1 is kept`);
   }
+}
+
+console.log("\n[#1418 — locked book: dismissing a review flag after the push does not make a row pending]");
+{
+  const t = seed({ locked: true });
+  // bbbb: a person dismissed a review flag after the push (provenance only,
+  // no content change). Door43's edit to it must still land.
+  t.sqlite.prepare(`UPDATE tn_rows SET last_change_source = 'user', last_change_action = 'dismiss_review', updated_at = ? WHERE id = 'bbbb'`).run(T0 + 100);
+  // Quiet master (SHA = watermark), so the mirror is the only writer tonight.
+  t.sqlite.prepare(`UPDATE book_resource_syncs SET source_sha = ? WHERE book = ?`).run(SHA_1, BOOK);
+  await night(t, { sha: SHA_1, files: { tn: MASTER_TN, tq: MASTER_TQ } });
+  eq(d1Tn(t.sqlite).find((r) => r.includes("|bbbb|")), "1:1|bbbb|B changed on Door43", "the dismissed row takes Door43's text");
+  eq(flagOf(t.sqlite, "tn_rows", "bbbb"), null, "and is not flagged mirror_kept");
 }
 
 console.log("\n[#1418 — locked book with no confirmed push at all: nothing is mirrored (fail safe)]");

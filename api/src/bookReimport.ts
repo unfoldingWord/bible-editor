@@ -10570,7 +10570,10 @@ async function softDeleteRemovedTsvRows(
 //     review-flag dismissal. A person's PATCH/create/delete/trash, an AI
 //     apply, a bootstrap import: all keep the row.
 //   - row provenance: last_change_source 'user' or 'ai_pipeline' with
-//     updated_at past confirmedAt. This catches the in-app reorder, which
+//     updated_at at or past confirmedAt (same second keeps), unless the last
+//     action only cleared or dismissed a review flag (a dismissal is not a
+//     content change; were it pending, dismissing a mirror_kept flag would
+//     keep the row over Door43 for good). This catches the in-app reorder, which
 //     writes no edit_log row.
 // The flag writes below touch neither record (no edit_log row, no provenance,
 // no updated_at), so a kept row still reads as pending the next night.
@@ -10646,7 +10649,7 @@ async function mirrorLockedTsv(
   const table = TSV_TABLE[kind];
   const storedRs = await env.DB.prepare(
     `SELECT id, ${TSV_STORED_COLS[kind]}, sort_order, version, deleted_at${kind === "tn" ? ", trashed_at" : ""},
-            review_kind, review_reason, last_change_source, updated_at
+            review_kind, review_reason, review_master_json, last_change_source, last_change_action, updated_at
        FROM ${table} WHERE book = ?1`,
   )
     .bind(book)
@@ -10672,6 +10675,8 @@ async function mirrorLockedTsv(
     const id = String(row.id);
     byId.set(id, row);
     const src = (row.last_change_source as string | null) ?? null;
+    const action = (row.last_change_action as string | null) ?? null;
+    const flagOnly = action === "dismiss_review" || action === "review_clear";
     const updatedAt = row.updated_at == null ? null : Number(row.updated_at);
     stored.push({
       id,
@@ -10682,7 +10687,7 @@ async function mirrorLockedTsv(
       removed: row.deleted_at != null || (kind === "tn" && row.trashed_at != null),
       pending:
         pendingIds.has(id) ||
-        ((src === "user" || src === AI_SOURCE) && updatedAt != null && updatedAt > confirmedAt),
+        ((src === "user" || src === AI_SOURCE) && !flagOnly && updatedAt != null && updatedAt >= confirmedAt),
       review_kind: (row.review_kind as string | null) ?? null,
     });
   }
@@ -10700,7 +10705,12 @@ async function mirrorLockedTsv(
     return chs;
   };
   const touched = new Set<number>();
-  for (const id of [...plan.write, ...plan.insert, ...plan.remove, ...plan.sortOrder.keys()]) {
+  // Flag writes included: they go to a row in a chapter the job owns too.
+  const planIds = [
+    ...plan.write, ...plan.insert, ...plan.remove, ...plan.sortOrder.keys(),
+    ...plan.keep.map((k) => k.id), ...plan.clearFlag,
+  ];
+  for (const id of planIds) {
     for (const ch of chaptersOf(id)) touched.add(ch);
   }
   const lockedChapters = new Set<number>();
@@ -10834,19 +10844,23 @@ async function mirrorLockedTsv(
   const flags: D1PreparedStatement[][] = [];
   for (const k of plan.keep) {
     out.kept++;
+    if (!free(k.id)) continue;
     if (k.reason === "deleted_in_app") continue; // a tombstone shows no flag
     const s = byId.get(k.id) as Record<string, unknown>;
     const reason = mirrorKeptReason(k.reason);
-    if (s.review_kind === MIRROR_KEPT && s.review_reason === reason) continue;
     const m = masterRows.get(k.id);
+    const snapshot = m ? masterReviewSnapshot(kind, m) : null;
+    // Rewritten when Door43 moved again, so the popup's Door43 side is current.
+    if (s.review_kind === MIRROR_KEPT && s.review_reason === reason && (s.review_master_json ?? null) === snapshot) continue;
     flags.push([
       env.DB.prepare(
         `UPDATE ${table} SET review_kind = '${MIRROR_KEPT}', review_reason = ?1, review_master_json = ?2
           WHERE id = ?3 AND book = ?4 AND deleted_at IS NULL`,
-      ).bind(reason, m ? masterReviewSnapshot(kind, m) : null, k.id, book),
+      ).bind(reason, snapshot, k.id, book),
     ]);
   }
   for (const id of plan.clearFlag) {
+    if (!free(id)) continue;
     flags.push([
       env.DB.prepare(
         `UPDATE ${table} SET review_kind = NULL, review_reason = NULL, review_master_json = NULL
