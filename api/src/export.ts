@@ -1277,6 +1277,15 @@ export function tsvRevertReport(
 // translator's Tags or line-break edit still counts as ours. Reference must be
 // byte-equal between ours and base for the row to count as unchanged.
 //
+// A row Door43 deleted (in base and ours, ours unchanged, absent from master)
+// is left out of the render and returned in `dropped` (#1415): shipping ours
+// would add back a note someone removed on Door43. The nightly sync prunes
+// such a row from D1 only when no person owns it (softDeleteRemovedTsvRows in
+// bookReimport.ts), so a human-edited or preserved row deleted on Door43 stays
+// in D1 and reaches this point. Dropped rows count with kept rows toward
+// MASTER_MOVED_REFUSE_THRESHOLD. Only when the caller proves master's file was
+// read whole (`masterComplete`): a truncated read must not delete rows.
+//
 // A row Door43 moved to another Reference (with or without a text change) is
 // NOT kept: substituting it in place would leave it under the wrong verse in
 // our ordering, and shipping ours would undo the move. It is returned in
@@ -1291,14 +1300,18 @@ export interface KeptMasterRow {
 }
 
 export interface KeepMasterPlan {
-  // `rendered` with each kept row's line replaced by master's line. Equal to
-  // `rendered` when nothing is kept.
+  // `rendered` with each kept row's line replaced by master's line and each
+  // dropped row's line removed. Equal to `rendered` when nothing is kept or
+  // dropped.
   content: string;
   kept: KeptMasterRow[];
   moved: KeptMasterRow[];
+  // Rows Door43 deleted that Bible Editor had not changed (#1415). `fields`
+  // is empty; `ref` is ours.
+  dropped: KeptMasterRow[];
 }
 
-// More kept rows than this in one book+resource means D1 is badly out of date
+// More kept (or dropped) rows than this in one book+resource means D1 is badly out of date
 // for it (a missed sync, not one person's fix), so the push is refused and a
 // person re-syncs first (#1403).
 export const MASTER_MOVED_REFUSE_THRESHOLD = 20;
@@ -1340,6 +1353,9 @@ export function planKeepMasterRows(
   // Restrict the plan to these IDs (the rows an unproven push kept; see
   // ExportWorkflow.masterMovedGuard). Absent = every row.
   onlyIds: ReadonlySet<string> | null = null,
+  // masterTsv is provably the whole file (fetchDcsMasterTextVerified). Rows
+  // master lacks are dropped only then; otherwise they ship as before (#1415).
+  masterComplete = false,
 ): KeepMasterPlan | null {
   const headers = kind === "tn" ? TN_HEADERS : kind === "tq" ? TQ_HEADERS : TWL_HEADERS;
   const refIdx = headers.indexOf("Reference");
@@ -1361,17 +1377,26 @@ export function planKeepMasterRows(
   const oursSame = (a: string[], b: string[], i: number) => ourCanon(a[i] ?? "") === ourCanon(b[i] ?? "");
   const kept: KeptMasterRow[] = [];
   const moved: KeptMasterRow[] = [];
+  const dropped: KeptMasterRow[] = [];
   const keepLine = new Map<string, string>();
   for (const [id, oursCells] of ours.rows) {
     if (onlyIds && !onlyIds.has(id)) continue;
     if (ours.dupes.has(id) || base.dupes.has(id) || master.dupes.has(id)) continue;
     const baseCells = base.rows.get(id);
     const masterCells = master.rows.get(id);
-    if (!baseCells || !masterCells) continue; // new or deleted row: the shrink guard's territory
+    if (!baseCells) continue; // new in ours: ships
     const oursUnchanged =
       refKey(oursCells[refIdx]) === refKey(baseCells[refIdx]) &&
       [...contentIdx, tagsIdx].every((i) => oursSame(oursCells, baseCells, i));
     if (!oursUnchanged) continue; // we changed it: today's behaviour
+    if (!masterCells) {
+      // Only Door43 deleted it (#1415): leave it out rather than add it back.
+      // A master read not proven complete could just be short: ship as before.
+      if (!masterComplete) continue;
+      dropped.push({ id, ref: oursCells[refIdx] ?? "", fields: [] });
+      keepLine.set(id, "");
+      continue;
+    }
     const fields = contentIdx.filter((i) => !same(masterCells, baseCells, i)).map((i) => headers[i]);
     const refMoved = refKey(masterCells[refIdx]) !== refKey(baseCells[refIdx]);
     if (fields.length === 0 && !refMoved) continue; // master did not move substantively
@@ -1388,21 +1413,24 @@ export function planKeepMasterRows(
     line[tagsIdx] = exportTags(kind, line[tagsIdx]);
     keepLine.set(id, line.join("\t"));
   }
-  if (keepLine.size === 0) return { content: renderedTsv, kept, moved };
+  if (keepLine.size === 0) return { content: renderedTsv, kept, moved, dropped };
   const lines = renderedTsv.split("\n");
+  const out: string[] = [lines[0]];
   for (let i = 1; i < lines.length; i++) {
     const id = lines[i].split("\t")[1]?.trim();
     const replacement = id ? keepLine.get(id) : undefined;
-    if (replacement !== undefined) lines[i] = lines[i].endsWith("\r") ? replacement + "\r" : replacement;
+    if (replacement === undefined) out.push(lines[i]);
+    else if (replacement !== "") out.push(lines[i].endsWith("\r") ? replacement + "\r" : replacement);
+    // "" = a dropped row: its line is left out.
   }
-  return { content: lines.join("\n"), kept, moved };
+  return { content: out.join("\n"), kept, moved, dropped };
 }
 
 // Ship, keep, or refuse (#1403). Separate from planKeepMasterRows so the
 // threshold is one tested decision: any `moved` row, or more than
-// MASTER_MOVED_REFUSE_THRESHOLD kept rows, refuses the push.
-export function masterMovedGuardRefuses(plan: Pick<KeepMasterPlan, "kept" | "moved">): boolean {
-  return plan.moved.length > 0 || plan.kept.length > MASTER_MOVED_REFUSE_THRESHOLD;
+// MASTER_MOVED_REFUSE_THRESHOLD kept-or-dropped rows (#1415), refuses the push.
+export function masterMovedGuardRefuses(plan: Pick<KeepMasterPlan, "kept" | "moved" | "dropped">): boolean {
+  return plan.moved.length > 0 || plan.kept.length + plan.dropped.length > MASTER_MOVED_REFUSE_THRESHOLD;
 }
 
 // ── Partitioning the revert report by master's measured lineage (#1231) ───

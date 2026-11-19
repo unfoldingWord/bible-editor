@@ -83,13 +83,16 @@ export function d1RenderKey(r2Key: string): string {
 }
 
 // IDs whose line differs between D1's render and the bytes pushed for it:
-// the rows that push kept from master (#1403 carry mode).
+// the rows that push kept from master (#1403 carry mode), plus the rows it
+// left out because Door43 had deleted them (#1415).
 function keptIdsBetween(d1Render: string, pushed: string): Set<string> {
   const lines = (raw: string) =>
     new Map(raw.split(/\r?\n/).slice(1).filter(Boolean).map((l) => [l.split("\t")[1]?.trim() ?? "", l] as const));
   const a = lines(d1Render);
+  const b = lines(pushed);
   const out = new Set<string>();
-  for (const [id, line] of lines(pushed)) if (id && a.has(id) && a.get(id) !== line) out.add(id);
+  for (const [id, line] of b) if (id && a.has(id) && a.get(id) !== line) out.add(id);
+  for (const id of a.keys()) if (id && !b.has(id)) out.add(id);
   return out;
 }
 
@@ -132,7 +135,7 @@ import {
   ALL_RESOURCES as REIMPORT_RESOURCES,
 } from "./bookReimport";
 import { noteLockedPushOnVerseMergeAlert, retireVerseKeptAiMasterFlags } from "./verseMergeConflicts.ts";
-import { dcsResourceFile, fetchDcsMasterText, fileBlobShaAtCommit, fileHeadCommit, repoHeadCommitSha, type ReimportResource } from "./dcsSources";
+import { dcsResourceFile, fetchDcsMasterText, fetchDcsMasterTextVerified, fileBlobShaAtCommit, fileHeadCommit, repoHeadCommitSha, type ReimportResource } from "./dcsSources";
 import { readLedgerMasterLineage, type LedgerLineageResult } from "./masterLineageLedger.ts";
 import { DCS_POLL_FETCH_TIMEOUT_MS } from "./dcsCommitPoll.ts";
 import { gitBlobSha, gitBlobShaOrNull, findOurMergeForPr, judgeOwnPublishDecline } from "./ownPublish";
@@ -1112,9 +1115,11 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // whose row==line model makes the count exact. This is what would have
     // stopped the twl_PSA clobber (4880 rows shipped over master's 7776).
     let tsvMasterContentForRevertReport: string | null = null;
+    let tsvMasterVerified = false;
     if (dcsAllowed && (resource === "tn" || resource === "tq" || resource === "twl")) {
       const guard = await this.checkTsvShrink(book, resource, built.rowCount, built.content, fresh.masterSha);
       tsvMasterContentForRevertReport = guard.masterContent;
+      tsvMasterVerified = guard.masterVerified === true;
       if (!guard.ok && allowShrink && guard.detail.startsWith("shrink_")) {
         // Explicit human override for a verified-intentional deletion. Scoped to
         // a real shrink only — "master_unreadable" still fails closed, since an
@@ -1223,19 +1228,28 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
 
     // Keep-master guard (#1403): a row Bible Editor has not changed since its
     // last push that reached master, but that Door43 changed substantively,
-    // ships as master's row instead of reverting it. Too many such rows (or a
+    // ships as master's row instead of reverting it. Such a row that Door43
+    // deleted is left out instead of added back (#1415), but only when the
+    // master read is verified complete. Too many kept-or-dropped rows (or a
     // row Door43 also moved to another verse) refuses the push. Runs before
     // the hard-reject gate so every later step (that gate, the R2 copy,
     // commitToDcs, recordPushedRender, a conflict rebuild, the revert report)
     // sees the one content that actually ships. Not measured (no proven base,
     // unreadable base or master, unparseable TSV) → ships as before.
     if (dcsAllowed && (resource === "tn" || resource === "tq" || resource === "twl") && tsvMasterContentForRevertReport != null) {
-      const guard = await this.masterMovedGuard(book, resource, built.content, tsvMasterContentForRevertReport, r2Key);
+      const guard = await this.masterMovedGuard(
+        book,
+        resource,
+        built.content,
+        tsvMasterContentForRevertReport,
+        r2Key,
+        tsvMasterVerified,
+      );
       if (guard.measured) {
         const { plan } = guard;
         if (masterMovedGuardRefuses(plan)) {
           await this.recordMasterMovedRefusal(book, resource, plan);
-          const reason = `master_moved_guard:${plan.kept.length}_kept_${plan.moved.length}_moved`;
+          const reason = `master_moved_guard:${plan.kept.length}_kept_${plan.moved.length}_moved_${plan.dropped.length}_dropped`;
           await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
           return {
             book,
@@ -1252,12 +1266,15 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           };
         }
         await this.clearExportAlert(`export_master_moved:${book}:${resource}`);
-        if (plan.kept.length > 0) {
+        if (plan.kept.length > 0 || plan.dropped.length > 0) {
           const d1Render = built.content;
           built.content = plan.content;
+          // Rows exported = rows that ship; dropped rows (#1415) do not.
+          built.rowCount -= plan.dropped.length;
           // D1's own render beside the pushed one, so the next export compares
           // D1 against what D1 was (not against the kept rows we pushed), which
-          // keeps the kept rows kept until D1 itself changes them. Tied to the
+          // keeps the kept rows kept (and the dropped rows dropped, #1415)
+          // until D1 itself changes them. Tied to the
           // pushed bytes by sha; basesha/basemode let a step.do retry of
           // this instance reuse this run's verdict. Written FIRST: if the put
           // below then fails, the step retries before anything is recorded.
@@ -1273,9 +1290,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             httpMetadata: { contentType: "text/tab-separated-values" },
           });
           console.log(
-            `export: kept Door43's version of ${plan.kept.length} ${book} ${resource} row(s) Bible Editor had not changed (#1403)`,
+            `export: kept Door43's version of ${plan.kept.length} and left out ${plan.dropped.length} Door43-deleted ` +
+              `${book} ${resource} row(s) Bible Editor had not changed (#1403, #1415)`,
           );
-          await this.recordKeptMasterRows(book, resource, plan.kept);
+          await this.recordKeptMasterRows(book, resource, plan.kept, plan.dropped);
         } else {
           await this.clearExportAlert(`export_kept_master:${book}:${resource}`);
         }
@@ -2633,15 +2651,22 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // tsvRevertReport) WITHOUT a second fetch. null whenever master was never
     // actually read (no_file / master_unreadable).
     masterContent: string | null;
+    // True only when masterContent is provably the whole file (a pinned SHA
+    // whose contents-API size matched; fetchDcsMasterTextVerified). The
+    // keep-master guard leaves out a row master lacks only then (#1415): a
+    // short read must never read as "Door43 deleted it".
+    masterVerified?: boolean;
   }> {
     const file = dcsResourceFile(book, resource as ReimportResource);
     if (!file) return { ok: true, detail: "no_file", masterRows: null, masterContent: null };
-    const raw = await fetchDcsMasterText(this.env, file.repo, file.path, masterSha ?? undefined);
+    const fetched = await fetchDcsMasterTextVerified(this.env, file.repo, file.path, masterSha ?? undefined);
+    const raw = fetched.text;
+    const masterVerified = fetched.verified;
     if (raw == null) return { ok: false, detail: "master_unreadable", masterRows: null, masterContent: null };
     // Data rows = non-empty lines minus the header (mirrors parseTsv's model).
     const masterRows = Math.max(0, raw.split(/\r?\n/).filter((l) => l.length > 0).length - 1);
     if (!exportTsvShrinkRefused(renderedRows, masterRows)) {
-      return { ok: true, detail: "ok", masterRows, masterContent: raw };
+      return { ok: true, detail: "ok", masterRows, masterContent: raw, masterVerified };
     }
 
     // Shrink path (rare): don't just refuse on the raw count — attribute the
@@ -2657,7 +2682,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     if (masterIds == null) {
       // Can't parse master's ID column — never let an unreadable body
       // "explain" a shrink. Fall back to the original count-only refusal.
-      return { ok: false, detail: `shrink_${lost}_of_${masterRows}_ids_unreadable`, masterRows, masterContent: raw };
+      return { ok: false, detail: `shrink_${lost}_of_${masterRows}_ids_unreadable`, masterRows, masterContent: raw, masterVerified };
     }
 
     // Defect 5: fail closed on a master file that itself contains duplicate
@@ -2678,7 +2703,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         ok: false,
         detail: `shrink_${lost}_of_${masterRows}_master_duplicate_ids_${dupCount}`,
         masterRows,
-        masterContent: raw,
+        masterContent: raw, masterVerified,
       };
     }
 
@@ -2700,14 +2725,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // itself.
     const renderedIds = parseTsvIds(renderedContent);
     if (renderedIds == null) {
-      return { ok: false, detail: "render_ids_unreadable", masterRows, masterContent: raw };
+      return { ok: false, detail: "render_ids_unreadable", masterRows, masterContent: raw, masterVerified };
     }
     if (renderedIds.length !== renderedRows) {
       return {
         ok: false,
         detail: `render_inconsistent_${renderedIds.length}_vs_${renderedRows}`,
         masterRows,
-        masterContent: raw,
+        masterContent: raw, masterVerified,
       };
     }
 
@@ -2782,7 +2807,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         masterRows,
         explained,
         unexplained,
-        masterContent: raw,
+        masterContent: raw, masterVerified,
       };
     }
     return {
@@ -2791,7 +2816,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       masterRows,
       explained,
       unexplained,
-      masterContent: raw,
+      masterContent: raw, masterVerified,
     };
   }
 
@@ -3566,6 +3591,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     rendered: string,
     masterTsv: string,
     r2Key: string,
+    // masterTsv is provably the whole file: only then may a row master lacks
+    // be left out as deleted on Door43 (#1415).
+    masterVerified: boolean,
   ): Promise<
     | { measured: true; plan: KeepMasterPlan; baseBlobSha: string; mode: "full" | "carry" }
     | { measured: false; reason: string }
@@ -3644,7 +3672,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         baseText = await readVerifiedPushedRenderText(this.env, book, resource, pointer.r2Key, pointer.blobSha);
       }
       if (baseText == null) return notMeasured("base_unreadable");
-      const plan = planKeepMasterRows(rendered, baseText, masterTsv, resource, onlyIds);
+      const plan = planKeepMasterRows(rendered, baseText, masterTsv, resource, onlyIds, masterVerified);
       if (plan == null) return notMeasured("unparseable");
       return { measured: true, plan, baseBlobSha: pointer.blobSha, mode };
     } catch (e) {
@@ -3674,13 +3702,35 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // #1403: the push shipped Door43's version of rows D1 had not changed. D1
   // still holds the older text, so this stays up (re-written each push) until
   // D1 catches up; a person pulling the book from Door43 clears it.
-  private async recordKeptMasterRows(book: string, resource: Resource, kept: KeptMasterRow[]): Promise<void> {
+  // #1415: the same banner names rows left out because Door43 deleted them.
+  // A pull does not remove such a row from D1 when a person owns it (the sync
+  // prunes only unowned rows: softDeleteRemovedTsvRows), so the advice differs.
+  private async recordKeptMasterRows(
+    book: string,
+    resource: Resource,
+    kept: KeptMasterRow[],
+    dropped: KeptMasterRow[],
+  ): Promise<void> {
+    const parts: string[] = [];
+    if (kept.length > 0) {
+      parts.push(
+        `kept Door43's version of ${kept.length} row(s) that Bible Editor ` +
+          `had not changed since its last push, instead of overwriting them with Bible Editor's older text: ` +
+          `${describeKeptRows(kept)}. Bible Editor still shows the older text for these rows. Pull ${book} ` +
+          `from Door43 to bring them in; editing one of them in Bible Editor instead makes that edit win on the next push.`,
+      );
+    }
+    if (dropped.length > 0) {
+      parts.push(
+        `left out ${dropped.length} row(s) that were deleted on Door43 and that Bible Editor had not changed ` +
+          `since its last push, instead of adding them back: ${describeKeptRows(dropped)}. Bible Editor still ` +
+          `shows these rows. Delete them in Bible Editor to match Door43; editing one of them in Bible Editor ` +
+          `instead puts it back on Door43 with the next push.`,
+      );
+    }
     await this.writeAlert(
       `export_kept_master:${book}:${resource}`,
-      `${book} ${resource.toUpperCase()}: kept Door43's version of ${kept.length} row(s) that Bible Editor ` +
-        `had not changed since its last push, instead of overwriting them with Bible Editor's older text: ` +
-        `${describeKeptRows(kept)}. Bible Editor still shows the older text for these rows. Pull ${book} ` +
-        `from Door43 to bring them in; editing one of them in Bible Editor instead makes that edit win on the next push.`,
+      `${book} ${resource.toUpperCase()}: ${parts.join(" Also ")}`,
       `${this.env.DCS_BASE_URL}/unfoldingWord`,
       "warning",
     );
@@ -3692,9 +3742,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // The kept-rows banner from an earlier push is superseded by this one.
     await this.clearExportAlert(`export_kept_master:${book}:${resource}`);
     const why: string[] = [];
-    if (plan.kept.length > MASTER_MOVED_REFUSE_THRESHOLD) {
+    const keptOrDropped = plan.kept.length + plan.dropped.length;
+    if (keptOrDropped > MASTER_MOVED_REFUSE_THRESHOLD) {
       why.push(
-        `${plan.kept.length} rows is more than ${MASTER_MOVED_REFUSE_THRESHOLD}, which usually means Bible Editor's ` +
+        `${keptOrDropped} rows is more than ${MASTER_MOVED_REFUSE_THRESHOLD}, which usually means Bible Editor's ` +
           `copy of ${book} is out of date`,
       );
     }
@@ -3703,9 +3754,19 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     }
     await this.writeAlert(
       `export_master_moved:${book}:${resource}`,
-      `${book} ${resource.toUpperCase()}: not pushed to Door43. Door43 has changes to ${plan.kept.length + plan.moved.length} ` +
-        `row(s) that Bible Editor has not changed since its last push, and pushing would undo them (${why.join("; ")}). ` +
-        `Pull ${book} from Door43, check these rows, then push again: ${describeKeptRows([...plan.moved, ...plan.kept])}.`,
+      `${book} ${resource.toUpperCase()}: not pushed to Door43. Door43 ` +
+        [
+          plan.kept.length + plan.moved.length > 0 ? `has changes to ${plan.kept.length + plan.moved.length} row(s)` : "",
+          plan.dropped.length > 0 ? `deleted ${plan.dropped.length} row(s)` : "",
+        ]
+          .filter(Boolean)
+          .join(" and ") +
+        ` that Bible Editor has not changed since its last push, and pushing would undo them (${why.join("; ")}). ` +
+        `Pull ${book} from Door43, check these rows, then push again: ` +
+        `${describeKeptRows([...plan.moved, ...plan.kept, ...plan.dropped])}.` +
+        (plan.dropped.length > 0
+          ? ` A row deleted on Door43 that a person edited in Bible Editor stays after the pull; delete it in Bible Editor too.`
+          : ""),
       `${this.env.DCS_BASE_URL}/unfoldingWord`,
       "error",
     );
