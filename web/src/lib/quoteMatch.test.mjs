@@ -131,7 +131,6 @@ const msgs = (r) => r.problems.map((x) => `${x.ref.chapter}:${x.ref.verse} ${x.s
   const s = quoteSummaryHtml(r, { carry: { state: "book" } });
   assert(s.startsWith('<details class="qm-summary" open><summary class="qm-head">'), "summary is an open <details> by default");
   assert(s.includes(`data-qm-target="${r.problems[0].target}"`) && s.includes(`href="#${r.problems[0].target}"`), "problem links carry the target");
-  assert(quoteSummaryHtml(r, { carry: { state: "book" }, open: false }).startsWith('<details class="qm-summary"><summary'), "collapsed state drops open");
   // A carried-in quote that a closer exposes points at that closer.
   const c = annotateQuotes(render([v(5, 1, t("Go.” Done."))]), { carryIn: [{ mark: "“", ref: { chapter: 4, verse: "1" } }, { mark: "‘", ref: { chapter: 4, verse: "2" } }] });
   const p0 = c.problems.find((x) => x.message.startsWith("‘2 is never closed"));

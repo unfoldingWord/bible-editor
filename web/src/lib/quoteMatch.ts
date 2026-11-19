@@ -387,8 +387,6 @@ export interface QuoteSummaryContext {
   // computed from earlier chapters with `earlierErrors` errors among them.
   // "loading" / "failed": carry-in could not be computed (yet).
   carry: { state: "book" } | { state: "ready"; earlierErrors: number } | { state: "loading" } | { state: "failed" };
-  // Box expanded (default) or collapsed to its one-line head.
-  open?: boolean;
 }
 
 // The box above the text: counts, carry-in, problems, what stays open, legend.
@@ -444,5 +442,5 @@ export function quoteSummaryHtml(r: QuoteResult | null, ctx: QuoteSummaryContext
     `<div class="qm-legend">Level: <span class="qm qm-l1">“</span> 1 · <span class="qm qm-l2">‘</span> 2 · <span class="qm qm-l3">“</span> 3 · <span class="qm qm-l4">‘</span> 4 · ` +
       `small numbers pair an opening mark with its closing mark · <span class="qm qm-bad">red</span> = error · <span class="qm qm-warn">yellow</span> = check · hover a mark for details · click a problem to go to it</div>`,
   );
-  return `<details class="qm-summary"${ctx.open === false ? "" : " open"}>${head}<div class="qm-body">${lines.join("")}</div></details>\n`;
+  return `<details class="qm-summary" open>${head}<div class="qm-body">${lines.join("")}</div></details>\n`;
 }

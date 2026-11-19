@@ -7,7 +7,7 @@
 // client-side (web/src/lib/bookVerses.ts). "Print" / "Open in tab" hand the
 // same HTML to a new window (web/src/lib/printPreview.ts).
 
-import { useEffect, useMemo, useState, type MouseEvent } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import {
   Alert,
   Box,
@@ -90,9 +90,11 @@ function PrintPreviewDialog({ book, chapter, versions, chapterVersesFor, onClose
   // Quote matching: colour every quote mark by nesting level and flag the
   // unbalanced ones (web/src/lib/quoteMatch.ts).
   const [showQuotes, setShowQuotes] = useState(false);
-  // Quote-check box expanded or collapsed; kept here so a re-render of the
-  // preview HTML doesn't snap it back open.
+  // Quote-check box expanded or collapsed in the dialog. Applied to the DOM
+  // after each render rather than baked into the HTML, so toggling never
+  // re-annotates the text and Print / Open in tab always get the box open.
   const [quotesOpen, setQuotesOpen] = useState(true);
+  const previewRef = useRef<HTMLDivElement>(null);
   // Whole-book verses, fetched once per book+version while the dialog is open.
   const [bookVerses, setBookVerses] = useState<Record<string, VerseDto[]>>({});
   const bookKey = `${book}:${version}`;
@@ -162,8 +164,12 @@ function PrintPreviewDialog({ book, chapter, versions, chapterVersesFor, onClose
     // would read as "closes nothing": show the plain text meanwhile.
     if (ctx.state === "loading") return quoteSummaryHtml(null, { carry: ctx }) + baseHtml;
     const r = annotateQuotes(baseHtml, { carryIn: carry?.open ?? [], atBookEnd: scope === "book" });
-    return quoteSummaryHtml(r, { carry: ctx, open: quotesOpen }) + r.html;
-  }, [baseHtml, showQuotes, scope, carry, bookFailed, quotesOpen]);
+    return quoteSummaryHtml(r, { carry: ctx }) + r.html;
+  }, [baseHtml, showQuotes, scope, carry, bookFailed]);
+  useLayoutEffect(() => {
+    const box = previewRef.current?.querySelector<HTMLDetailsElement>("details.qm-summary");
+    if (box) box.open = quotesOpen;
+  }, [html, quotesOpen]);
 
   // Clicks inside the preview: a problem link scrolls to its mark and flashes
   // it (its `#id` href would otherwise hit the app's hash router), and the
@@ -192,11 +198,16 @@ function PrintPreviewDialog({ book, chapter, versions, chapterVersesFor, onClose
       mark.classList.remove("qm-flash");
       void mark.offsetWidth; // restart the flash animation on a repeat click
       mark.classList.add("qm-flash");
+      // Only the latest jump stays highlighted, and only briefly.
+      setTimeout(() => mark.classList.remove("qm-flash"), 2000);
       return;
     }
-    if (el.closest(".qm-summary > summary")) {
+    const summary = el.closest(".qm-summary > summary");
+    if (summary) {
+      // Toggle through state, not natively: React flushes this click's update
+      // before the browser's own toggle would run, so the two would cancel.
       e.preventDefault();
-      setQuotesOpen((o) => !o);
+      setQuotesOpen(!(summary.parentElement as HTMLDetailsElement).open);
     }
   }
   const title = scope === "chapter" ? `${book} ${chapter} · ${version}` : `${book} · ${version}`;
@@ -294,6 +305,7 @@ function PrintPreviewDialog({ book, chapter, versions, chapterVersesFor, onClose
           <Box sx={{ my: 2 }}>
             <div
               className={showMarkers ? "print-preview show-markers" : "print-preview"}
+              ref={previewRef}
               onClick={onPreviewClick}
               dangerouslySetInnerHTML={{ __html: `<h2 class="print-preview-title">${escapeHtml(title)}</h2>${html}` }}
             />
