@@ -956,6 +956,12 @@ Highlights that bite repeatedly:
   the joined array): a joined source built any other way, or a copy of that array, silently gets whole-bridge
   behaviour, so x-ref'd milestones resolve against the wrong copy of a repeated word. Any identity key on a
   source word (`content|occurrence`) must include `ref`, or the same 1/1 in two bridged verses collapses.
+- **Footnote bodies are edited only through `FootnoteBand` (`web/src/lib/footnotes.ts`), never the verse
+  contentEditable.** A `\f … \f*` body lives on the node's `content`, which `extractEditableText` never reads, so a
+  text edit cannot reach it; the band swaps or removes the one node and saves with intent `section_edit` (a 409 must
+  re-send verbatim — a text-space rebase would drop the footnote change). usfm-js cannot parse a footnote nested
+  inside a `\zaln` milestone: it splits it into `{type:"footnote", content:"+ "}`, `{tag:"ft"}` and a stray
+  `{tag:"f*"}`, so only nodes with `endTag` `f*`/`fe*` are offered for edit.
 
 ## Stop conditions / goals
 

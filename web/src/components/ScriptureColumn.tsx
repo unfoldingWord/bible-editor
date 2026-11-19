@@ -27,6 +27,8 @@ import { extractEditableText, extractTrailingMarkers, stripTrailingMarkers, spli
 import { introEditBase } from "../lib/verseIntro";
 import { t4tToUstPlain } from "../lib/t4t";
 import { SectionHeaderBand } from "./SectionHeaderBand";
+import { FootnoteBand } from "./FootnoteBand";
+import { listFootnotes, type FootnoteInfo } from "../lib/footnotes";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
 import { DriftedMarkerBand, driftedMarkerTags } from "./DriftedMarkerBand";
@@ -170,6 +172,14 @@ interface Props {
     change: { index: number; tag: string | null; text: string },
     base: VerseDto,
   ) => void;
+  // Footnote (`\f … \f*`) edit / delete in the active card (rows mode).
+  // content === null deletes the `index`-th body footnote (lib/footnotes.ts).
+  onEditFootnote?: (
+    verseNum: number,
+    bibleVersion: string,
+    change: { index: number; content: string | null },
+    base: VerseDto,
+  ) => void;
   // Book-mode variant — chapter is variable because BookView spans the
   // whole book. Same splice/save semantics as onEditSection above.
   onEditBookSection?: (
@@ -285,6 +295,7 @@ function ScriptureColumnInner({
   onSaveVerse,
   onRestoreVerse,
   onEditSection,
+  onEditFootnote,
   onEditBookSection,
   locked = false,
   bookLocked = false,
@@ -725,6 +736,7 @@ function ScriptureColumnInner({
             verseCommentCounts={verseCommentCounts}
             onOpenVerseComments={onOpenVerseComments}
             onEditSection={onEditSection}
+            onEditFootnote={onEditFootnote}
             onMergeBridge={
               onMergeVerseBridge ? (verseNum) => onMergeVerseBridge(chapter, verseNum, "UST") : undefined
             }
@@ -929,6 +941,7 @@ function StackedBody({
   verseCommentCounts,
   onOpenVerseComments,
   onEditSection,
+  onEditFootnote,
   onMergeBridge,
   onSplitBridge,
   locked,
@@ -969,6 +982,12 @@ function StackedBody({
     verseNum: number,
     bibleVersion: string,
     change: { index: number; tag: string | null; text: string },
+    base: VerseDto,
+  ) => void;
+  onEditFootnote?: (
+    verseNum: number,
+    bibleVersion: string,
+    change: { index: number; content: string | null },
     base: VerseDto,
   ) => void;
   // Verse-bridge create/break for the active card's UST line. Chapter is fixed
@@ -1177,6 +1196,11 @@ function StackedBody({
                     ? (change) => onEditSection(ultStart, "ULT", change, ultV)
                     : undefined
                 }
+                onEditFootnote={
+                  ultV && onEditFootnote
+                    ? (change) => onEditFootnote(ultStart, "ULT", change, ultV)
+                    : undefined
+                }
               />
               <ActiveLine
                 book={book}
@@ -1210,6 +1234,11 @@ function StackedBody({
                 onEditSection={
                   ustV && onEditSection
                     ? (change) => onEditSection(ustStart, "UST", change, ustV)
+                    : undefined
+                }
+                onEditFootnote={
+                  ustV && onEditFootnote
+                    ? (change) => onEditFootnote(ustStart, "UST", change, ustV)
                     : undefined
                 }
                 verseEnd={ustV?.verse_end ?? null}
@@ -1669,6 +1698,7 @@ function ActiveLine({
   onEditPlain,
   onSave,
   onEditSection,
+  onEditFootnote,
   version,
   onRestoreVersion,
   verseEnd,
@@ -1720,6 +1750,9 @@ function ActiveLine({
   // means delete the section header at that index. Shell mutates the
   // verseObjects tree directly and re-saves.
   onEditSection?: (change: { index: number; tag: string | null; text: string }) => void;
+  // Footnote edit / delete (content === null). See FootnoteBand / Shell's
+  // saveFootnoteEdit.
+  onEditFootnote?: (change: { index: number; content: string | null }) => void;
   // The verse row's monotonic version — drives the `v{N}` history chip
   // (editable ULT/UST only). Absent ⇒ no chip.
   version?: number;
@@ -1899,6 +1932,13 @@ function ActiveLine({
     if (!Array.isArray(verseObjects)) return [];
     return splitSectionHeaders(verseObjects).sections;
   }, [verseObjects]);
+  // Body footnotes — invisible to the contentEditable above, so surfaced in
+  // their own band below it (FootnoteBand). Source lines (UHB/UGNT) and RTL
+  // lines show none: only the translation lines carry editable notes.
+  const footnotes = useMemo<FootnoteInfo[]>(
+    () => (Array.isArray(verseObjects) && !isSource && !rtl ? listFootnotes(verseObjects) : []),
+    [verseObjects, isSource, rtl],
+  );
   // Markers attached to the previous verse that visually introduce
   // THIS verse — usfm-js stores `\q1 \v N+1` markers on verse N. We
   // render them as read-only chip bands above the editable area so
@@ -2219,6 +2259,12 @@ function ActiveLine({
           ))}
         </Stack>
       )}
+      <FootnoteBand
+        footnotes={footnotes}
+        editable={!!editable && !readOnly && !!onEditFootnote}
+        blockedReason={hasDraft ? "Save your typing in this verse first" : null}
+        onChange={onEditFootnote}
+      />
       {historyOpen && book && version != null && (
         <Suspense fallback={null}>
           <VerseHistoryDialog

@@ -59,6 +59,7 @@ import { shouldApplyUpsert } from "./rowUpsertGuard";
 import { drafts, verseKey, rowKey as draftRowKey, pinVerseBase, pinEpoch, unpinVerseBaseIfIdle, holdVerseBaseForEditor, registerVerseVersionReader } from "../sync/drafts";
 import { generationForSavedPlain } from "../sync/draftSaveState";
 import { smartEditVerse, labelRefusalText, editHeaderBand } from "../lib/replace";
+import { editFootnote } from "../lib/footnotes";
 import { adoptBaseQuotes, curlifyVerseContent } from "../lib/curlyVerse";
 import { extractEditableText, extractPlainText, normalizeEditable } from "../lib/usfm";
 import { chapterOpensWithoutMarker, introEditBase } from "../lib/verseIntro";
@@ -4586,6 +4587,41 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     if (chapterNum === chapter) applyLocalVerse(newDto);
   };
 
+  // Footnote (`\f … \f*`) edit / delete from the active card's FootnoteBand.
+  // Same shape as saveSectionEdit: a structural swap of the one footnote node
+  // (lib/footnotes.ts), no text diff, so no word or `\zaln` milestone is
+  // touched. Rides the `section_edit` intent: like a section header, a
+  // footnote body is invisible to extractEditableText, so a 409 must re-send
+  // this tree verbatim rather than text-rebase it (which would drop the
+  // footnote change — see verseRebase.ts).
+  const saveFootnoteEdit = (
+    chapterNum: number,
+    verseNum: number,
+    bibleVersion: string,
+    change: { index: number; content: string | null },
+    base: VerseDto,
+  ) => {
+    const verseObjects = (base.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+    if (!Array.isArray(verseObjects)) return;
+    const next = editFootnote(verseObjects, change);
+    if (next === verseObjects) return;
+    const newContent = { ...(base.content as Record<string, unknown> | null), verseObjects: next };
+    const newPlainText = extractPlainText(newContent);
+    const newDto = {
+      ...base,
+      chapter: chapterNum,
+      verse: verseNum,
+      bible_version: bibleVersion,
+      plain_text: newPlainText,
+      content: newContent,
+    } as VerseDto;
+    if (!enqueueVerseSafely(chapterNum, verseNum, bibleVersion, base, newContent, newPlainText, "section_edit")) {
+      return;
+    }
+    bookHook?.applyLocalVerse(newDto);
+    if (chapterNum === chapter) applyLocalVerse(newDto);
+  };
+
   // The chapter the rendered payload belongs to. Equal to `chapter` except in
   // the stale window (#892), when the previous chapter is still on screen:
   // anything that labels scripture content with a chapter uses this, so the
@@ -4982,6 +5018,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }}
           onEditSection={(verseNum, bibleVersion, change, base) => {
             saveSectionEdit(viewChapter, verseNum, bibleVersion, change, base);
+          }}
+          onEditFootnote={(verseNum, bibleVersion, change, base) => {
+            saveFootnoteEdit(viewChapter, verseNum, bibleVersion, change, base);
           }}
           onEditBookSection={(ch, verseNum, bibleVersion, change, base) => {
             saveSectionEdit(ch, verseNum, bibleVersion, change, base);
