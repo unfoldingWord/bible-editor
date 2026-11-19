@@ -20,6 +20,22 @@
 
 export const MIRROR_KEPT = "mirror_kept";
 
+/**
+ * Row actions that change nothing the export renders (#1428): review-flag
+ * acknowledgments and the tn preserve/hint bits. One of these after the last
+ * confirmed push does not make a row pending. trash/untrash are NOT here: the
+ * export leaves trashed notes out, so a trash after the push is a removal the
+ * pending push ships (and an untrash a row it ships back).
+ */
+export const MIRROR_NON_CONTENT_ACTIONS: readonly string[] = [
+  "dismiss_review",
+  "review_clear",
+  "preserve",
+  "unpreserve",
+  "hint",
+  "unhint",
+];
+
 /** One row of master's file, in file order. `sig` is tsvRowSignature. */
 export interface MirrorMasterRow {
   id: string;
@@ -39,6 +55,13 @@ export interface MirrorStoredRow {
   removed: boolean;
   /** A person (or the AI) changed this row in Bible Editor after the last confirmed push. */
   pending: boolean;
+  /**
+   * Not pending, but a person's non-content action after the push is the
+   * row's last provenance stamp, which may hide an earlier in-app drag (a
+   * reorder writes no edit_log row). Its verse keeps D1's order; its content
+   * still follows master.
+   */
+  holdOrder?: boolean;
   review_kind: string | null;
 }
 
@@ -131,7 +154,7 @@ export function planLockedMirror(
       if (!s.removed) place(verseKey(s.chapter, s.verse), s.id, true);
       continue;
     }
-    place(verseKey(m.chapter, m.verse), m.id, false);
+    place(verseKey(m.chapter, m.verse), m.id, s?.holdOrder === true);
   }
   for (const s of stored) {
     if (keptIds.has(s.id) && !masterById.has(s.id)) place(verseKey(s.chapter, s.verse), s.id, true);
@@ -143,7 +166,8 @@ export function planLockedMirror(
     const ids = g.ids.filter((id) => !removedIds.has(id));
     if (!mirrorOrder || g.pending) {
       // Order is left as D1 has it: twl always (see above), and a verse holding
-      // a pending row (a person's in-app order may be part of the pending fix).
+      // a pending or holdOrder row (a person's in-app order may be part of the
+      // pending fix).
       // A row master adds still needs a number: after the verse's last one.
       let next = Math.max(0, ...ids.filter((id) => !inserted.has(id)).map((id) => currentSort(id) ?? 0));
       for (const id of ids) {
