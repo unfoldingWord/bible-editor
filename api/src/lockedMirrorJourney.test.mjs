@@ -491,6 +491,19 @@ console.log("\n[#1428 item 2 — preserve/hint toggles after the push are not co
   eq(res.perResource.tn.mirror_kept, 2, "kept: only the two flagged rows (ffff, gggg) count");
 }
 
+console.log("\n[#1428 item 2 — a dismissal after the push does not hold its verse's order]");
+{
+  const t = seed({ locked: true });
+  quietMaster(t);
+  userAction(t.sqlite, "hhhh", "dismiss_review", T0 + 100, JSON.stringify({ review_kind: "merge_conflict", review_reason: "x" }));
+  t.sqlite
+    .prepare(`UPDATE tq_rows SET last_change_source = 'user', last_change_action = 'review_clear', updated_at = ? WHERE id = 'qa01'`)
+    .run(T0 + 100);
+  await night(t, { sha: SHA_1, files: { tn: MASTER_TN, tq: MASTER_TQ } });
+  eq(d1Tn(t.sqlite).filter((r) => r.startsWith("2:1")), ["2:1|iiii|I", "2:1|hhhh|H"], "tn 2:1 takes Door43's order");
+  eq(d1Tq(t.sqlite), EXPECTED_LOCKED_TQ, "tq 2:1 takes Door43's order");
+}
+
 console.log("\n[#1428 item 3 — a dismissed mirror_kept flag stays dismissed]");
 {
   const t = seed({ locked: true });
