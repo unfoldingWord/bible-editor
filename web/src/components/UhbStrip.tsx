@@ -10,6 +10,7 @@ import { nfc } from "../lib/hebrew";
 import { directionForVersion } from "../lib/direction";
 import { SourceTooltipBody } from "./SourceTooltipBody";
 import { LexTooltip } from "./LexTooltip";
+import { jumpToLinked } from "../lib/alignmentJump";
 import { pinLex, usePinnedLexRefresh } from "./PinnedLexBox";
 
 // ─── UHB source strip ────────────────────────────────────────────────
@@ -225,6 +226,10 @@ function SourceVerseToken({
           component="span"
           onMouseEnter={() => hctx.onHebrewEnter(pos)}
           onMouseLeave={hctx.onLeave}
+          data-hover-tone={tone ?? undefined}
+          onClick={(e) => {
+            if (hctx.hoverLink) jumpToLinked(e.currentTarget);
+          }}
           onDoubleClick={() => {
             if (showInfo) pinLex(source, lex, twHint);
           }}

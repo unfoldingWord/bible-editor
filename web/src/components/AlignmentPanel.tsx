@@ -100,6 +100,7 @@ import { LexTooltip } from "./LexTooltip";
 import { UhbStrip, buildTwHintMap, twHintFromMap } from "./UhbStrip";
 import { directionForVersion } from "../lib/direction";
 import { type HighlightCtx, hoverShadow } from "../lib/highlightTypes";
+import { JUMP_ROOT_ATTR, jumpToLinked } from "../lib/alignmentJump";
 
 const WORD_IDS_MIME = "text/word-ids";
 const SOURCE_ID_MIME = "text/source-id";
@@ -108,7 +109,6 @@ const GROUP_ID_MIME = "text/group-id";
 // Storage keys for sticky toolbar prefs.
 const LS_HIDE_UHB = "be:alignmentHideUhb";
 const LS_COLORIZE = "be:alignmentColorize";
-const LS_HOVERLINK = "be:alignmentHoverLink";
 const LS_INVENTORY_HEIGHT = "be:alignmentInventoryHeight";
 
 const DEFAULT_INVENTORY_HEIGHT = 112;
@@ -473,7 +473,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     const [colorize, setColorize] = useState<boolean>(() => readFlag(LS_COLORIZE));
     // hoverLink is controlled when the side-by-side parent passes it in;
     // otherwise it's local (standalone single-panel behavior unchanged).
-    const [localHoverLink, setLocalHoverLink] = useState<boolean>(() => readFlag(LS_HOVERLINK));
+    const [localHoverLink, setLocalHoverLink] = useState<boolean>(true);
     const hoverLink = hoverLinkProp !== undefined ? hoverLinkProp : localHoverLink;
     // Hover itself is never React state (#900) — it lives in an external store,
     // local to this panel unless a side-by-side parent shares one so both
@@ -518,7 +518,6 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       }
       setLocalHoverLink((cur) => {
         const next = !cur;
-        writeFlag(LS_HOVERLINK, next);
         if (!next) hoverStore.setHover(null);
         return next;
       });
@@ -1203,6 +1202,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
           overflow: "hidden",
           bgcolor: "background.paper",
         }}
+        {...{ [JUMP_ROOT_ATTR]: "" }}
         // #943: no drag can start while locked (the handlers above also
         // refuse; this keeps the drag ghost from appearing at all).
         onDragStartCapture={locked ? (e) => e.preventDefault() : undefined}
@@ -1494,7 +1494,7 @@ function InventoryStrip({
           label="hover-link"
           checked={hoverLink}
           onChange={onToggleHoverLink}
-          tooltip="hover any word to highlight its matches and aligned partner everywhere"
+          tooltip="hover any word to highlight its matches and aligned partner everywhere; click it to scroll an off-screen partner into view"
         />
         <Button
           size="small"
@@ -2224,6 +2224,10 @@ function SourceWordTypography({
           setHover(false);
           hctx.onLeave();
         }}
+        data-hover-tone={tone ?? undefined}
+        onClick={(e) => {
+          if (hctx.hoverLink) jumpToLinked(e.currentTarget);
+        }}
         onDragStart={(e) => {
           e.dataTransfer.setData(SOURCE_ID_MIME, source.id);
           e.dataTransfer.effectAllowed = "move";
@@ -2335,8 +2339,12 @@ function AlignedChip({
       label={targetLabel(text, occurrence, occurrences, supColor)}
       size="small"
       variant="outlined"
+      data-hover-tone={tone ?? undefined}
       onMouseEnter={() => hctx.onEnglishEnter(wordId, text, occurrence)}
       onMouseLeave={hctx.onLeave}
+      onClick={
+        hctx.hoverLink ? (e) => jumpToLinked(e.currentTarget as HTMLElement) : undefined
+      }
       sx={{
         fontFamily: '"Roboto","Helvetica",sans-serif',
         color: "text.disabled",
@@ -2391,6 +2399,7 @@ function SelectableChip({
       variant={selected ? "filled" : "outlined"}
       color={selected ? "primary" : "default"}
       draggable
+      data-hover-tone={tone ?? undefined}
       onClick={(e) => onClick(e.shiftKey)}
       onMouseEnter={() => hctx.onEnglishEnter(wordId, text, occurrence)}
       onMouseLeave={hctx.onLeave}
@@ -2445,8 +2454,12 @@ function SimpleDraggableChip({
         size="small"
         variant="outlined"
         draggable
+        data-hover-tone={tone ?? undefined}
         onMouseEnter={() => hctx.onEnglishEnter(wordId, text, occurrence, groupId)}
         onMouseLeave={hctx.onLeave}
+        onClick={(e) => {
+          if (hctx.hoverLink) jumpToLinked(e.currentTarget);
+        }}
         onDragStart={(e) => {
           e.dataTransfer.setData(WORD_IDS_MIME, JSON.stringify([wordId]));
           e.dataTransfer.setData("text/word-id", wordId);

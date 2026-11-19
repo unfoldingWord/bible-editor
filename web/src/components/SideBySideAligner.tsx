@@ -18,6 +18,7 @@ import KeyboardArrowLeftIcon from "@mui/icons-material/KeyboardArrowLeft";
 import KeyboardArrowRightIcon from "@mui/icons-material/KeyboardArrowRight";
 import { AlignmentPanel, type AlignerLock, type AlignmentPanelHandle } from "./AlignmentPanel";
 import { UhbStrip } from "./UhbStrip";
+import { JUMP_ROOT_ATTR } from "../lib/alignmentJump";
 import { type HighlightCtx } from "../lib/highlightTypes";
 import { createHoverStore, useHoverTone, type HoverStore } from "../lib/hoverStore";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
@@ -28,29 +29,6 @@ import type { LexiconEntry } from "../hooks/useLexicon";
 import { extractEditableText, normalizeEditable } from "../lib/usfm";
 import { formatVerseLabel } from "../lib/verseRange";
 import { droppedEditNotice, type DualSideRow } from "../lib/dualRowChange";
-
-// Separate key from the single-panel aligner's `be:alignmentHoverLink`
-// (which defaults OFF). The side-by-side popup's whole point is the
-// cross-highlight bridge ("hover Hebrew to bridge" in its titlebar), so it
-// defaults ON — and a distinct key keeps that intentional default from
-// colliding with (or being silently flipped by) the single-panel toggle,
-// whose `readFlag` reads the same string with the opposite default.
-const LS_HOVERLINK = "be:dualAlignmentHoverLink";
-function readHoverLink(): boolean {
-  try {
-    const raw = localStorage.getItem(LS_HOVERLINK);
-    return raw == null ? true : raw === "1";
-  } catch {
-    return true;
-  }
-}
-function writeHoverLink(v: boolean) {
-  try {
-    localStorage.setItem(LS_HOVERLINK, v ? "1" : "0");
-  } catch {
-    /* ignore */
-  }
-}
 
 // ─── Resizable reading strip ────────────────────────────────────────────
 // The reading (English) strip sits above the aligners as a fixed-height band.
@@ -371,7 +349,7 @@ export function SideBySideAligner({
   const hoverStoreRef = useRef<HoverStore | null>(null);
   if (!hoverStoreRef.current) hoverStoreRef.current = createHoverStore(null);
   const hoverStore = hoverStoreRef.current;
-  const [hoverLink, setHoverLink] = useState<boolean>(readHoverLink);
+  const [hoverLink, setHoverLink] = useState<boolean>(true);
   // Hebrew lexicon tooltip on hover — default on; turn off to see only what's
   // aligned (the highlight bridge) without the popup covering the panels.
   const [lexInfo, setLexInfo] = useState(false);
@@ -451,7 +429,6 @@ export function SideBySideAligner({
   const toggleHoverLink = () =>
     setHoverLink((cur) => {
       const next = !cur;
-      writeHoverLink(next);
       if (!next) hoverStore.setHover(null);
       return next;
     });
@@ -546,7 +523,12 @@ export function SideBySideAligner({
     // disableEnforceFocus: the pinned lexical box (PinnedLexBox) is portaled
     // outside this Dialog; a focus trap would fight text selection in it (#1053).
     <Dialog ref={dialogRef} open={open} onClose={onClose} fullScreen disableEnforceFocus>
-      <Box sx={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
+      <Box
+        // Outermost click-to-jump root: a click in either panel or the shared
+        // strip can scroll the other panel's panes too (lib/alignmentJump).
+        {...{ [JUMP_ROOT_ATTR]: "" }}
+        sx={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}
+      >
         {/* titlebar */}
         <Box
           sx={{
