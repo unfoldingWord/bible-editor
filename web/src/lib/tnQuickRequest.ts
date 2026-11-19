@@ -31,7 +31,7 @@ import {
 } from "./highlight.ts";
 import { shortSupport } from "./supportReference.ts";
 import { extractPlainText } from "./usfm.ts";
-import { bridgeNoteAnchor, buildVerseIndex, noteCoveredVerses } from "./verseRange.ts";
+import { bridgeNoteAnchor, buildVerseIndex, isRangeRow, noteCoveredVerses } from "./verseRange.ts";
 
 const CONTEXT_WINDOW = 5;
 const HEBREW_GAP = /[&…]+|\.{3}/g;
@@ -154,9 +154,13 @@ export function buildTnQuickRequest(
   // the note's own verse and occurrence.
   const selectionFor = (target: VerseDto | undefined, vo: unknown[], quote: string, occurrence: number): string => {
     const anchor = bridgeNoteAnchor(sourceByVerse, target, row.verse, quote, occurrence);
-    return anchor
-      ? extractTargetSelectionText(vo, quote, anchor.occurrence, verseObjectsOf(anchor.source) ?? undefined)
-      : extractTargetSelectionText(vo, quote, occurrence, sourceVo);
+    if (anchor) {
+      return extractTargetSelectionText(vo, quote, anchor.occurrence, verseObjectsOf(anchor.source) ?? undefined);
+    }
+    // A bridged row joined on the note's own verse: name that verse so x-ref'd
+    // words of the bridge's other verses stay out (#1414).
+    const sourceRef = target && isRangeRow(target) ? `${target.chapter}:${row.verse}` : undefined;
+    return extractTargetSelectionText(vo, quote, occurrence, sourceVo, sourceRef ? { sourceRef } : undefined);
   };
 
   let ultSelection: string;

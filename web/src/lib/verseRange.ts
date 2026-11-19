@@ -235,13 +235,21 @@ export function rowHighlightsFor(
   if (bibleVersion === "T4T") return new Set();
   if (target && isRangeRow(target)) {
     const [start, end] = verseSpan(target);
+    // The joined verse is passed as tCore's x-ref spelling so x-ref'd
+    // milestones naming another verse of the bridge stay dark (#1414).
     if (noteVerse != null && noteVerse > start && noteVerse <= end) {
       const own = sourceByVerseStart?.[noteVerse]?.content;
-      return own ? highlightsFor(bibleVersion, target.content, quote, occurrence, own, partialGroups) : new Set();
+      return own
+        ? highlightsFor(bibleVersion, target.content, quote, occurrence, own, partialGroups, `${target.chapter}:${noteVerse}`)
+        : new Set();
     }
     // Any other note (on the first verse, before the span, or with no verse)
-    // joins against the start verse alone, as on main.
-    return highlightsFor(bibleVersion, target.content, quote, occurrence, sourceByVerseStart?.[start]?.content ?? fallbackSource, partialGroups);
+    // joins against the start verse alone, as on main. A fallbackSource is of
+    // unknown verse, so it gets no x-ref scoping.
+    const startSource = sourceByVerseStart?.[start]?.content;
+    return startSource
+      ? highlightsFor(bibleVersion, target.content, quote, occurrence, startSource, partialGroups, `${target.chapter}:${start}`)
+      : highlightsFor(bibleVersion, target.content, quote, occurrence, fallbackSource, partialGroups);
   }
   const spanSource = sourceForTargetRow(sourceByVerseStart, target)?.content ?? fallbackSource;
   return highlightsFor(bibleVersion, target?.content, quote, occurrence, spanSource, partialGroups);

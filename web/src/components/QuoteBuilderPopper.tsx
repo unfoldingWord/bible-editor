@@ -155,6 +155,7 @@ export function QuoteBuilderPopper({
               uhbVerseObjects={seg.uhb}
               ultVerseObjects={seg.ult}
               ustVerseObjects={seg.ust}
+              sourceRef={seg.sourceRef}
               lexiconMap={lexiconMap}
               selectedKeys={selectedKeys}
               anchor={anchor}
@@ -221,6 +222,7 @@ function VerseBlock({
   uhbVerseObjects,
   ultVerseObjects,
   ustVerseObjects,
+  sourceRef,
   lexiconMap,
   selectedKeys,
   anchor,
@@ -235,6 +237,7 @@ function VerseBlock({
   uhbVerseObjects: unknown[] | null;
   ultVerseObjects: unknown[] | null;
   ustVerseObjects: unknown[] | null;
+  sourceRef?: string;
   lexiconMap: Map<string, LexiconEntry | null>;
   selectedKeys: Set<HighlightKey>;
   anchor: { verse: number; row: Row; index: number } | null;
@@ -244,12 +247,12 @@ function VerseBlock({
 }) {
   const uhbTokens = useMemo(() => collectUhbChips(uhbVerseObjects), [uhbVerseObjects]);
   const ultTokens = useMemo(
-    () => collectTargetTokens(ultVerseObjects, uhbVerseObjects),
-    [ultVerseObjects, uhbVerseObjects],
+    () => collectTargetTokens(ultVerseObjects, uhbVerseObjects, sourceRef),
+    [ultVerseObjects, uhbVerseObjects, sourceRef],
   );
   const ustTokens = useMemo(
-    () => collectTargetTokens(ustVerseObjects, uhbVerseObjects),
-    [ustVerseObjects, uhbVerseObjects],
+    () => collectTargetTokens(ustVerseObjects, uhbVerseObjects, sourceRef),
+    [ustVerseObjects, uhbVerseObjects, sourceRef],
   );
 
   const scope = (key: HighlightKey) => verseScopedKey(verse, key);
