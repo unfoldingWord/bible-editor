@@ -362,6 +362,94 @@ console.log("\n[8. a push that kept rows but has not merged yet: the next push s
   ok(noteOf(d.branch, "aa11") === "Translator edit.", "…and the translator's unshipped edit still ships");
 }
 
+// Remove one row from a rendered TSV (a person deleting a note on Door43).
+const deleteRow = (tsv, id) => tsv.split("\n").filter((l) => l.split("\t")[1] !== id).join("\n");
+const hasRow = (tsv, id) => (tsv ?? "").split("\n").some((l) => l.split("\t")[1] === id);
+
+console.log("\n[9. only Door43 deleted a row (D1 still has it) → it does not come back (#1415)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  d.master = deleteRow(d.master, "bb22");
+  const n2 = await t.exportOne("export-night-2");
+  ok(d.writes.length === 0, `nothing was committed to the branch (writes: ${d.writes.length})`);
+  ok(n2.dcsSkippedReason === "unchanged", `the render equals master, so the export is unchanged (got ${n2.dcsSkippedReason})`);
+  const pushed = t.r2.get(`exports/export-night-2/${BOOK}/tn/${FILE}`).body;
+  ok(!hasRow(pushed, "bb22"), "the R2 copy of the pushed render leaves bb22 out");
+  const alert = t.live(`export_kept_master:${BOOK}:tn`);
+  ok(alert.length === 1 && alert[0].message.includes("bb22 (1:2)") && alert[0].message.includes("deleted on Door43"), "an alert names bb22 as deleted on Door43");
+
+  console.log("\n[9b. the next export still leaves it out (D1 still has the row)]");
+  const n3 = await t.exportOne("export-night-3");
+  ok(d.writes.length === 0 && n3.dcsSkippedReason === "unchanged", `night 3 still leaves bb22 out (got ${n3.dcsSkippedReason}, writes ${d.writes.length})`);
+
+  console.log("\n[9c. once D1 deletes it too, the alert clears]");
+  t.sqlite.prepare(`UPDATE tn_rows SET deleted_at = 1 WHERE id = 'bb22'`).run();
+  await t.exportOne("export-night-4");
+  ok(t.live(`export_kept_master:${BOOK}:tn`).length === 0, "alert cleared on a measured clean pass");
+}
+
+console.log("\n[10. Door43 deleted two rows; a translator edited one of them and another row → the edits ship, the untouched deletion holds]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  t.sqlite
+    .prepare(`UPDATE book_resource_syncs SET pushed_read_at = pushed_read_at - 100, master_confirmed_at = master_confirmed_at - 100 WHERE book = ?`)
+    .run(BOOK);
+  d.master = deleteRow(deleteRow(d.master, "bb22"), "cc33");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator kept this one.' WHERE id = 'cc33'`).run();
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  await t.exportOne("export-night-2");
+  ok(!hasRow(d.branch, "bb22"), "bb22 (deleted on Door43, untouched here) stays off the branch");
+  ok(noteOf(d.branch, "cc33") === "Translator kept this one.", "cc33 (edited after the base) ships");
+  ok(noteOf(d.branch, "aa11") === "Translator edit.", "aa11's edit ships");
+  const alert = t.live(`export_kept_master:${BOOK}:tn`);
+  ok(alert.length === 1 && alert[0].message.includes("bb22") && !alert[0].message.includes("cc33"), "the alert names bb22 only");
+
+  console.log("\n[10b. a step.do retry of that export leaves bb22 out again]");
+  await t.exportOne("export-night-2");
+  ok(!hasRow(d.branch, "bb22") && noteOf(d.branch, "cc33") === "Translator kept this one.", "the retry does not add bb22 back");
+
+  console.log("\n[10c. a lock & push before that PR merges (carry mode) leaves bb22 out]");
+  d.branch = null;
+  await t.exportOne("export-lockpush");
+  ok(!hasRow(d.branch, "bb22"), "the unproven push's dropped row stays dropped");
+  ok(noteOf(d.branch, "cc33") === "Translator kept this one." && noteOf(d.branch, "aa11") === "Translator edit.", "…and the translator's edits still ship");
+}
+
+console.log("\n[11. too many rows deleted on Door43 → push refused + alert]");
+{
+  const id = (i) => `m${String(i).padStart(3, "0")}`;
+  const many = Array.from({ length: 30 }, (_, i) => [id(i), i + 1, `Note ${i}.`]);
+
+  for (const [label, del, edit, refuse] of [
+    ["21 deleted", 21, 0, true],
+    ["11 edited + 10 deleted", 10, 11, true],
+    ["20 deleted (at the threshold)", 20, 0, false],
+  ]) {
+    const d = door43();
+    const t = freshEnv(many);
+    await confirmedNight1(t, d);
+    for (let i = 0; i < del; i++) d.master = deleteRow(d.master, id(i));
+    for (let i = del; i < del + edit; i++) d.master = editNote(d.master, id(i), `Fixed ${i}.`);
+    const n2 = await t.exportOne("export-night-2");
+    if (refuse) {
+      ok(String(n2.dcsSkippedReason).startsWith("master_moved_guard:"), `${label}: refused (got ${n2.dcsSkippedReason})`);
+      ok(d.writes.length === 0, `${label}: nothing committed`);
+      const alert = t.live(`export_master_moved:${BOOK}:tn`);
+      ok(
+        alert.length === 1 && alert[0].message.includes("not pushed") && alert[0].message.includes(`${del + edit} rows is more than`),
+        `${label}: a refusal alert gives the combined count (${alert[0]?.message})`,
+      );
+    } else {
+      ok(n2.dcsSkippedReason === "unchanged", `${label}: ships (got ${n2.dcsSkippedReason})`);
+      ok(t.live(`export_master_moved:${BOOK}:tn`).length === 0, `${label}: no refusal alert`);
+    }
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
