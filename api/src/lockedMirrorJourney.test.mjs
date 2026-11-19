@@ -15,7 +15,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { runChunkedReimport } from "./bookReimport.ts";
+import { runChunkedReimport, setMirrorRowsPerStepForTest } from "./bookReimport.ts";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -252,10 +252,10 @@ const EXPECTED_LOCKED_TN = [
 ];
 const EXPECTED_LOCKED_TQ = ["2:1|qa02|Q2", "2:1|qa01|Q1"];
 
-async function night(t, state) {
+async function night(t, state, stepRunner = step) {
   const restore = stubDoor43(state);
   try {
-    return await runChunkedReimport(t.env, step, BOOK, `inst-${Math.random()}`, ["tn", "tq"]);
+    return await runChunkedReimport(t.env, stepRunner, BOOK, `inst-${Math.random()}`, ["tn", "tq"]);
   } finally {
     restore();
   }
@@ -346,6 +346,71 @@ console.log("\n[#1418 — locked book: dismissing a review flag after the push d
   await night(t, { sha: SHA_1, files: { tn: MASTER_TN, tq: MASTER_TQ } });
   eq(d1Tn(t.sqlite).find((r) => r.includes("|bbbb|")), "1:1|bbbb|B changed on Door43", "the dismissed row takes Door43's text");
   eq(flagOf(t.sqlite, "tn_rows", "bbbb"), null, "and is not flagged mirror_kept");
+}
+
+const syncOf = (sqlite, resource) =>
+  sqlite.prepare(`SELECT source_sha FROM book_resource_syncs WHERE book = ? AND resource = ?`).get(BOOK, resource)?.source_sha ?? null;
+const withholdOf = (sqlite, resource) =>
+  sqlite.prepare(`SELECT reason FROM sync_withholds WHERE book = ? AND resource = ?`).get(BOOK, resource)?.reason ?? null;
+
+console.log("\n[#1418 review A1 — quiet master, a pipeline job holds chapter 2: the mirror leaves it, and the watermark is withheld]");
+{
+  const t = seed({ locked: true });
+  t.sqlite.prepare(`UPDATE book_resource_syncs SET source_sha = ? WHERE book = ?`).run(SHA_1, BOOK);
+  t.sqlite
+    .prepare(
+      `INSERT INTO pipeline_jobs (job_id, user_id, pipeline_type, book, start_chapter, end_chapter, session_key, state)
+       VALUES ('job1', 42, 'notes', ?, 2, 2, 'sess1', 'running')`,
+    )
+    .run(BOOK);
+  await night(t, { sha: SHA_1, files: { tn: MASTER_TN, tq: MASTER_TQ } });
+  eq(d1Tn(t.sqlite).filter((r) => r.startsWith("2:1")), ["2:1|hhhh|H", "2:1|iiii|I"], "the held chapter's tn order is left alone");
+  eq(d1Tn(t.sqlite).some((r) => r.startsWith("1:3|dddd|")), false, "an unheld chapter is still mirrored");
+  eq(syncOf(t.sqlite, "tn"), "withheld", "tn watermark no longer certifies master's SHA");
+  eq(withholdOf(t.sqlite, "tn"), "prune_locked", "and the reason is recorded");
+  eq(syncOf(t.sqlite, "tq"), SHA_1, "tq (a notes job does not hold it) keeps its watermark");
+}
+
+console.log("\n[#1418 review A3 — a mirror step that throws: the run finishes, the watermark is withheld]");
+{
+  const t = seed({ locked: true });
+  const throwing = {
+    async do(name, optsOrFn, maybeFn) {
+      if (name.startsWith("reimport-mirror-") && name.includes("-tn-")) throw new Error("simulated D1 failure");
+      return step.do(name, optsOrFn, maybeFn);
+    },
+  };
+  let threw = false;
+  try {
+    await night(t, { sha: SHA_1, files: { tn: MASTER_TN, tq: MASTER_TQ } }, throwing);
+  } catch {
+    threw = true;
+  }
+  eq(threw, false, "runChunkedReimport does not throw");
+  eq(syncOf(t.sqlite, "tn") === SHA_1, false, "tn (changed this night) is not stamped with master's SHA");
+  eq(syncOf(t.sqlite, "tq"), SHA_1, "tq still reaches the sync step and is stamped");
+  eq(d1Tq(t.sqlite), EXPECTED_LOCKED_TQ, "tq's mirror still ran");
+}
+
+console.log("\n[#1418 review A2 — a per-step cap of 2 rows: the mirror spreads over steps and still ends equal to master]");
+{
+  const prev = setMirrorRowsPerStepForTest(2);
+  try {
+    const t = seed({ locked: true });
+    const names = [];
+    const counting = {
+      async do(name, optsOrFn, maybeFn) {
+        names.push(name);
+        return step.do(name, optsOrFn, maybeFn);
+      },
+    };
+    await night(t, { sha: SHA_1, files: { tn: MASTER_TN, tq: MASTER_TQ } }, counting);
+    eq(d1Tn(t.sqlite), EXPECTED_LOCKED_TN, "tn equals master except the pending rows");
+    eq(names.filter((n) => n.startsWith(`reimport-mirror-${BOOK}-tn-`)).length > 1, true, "tn's mirror took more than one step");
+    eq(syncOf(t.sqlite, "tn"), SHA_1, "a mirror that finished within its steps certifies the watermark");
+  } finally {
+    setMirrorRowsPerStepForTest(prev);
+  }
 }
 
 console.log("\n[#1418 — locked book with no confirmed push at all: nothing is mirrored (fail safe)]");

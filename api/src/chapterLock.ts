@@ -338,6 +338,54 @@ export async function lockedResourcesForChapter(
   return locked;
 }
 
+// lockedResourcesForChapter for every chapter of a book at once (issue #1418):
+// at most two queries however many chapters the caller asks about, instead of
+// one or two per chapter. Same rules, applied per chapter in memory: an active
+// job covering the chapter locks what it (and its pending chain) writes, and a
+// running chain's earlier links covering the chapter lock what they wrote.
+export async function bookChapterLocks(
+  env: Env,
+  book: string,
+): Promise<(chapter: number) => Set<LockedResource>> {
+  const statePlaceholders = NON_TERMINAL.map((_, i) => `?${i + 2}`).join(", ");
+  const active = await env.DB.prepare(
+    `SELECT job_id, pipeline_type, follow_up_chain, start_chapter, end_chapter
+       FROM pipeline_jobs
+      WHERE book = ?1 AND state IN (${statePlaceholders})`,
+  )
+    .bind(book.toUpperCase(), ...NON_TERMINAL)
+    .all<{ job_id: string; pipeline_type: string; follow_up_chain: string | null; start_chapter: number; end_chapter: number }>();
+  const jobs = active.results ?? [];
+  const hasChain = jobs.some((j) => chainRootJobId(j.job_id ?? "") !== (j.job_id ?? ""));
+  const siblings = hasChain
+    ? (
+        await env.DB.prepare(
+          `SELECT job_id, pipeline_type, start_chapter, end_chapter FROM pipeline_jobs WHERE book = ?1`,
+        )
+          .bind(book.toUpperCase())
+          .all<{ job_id: string; pipeline_type: string; start_chapter: number; end_chapter: number }>()
+      ).results ?? []
+    : [];
+  const covers = (j: { start_chapter: number; end_chapter: number }, ch: number) =>
+    Number(j.start_chapter) <= ch && Number(j.end_chapter) >= ch;
+  return (chapter: number) => {
+    const locked = new Set<LockedResource>();
+    const roots = new Set<string>();
+    for (const j of jobs) {
+      if (!covers(j, chapter)) continue;
+      for (const r of resourcesLockedByJob(j.pipeline_type, j.follow_up_chain)) locked.add(r);
+      const root = chainRootJobId(j.job_id ?? "");
+      if (root !== (j.job_id ?? "")) roots.add(root);
+    }
+    if (roots.size === 0) return locked;
+    for (const j of siblings) {
+      if (!covers(j, chapter) || !roots.has(chainRootJobId(j.job_id ?? ""))) continue;
+      for (const r of resourcesWrittenBy(j.pipeline_type)) locked.add(r);
+    }
+    return locked;
+  };
+}
+
 // The job_id every link of one chained run shares. enqueueFollowUpFromChain
 // mints a child as `${parentJobId}:chain${depth}`, so stripping at the first
 // `:chain` yields the macro's root for any link, and for an unchained job
