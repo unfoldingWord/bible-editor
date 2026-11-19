@@ -20,7 +20,8 @@ import {
 } from "./highlight.ts";
 import { extractEditableText, extractTrailingMarkers } from "./usfm.ts";
 import { buildQuoteFromSelection, selectionFromQuote, tokenKey, collectTargetTokens } from "./quoteBuilder.ts";
-import { extractTargetSelectionText } from "./highlight.ts";
+import { extractTargetSelectionText, findSourceForTargetText } from "./highlight.ts";
+import { nfc } from "./hebrew.ts";
 import { rowHighlightsFor } from "./verseRange.ts";
 import usfm from "usfm-js";
 import { readFileSync } from "node:fs";
@@ -843,6 +844,28 @@ const JOIN = "⁠";
     JSON.stringify(lit) === JSON.stringify(["Jerusalem", "in", "it", "many", "that", "things", "wood"]),
     `without x-ref every אֶת 1/1 still lights (got ${JSON.stringify(lit)})`,
   );
+  // English → Hebrew lookup ignores sourceRef when no milestone carries x-ref.
+  const ks = findSourceForTargetText(ust.chapters["9"]["10-12"].verseObjects, "King Solomon", "9:11");
+  assert(nfc(ks) === nfc("וְ⁠הַ⁠מֶּ֨לֶךְ שְׁלֹמֹ֜ה"), `without x-ref the first "King Solomon" (9:12's) still wins (got ${JSON.stringify(ks)})`);
+}
+
+// English → Hebrew (TN Quick's English input, #1426): in a bridged row with
+// x-ref, "King Solomon" is 9:12's first in document order, then 9:10's and
+// 9:11's. Scoped to 9:11, only 9:11's English can match; the words of the
+// other verses still break a run rather than joining across them.
+{
+  console.log("\n[x-ref] findSourceForTargetText stays in the named verse (#1426)");
+  const here = dirname(fileURLToPath(import.meta.url));
+  const samples = resolve(here, "../../../docs/samples");
+  const ustVo = usfm.toJSON(readFileSync(resolve(samples, "en_ust_14-2CH-9_10-12.usfm"), "utf8")).chapters["9"]["10-12"].verseObjects;
+  const unscoped = findSourceForTargetText(ustVo, "King Solomon");
+  assert(nfc(unscoped) === nfc("וְ⁠הַ⁠מֶּ֨לֶךְ שְׁלֹמֹ֜ה"), `unscoped: first match (9:12) as before (got ${JSON.stringify(unscoped)})`);
+  const s11 = findSourceForTargetText(ustVo, "King Solomon", "9:11");
+  assert(nfc(s11) === nfc("הַ֠⁠מֶּלֶךְ"), `scoped to 9:11: 9:11's הַמֶּלֶךְ (got ${JSON.stringify(s11)})`);
+  const s10 = findSourceForTargetText(ustVo, "King Solomon", "9:10");
+  assert(nfc(s10) === nfc("שְׁלֹמֹ֔ה"), `scoped to 9:10: only "Solomon" there aligns as King Solomon (got ${JSON.stringify(s10)})`);
+  const none = findSourceForTargetText(ustVo, "many things", "9:11");
+  assert(none === "", `9:12's English finds nothing when scoped to 9:11 (got ${JSON.stringify(none)})`);
 }
 
 if (failed) {

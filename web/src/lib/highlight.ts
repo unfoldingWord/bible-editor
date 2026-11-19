@@ -692,6 +692,13 @@ export function findTargetHighlights(
 export function findSourceForTargetText(
   verseObjects: unknown[],
   englishText: string,
+  // The single source verse the caller wants ("9:12"), when `verseObjects` is a
+  // bridged row: English under a milestone whose x-ref names another verse
+  // cannot match, so the first match in document order can't be that other
+  // verse's copy of the phrase. Those words stay in place and break a run.
+  // Milestones without x-ref, and every milestone when no sourceRef is given,
+  // behave as before (#1426).
+  sourceRef?: string,
 ): string {
   const wantedWords = englishText
     // Proofreaders paste straight from the ULT, which can carry USFM
@@ -709,27 +716,31 @@ export function findSourceForTargetText(
 
   type Target = { norm: string; sources: string[] };
   const targets: Target[] = [];
-  function walk(nodes: unknown[], stack: string[]) {
+  function walk(nodes: unknown[], stack: string[], otherVerse: boolean) {
     for (const node of nodes ?? []) {
       const o = node as Record<string, unknown> | null;
       if (!o) continue;
       if (nodeIsMilestone(o)) {
         const source = String(o["content"] ?? "");
         const children = (o["children"] as unknown[] | undefined) ?? [];
-        walk(children, source ? [...stack, source] : stack);
+        const ref = typeof o["ref"] === "string" && o["ref"] !== "" ? o["ref"] : undefined;
+        const other = otherVerse || (sourceRef !== undefined && ref !== undefined && ref !== sourceRef);
+        walk(children, source ? [...stack, source] : stack, other);
       } else if (nodeIsPsalmTitle(o)) {
         // \d (Psalm superscription) is type:"section" but its content IS
         // alignable verse body — walk its children like a milestone (no
         // source contribution of its own). Mirrors collectMilestoneRuns.
-        walk((o["children"] as unknown[] | undefined) ?? [], stack);
+        walk((o["children"] as unknown[] | undefined) ?? [], stack, otherVerse);
       } else if (nodeIsWord(o)) {
         const text = String(o["text"] ?? "");
         const norm = text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
-        if (norm.length > 0) targets.push({ norm, sources: stack });
+        // Another verse's word keeps its slot with a norm no wanted word can
+        // equal (wanted words are non-empty), so it never matches.
+        if (norm.length > 0) targets.push(otherVerse ? { norm: "", sources: [] } : { norm, sources: stack });
       }
     }
   }
-  walk(verseObjects, []);
+  walk(verseObjects, [], false);
   if (targets.length === 0) return "";
 
   let bestStart = -1;

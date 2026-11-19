@@ -959,7 +959,11 @@ Highlights that bite repeatedly:
   A bridged row joined against ONE of its verses (highlights, word gloss, TN Quick, picker verse blocks) has no
   side table, so it must be told which verse that is (`sourceRef`, #1414); without it, x-ref'd milestones from
   the other verses join too. Comparing two copies of these modules (a main snapshot vs the branch) needs each
-  copy's own `concatSourceRange`: the side table is per module instance.
+  copy's own `concatSourceRange`: the side table is per module instance. English → source lookups on a bridged
+  row (`findSourceForTargetText`, `resolveSpanToSource`) need `sourceRef` too (#1426): another verse's English
+  stays in place as a word that cannot match, so runs never join across it and the suggest route's
+  `glOccurrence`, counted over the whole row, still lines up. A TN note whose ref spans several verses may quote
+  any of them, so it is not scoped.
 
 ## Stop conditions / goals
 

@@ -5,6 +5,11 @@
 
 import assert from "node:assert/strict";
 import { resolveSpanToSource } from "./twlResolve.ts";
+import { nfc } from "./hebrew.ts";
+import usfm from "usfm-js";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 let passed = 0;
 const check = (cond, msg) => {
@@ -132,6 +137,52 @@ const ult = [
   check(
     first.orig_words !== second.orig_words || first.occurrence !== second.occurrence,
     "the two twins resolve to DIFFERENT source words",
+  );
+}
+
+// --- a bridged ULT row with x-ref, resolved against ONE verse (#1426) --------
+// Real Door43 2CH 9:10-12 (the UST bridge stands in for a bridged ULT): each
+// milestone counts per source verse and names it in x-ref, so אֶת 1/1 x-ref
+// 9:11 and אֶת 1/1 x-ref 9:12 share the key אֶת|1. Resolving one verse's
+// suggestion against that verse's UHB must not take another verse's English.
+{
+  console.log("\n[x-ref] bridged row resolved against one verse");
+  const here = dirname(fileURLToPath(import.meta.url));
+  const samples = resolve(here, "../../../docs/samples");
+  const ustRaw = readFileSync(resolve(samples, "en_ust_14-2CH-9_10-12.usfm"), "utf8");
+  const uhbJson = usfm.toJSON(readFileSync(resolve(samples, "hbo_uhb_14-2CH-9_10-12.usfm"), "utf8"));
+  const uhbOf = (v) => uhbJson.chapters["9"][String(v)].verseObjects;
+  const bridge = usfm.toJSON(ustRaw).chapters["9"]["10-12"].verseObjects;
+
+  const own = resolveSpanToSource(bridge, uhbOf(12), "many things", 1, "9:12");
+  check(
+    own && nfc(own.orig_words) === nfc("אֶת־כָּל") && own.occurrence === 1 && own.confident,
+    `9:12's "many things" -> 9:12's אֶת־כָּל (got ${JSON.stringify(own)})`,
+  );
+  const cross12 = resolveSpanToSource(bridge, uhbOf(12), "that wood", 1, "9:12");
+  check(cross12 === null, `9:11's "that wood" does not resolve to 9:12's אֶת (got ${JSON.stringify(cross12)})`);
+  const cross11 = resolveSpanToSource(bridge, uhbOf(11), "many things", 1, "9:11");
+  check(cross11 === null, `9:12's "many things" does not resolve to 9:11's אֶת (got ${JSON.stringify(cross11)})`);
+  const own11 = resolveSpanToSource(bridge, uhbOf(11), "that wood", 1, "9:11");
+  check(
+    own11 && nfc(own11.orig_words).startsWith(nfc("אֶת")) && own11.occurrence === 1 && own11.confident,
+    `9:11's "that wood" -> 9:11's אֶת … (got ${JSON.stringify(own11)})`,
+  );
+  // glOccurrence still counts over the whole row (the suggest route scans the
+  // row's full text): "King Solomon" is 9:12's, 9:10's, then 9:11's.
+  const third = resolveSpanToSource(bridge, uhbOf(11), "King Solomon", 3, "9:11");
+  check(
+    third && nfc(third.orig_words) === nfc("הַ֠⁠מֶּלֶךְ") && third.confident,
+    `3rd "King Solomon" in the row -> 9:11's הַמֶּלֶךְ (got ${JSON.stringify(third)})`,
+  );
+
+  // Milestones without x-ref keep the whole-bridge behaviour.
+  const legacy = usfm.toJSON(ustRaw.replace(/ x-ref="[^"]*"/g, "")).chapters["9"]["10-12"].verseObjects;
+  const scoped = resolveSpanToSource(legacy, uhbOf(12), "that wood", 1, "9:12");
+  const unscoped = resolveSpanToSource(legacy, uhbOf(12), "that wood", 1);
+  check(
+    JSON.stringify(scoped) === JSON.stringify(unscoped) && scoped !== null,
+    `no x-ref: sourceRef changes nothing (got ${JSON.stringify(scoped)} vs ${JSON.stringify(unscoped)})`,
   );
 }
 
