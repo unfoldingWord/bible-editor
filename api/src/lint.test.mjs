@@ -3,6 +3,9 @@
 
 import assert from "node:assert/strict";
 import usfm from "usfm-js";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { lintChapterOpeningMarkers, lintOrphanedBlankText, lintPairedPunctuation, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses, lintVerseTextQuality } from "./lint.ts";
 
 let passed = 0;
@@ -1467,5 +1470,52 @@ t("a _meta key inside review_master_json (PR #665's flag bookkeeping) is strippe
   assert.deepEqual(flag.door43, { note: "door43's note", quote: "door43's quote" }, "real Door43 fields survive, _meta does not");
   assert.equal("_meta" in flag.door43, false, "no bookkeeping key leaks through as a fake Door43 field");
 });
+
+// ── Reused source token inside an x-ref'd bridge (#1414) ─────────────────────
+// 2CH UST 9:10-12 (real Door43 data) counts each source word per SOURCE verse
+// and names the verse in x-ref, so אֶת 1/1 x-ref 9:11 and אֶת 1/1 x-ref 9:12 are
+// two different tokens. Without x-ref in the key they collide on אֶת|1 and,
+// sitting in chains of different shape, read as one token aligned twice.
+{
+  const here = dirname(fileURLToPath(import.meta.url));
+  const samples = resolve(here, "../../docs/samples");
+  const ust = usfm.toJSON(readFileSync(resolve(samples, "en_ust_14-2CH-9_10-12.usfm"), "utf8"));
+  const uhb = usfm.toJSON(readFileSync(resolve(samples, "hbo_uhb_14-2CH-9_10-12.usfm"), "utf8"));
+  const bridgeRow = (vos) => ({ book: "2CH", chapter: 9, verse: 10, verse_end: 12, bible_version: "UST", version: 1, content_json: JSON.stringify({ verseObjects: vos }) });
+  const srcRow = (v, vos) => ({ book: "2CH", chapter: 9, verse: v, verse_end: null, bible_version: "UHB", version: 1, content_json: JSON.stringify({ verseObjects: vos }) });
+  const row = bridgeRow(ust.chapters["9"]["10-12"].verseObjects);
+  const src = [10, 11, 12].map((v) => srcRow(v, uhb.chapters["9"][String(v)].verseObjects));
+
+  t("2CH 9:10-12 (x-ref'd bridge) is not flagged as a reused source token without source rows", () => {
+    assert.equal(reusedChecks(lintUsfmVerses([row])).length, 0);
+  });
+  t("2CH 9:10-12 (x-ref'd bridge) is not flagged as a reused source token with source rows", () => {
+    assert.equal(reusedChecks(lintUsfmVerses([row], src)).length, 0);
+  });
+
+  // Order the chains so the forward cursor guesses wrong: a lone אֶת x-ref 9:12
+  // comes first, then 9:11's [אֶת, עֲצֵי] chain. Resolved across the whole bridge,
+  // both claim 9:11's אֶת (the lone one by "leftmost", the pair by contiguity).
+  const z = (content, ref, inner) =>
+    `\\zaln-s |x-occurrence="1" x-occurrences="1" x-content="${content}" x-ref="${ref}"\\*${inner}\\zaln-e\\*`;
+  const target = usfm.toJSON(
+    `\\c 9\n\\p\n\\v 10-12 ` +
+      z("אֶת", "9:12", "\\w everything\\w*") + " " +
+      z("אֶת", "9:11", z("עֲצֵי", "9:11", "\\w the\\w* \\w wood\\w*")) + "\n",
+  );
+  const source = usfm.toJSON(
+    `\\c 9\n\\v 10 \\w וְגַם\\w*\n\\v 11 \\w וַיַּעַשׂ\\w* \\w אֶת\\w*־\\w עֲצֵי\\w*\n\\v 12 \\w נָתַן\\w* \\w אֶת\\w*־\\w כָּל\\w*\n`,
+  );
+  const ordered = bridgeRow(target.chapters["9"]["10-12"].verseObjects);
+  const orderedSrc = [10, 11, 12].map((v) => srcRow(v, source.chapters["9"][String(v)].verseObjects));
+  t("x-ref scopes reused-token resolution to the named verse (cursor would pick 9:11 for both)", () => {
+    assert.equal(reusedChecks(lintUsfmVerses([ordered], orderedSrc)).length, 0);
+  });
+  t("the same chains WITHOUT x-ref still resolve across the whole bridge (unchanged)", () => {
+    const stripped = JSON.parse(JSON.stringify(ordered).replace(/,\\"ref\\":\\"9:1[12]\\"/g, ""));
+    assert.equal(stripped.content_json.includes("ref"), false, "fixture: x-ref stripped");
+    assert.equal(reusedChecks(lintUsfmVerses([stripped], orderedSrc)).length, 1);
+  });
+}
 
 console.log(`\n${passed} lint tests passed`);
