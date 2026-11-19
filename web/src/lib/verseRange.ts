@@ -244,12 +244,14 @@ export function rowHighlightsFor(
         : new Set();
     }
     // Any other note (on the first verse, before the span, or with no verse)
-    // joins against the start verse alone, as on main. A fallbackSource is of
-    // unknown verse, so it gets no x-ref scoping.
+    // joins against the start verse alone, as on main. Only a note ON the
+    // first verse is scoped to it: a note of unknown or outside verse may quote
+    // a later verse's word, which then lights through the GL-only fallback as
+    // before. A fallbackSource is of unknown verse, so it is never scoped.
     const startSource = sourceByVerseStart?.[start]?.content;
-    return startSource
+    return startSource && noteVerse === start
       ? highlightsFor(bibleVersion, target.content, quote, occurrence, startSource, partialGroups, `${target.chapter}:${start}`)
-      : highlightsFor(bibleVersion, target.content, quote, occurrence, fallbackSource, partialGroups);
+      : highlightsFor(bibleVersion, target.content, quote, occurrence, startSource ?? fallbackSource, partialGroups);
   }
   const spanSource = sourceForTargetRow(sourceByVerseStart, target)?.content ?? fallbackSource;
   return highlightsFor(bibleVersion, target?.content, quote, occurrence, spanSource, partialGroups);

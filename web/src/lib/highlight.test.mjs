@@ -799,6 +799,14 @@ const JOIN = "⁠";
   const lit11 = words(rowHighlightsFor("UST", target, "אֶת", 1, sourceByVerse, 11));
   assert(JSON.stringify(lit11) === JSON.stringify(v11), `note on 9:11 אֶת lights both 9:11 split-gloss spans and nothing from 9:12 (got ${JSON.stringify(lit11)})`);
 
+  // A note of unknown verse joins the start verse unscoped, as before: אֶת is
+  // not in 9:10, so it still lights through the GL-only fallback.
+  const litNull = words(rowHighlightsFor("UST", target, "אֶת", 1, sourceByVerse, null));
+  assert(
+    JSON.stringify(litNull) === JSON.stringify(["Jerusalem", "in", "it", "many", "that", "things", "wood"]),
+    `a note with no verse is not scoped (got ${JSON.stringify(litNull)})`,
+  );
+
   // Word-gloss preview / TN Quick join a later-verse note on its own verse too.
   const gloss12 = extractTargetSelectionText(ustVo, "אֶת", 1, sourceByVerse[12].content.verseObjects, { sourceRef: "9:12" });
   assert(gloss12 === "many things in Jerusalem", `selection text for 9:12 אֶת is 9:12's English only (got ${JSON.stringify(gloss12)})`);
