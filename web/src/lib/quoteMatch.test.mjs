@@ -123,6 +123,22 @@ const msgs = (r) => r.problems.map((x) => `${x.ref.chapter}:${x.ref.verse} ${x.s
   assert(quoteSummaryHtml(null, { carry: { state: "loading" } }).includes("Checking earlier chapters"), "loading summary renders without a result");
 }
 
+// --- problems link to their marks; summary collapses ---
+{
+  const r = annotateQuotes(render([v(2, 1, t("Then he left.” And “she spoke."))]), { atBookEnd: true });
+  assert(r.problems.every((x) => x.target), "every problem in the text has a jump target");
+  for (const x of r.problems) assert(r.html.includes(`<span id="${x.target}" class="qm`), `target ${x.target} is a mark in the text`);
+  const s = quoteSummaryHtml(r, { carry: { state: "book" } });
+  assert(s.startsWith('<details class="qm-summary" open><summary class="qm-head">'), "summary is an open <details> by default");
+  assert(s.includes(`data-qm-target="${r.problems[0].target}"`) && s.includes(`href="#${r.problems[0].target}"`), "problem links carry the target");
+  // A carried-in quote that a closer exposes points at that closer.
+  const c = annotateQuotes(render([v(5, 1, t("Go.” Done."))]), { carryIn: [{ mark: "“", ref: { chapter: 4, verse: "1" } }, { mark: "‘", ref: { chapter: 4, verse: "2" } }] });
+  const p0 = c.problems.find((x) => x.message.startsWith("‘2 is never closed"));
+  assert(p0 && c.html.includes(`<span id="${p0.target}" class="qm qm-l1"`), "carried-in unclosed quote links to the ” that closed past it");
+  const clean = annotateQuotes(render([v(1, 1, t("“Fine.”"))]), { atBookEnd: true });
+  assert(!clean.html.includes(" id="), "marks without problems get no id");
+}
+
 // --- off means untouched: annotate only changes text marks and badges ---
 {
   const html = render([v(1, 1, t("No quotes here."))]);

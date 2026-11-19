@@ -374,8 +374,14 @@ export const PRINT_PREVIEW_CSS = `
 .print-preview .qm-bad { background: #d32f2f; color: #fff; }
 .print-preview .qm-open { outline: 1px dashed #e59d33; }
 .print-preview .qm-carry { font-family: Arial, sans-serif; font-size: 0.8rem; text-indent: 0; background: #fff3cd; border: 1px solid #e59d33; border-radius: 3px; padding: 0 4px; margin-right: 0.5em; vertical-align: middle; white-space: nowrap; }
-.print-preview .qm-summary { font-family: Arial, sans-serif; font-size: 0.8rem; line-height: 1.5; background: #f6f8fa; border: 1px solid #ccc; border-radius: 4px; padding: 0.6em 1em; margin: 0 0 1.5em; }
-.print-preview .qm-summary .qm-problems { margin: 0.3em 0; padding-left: 1.4em; }
+.print-preview .qm-summary { position: sticky; top: 0; z-index: 2; font-family: Arial, sans-serif; font-size: 0.8rem; line-height: 1.5; background: #f6f8fa; border: 1px solid #ccc; border-radius: 4px; padding: 0.6em 1em; margin: 0 0 1.5em; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15); }
+.print-preview .qm-summary > summary { cursor: pointer; }
+.print-preview .qm-summary .qm-problems { margin: 0.3em 0; padding-left: 1.4em; max-height: 22vh; overflow-y: auto; }
+.print-preview .qm-jump { color: inherit; text-decoration: underline dotted; cursor: pointer; }
+.print-preview .qm-jump:hover { text-decoration: underline; }
+.print-preview .qm[id] { scroll-margin-top: 45vh; }
+.print-preview .qm:target, .print-preview .qm.qm-flash { outline: 3px solid #31ade3; outline-offset: 2px; animation: qm-flash 1.6s ease-out; }
+@keyframes qm-flash { 0%, 40% { box-shadow: 0 0 0 8px rgba(49, 173, 227, 0.45); } 100% { box-shadow: 0 0 0 0 rgba(49, 173, 227, 0); } }
 .print-preview .qm-sum-bad { color: #b71c1c; }
 .print-preview .qm-sum-warn { color: #8a5a00; }
 .print-preview .qm-legend { color: #555; margin-top: 0.3em; }
@@ -385,6 +391,8 @@ export const PRINT_PREVIEW_CSS = `
   @page { margin: 20mm 25mm; }
   .print-preview { max-width: none; padding: 0; font-size: 11pt; }
   .print-preview h1, .print-preview h2, .print-preview h3 { break-after: avoid; }
+  .print-preview .qm-summary { position: static; box-shadow: none; }
+  .print-preview .qm-summary .qm-problems { max-height: none; overflow: visible; }
 }
 `;
 

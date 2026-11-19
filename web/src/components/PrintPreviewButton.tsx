@@ -7,7 +7,7 @@
 // client-side (web/src/lib/bookVerses.ts). "Print" / "Open in tab" hand the
 // same HTML to a new window (web/src/lib/printPreview.ts).
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import {
   Alert,
   Box,
@@ -90,6 +90,11 @@ function PrintPreviewDialog({ book, chapter, versions, chapterVersesFor, onClose
   // Quote matching: colour every quote mark by nesting level and flag the
   // unbalanced ones (web/src/lib/quoteMatch.ts).
   const [showQuotes, setShowQuotes] = useState(false);
+  // Quote-check box expanded or collapsed in the dialog. Applied to the DOM
+  // after each render rather than baked into the HTML, so toggling never
+  // re-annotates the text and Print / Open in tab always get the box open.
+  const [quotesOpen, setQuotesOpen] = useState(true);
+  const previewRef = useRef<HTMLDivElement>(null);
   // Whole-book verses, fetched once per book+version while the dialog is open.
   const [bookVerses, setBookVerses] = useState<Record<string, VerseDto[]>>({});
   const bookKey = `${book}:${version}`;
@@ -161,6 +166,50 @@ function PrintPreviewDialog({ book, chapter, versions, chapterVersesFor, onClose
     const r = annotateQuotes(baseHtml, { carryIn: carry?.open ?? [], atBookEnd: scope === "book" });
     return quoteSummaryHtml(r, { carry: ctx }) + r.html;
   }, [baseHtml, showQuotes, scope, carry, bookFailed]);
+  useLayoutEffect(() => {
+    const box = previewRef.current?.querySelector<HTMLDetailsElement>("details.qm-summary");
+    if (box) box.open = quotesOpen;
+  }, [html, quotesOpen]);
+
+  // Clicks inside the preview: a problem link scrolls to its mark and flashes
+  // it (its `#id` href would otherwise hit the app's hash router), and the
+  // quote-check head toggles the box through state.
+  function onPreviewClick(e: MouseEvent<HTMLDivElement>): void {
+    const el = e.target as HTMLElement;
+    const link = el.closest<HTMLElement>("[data-qm-target]");
+    if (link) {
+      e.preventDefault();
+      const id = link.dataset.qmTarget ?? "";
+      const mark = e.currentTarget.querySelector<HTMLElement>(`#${CSS.escape(id)}`);
+      if (!mark) return;
+      // Scroll the dialog body so the mark lands a third of the way down the
+      // part not covered by the sticky quote-check box. (scrollIntoView would
+      // centre it under the box.)
+      const scroller = e.currentTarget.closest<HTMLElement>(".MuiDialogContent-root");
+      const box = e.currentTarget.querySelector<HTMLElement>(".qm-summary");
+      if (scroller) {
+        const area = scroller.getBoundingClientRect();
+        const top = Math.max(area.top, box?.getBoundingClientRect().bottom ?? area.top);
+        const delta = mark.getBoundingClientRect().top - (top + (area.bottom - top) / 3);
+        scroller.scrollBy({ top: delta, behavior: "smooth" });
+      } else {
+        mark.scrollIntoView({ block: "center", behavior: "smooth" });
+      }
+      mark.classList.remove("qm-flash");
+      void mark.offsetWidth; // restart the flash animation on a repeat click
+      mark.classList.add("qm-flash");
+      // Only the latest jump stays highlighted, and only briefly.
+      setTimeout(() => mark.classList.remove("qm-flash"), 2000);
+      return;
+    }
+    const summary = el.closest(".qm-summary > summary");
+    if (summary) {
+      // Toggle through state, not natively: React flushes this click's update
+      // before the browser's own toggle would run, so the two would cancel.
+      e.preventDefault();
+      setQuotesOpen(!(summary.parentElement as HTMLDetailsElement).open);
+    }
+  }
   const title = scope === "chapter" ? `${book} ${chapter} · ${version}` : `${book} · ${version}`;
 
   // Hand the rendered page to a new window: the print dialog can't target a
@@ -256,6 +305,8 @@ function PrintPreviewDialog({ book, chapter, versions, chapterVersesFor, onClose
           <Box sx={{ my: 2 }}>
             <div
               className={showMarkers ? "print-preview show-markers" : "print-preview"}
+              ref={previewRef}
+              onClick={onPreviewClick}
               dangerouslySetInnerHTML={{ __html: `<h2 class="print-preview-title">${escapeHtml(title)}</h2>${html}` }}
             />
           </Box>
