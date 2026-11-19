@@ -307,7 +307,16 @@ console.log("\n[#1418 — locked book whose master is quiet (SHA = watermark) bu
   // Master's SHA is already the stored watermark; D1 holds the old order and
   // the deleted rows. Before #1418 the SHA match skipped the book entirely.
   t.sqlite.prepare(`UPDATE book_resource_syncs SET source_sha = ? WHERE book = ?`).run(SHA_1, BOOK);
+  // An app-side tn tag on a row that matches master. The export blanks Tags,
+  // so master's blank is no Door43 change: the mirror (the only writer on a
+  // quiet night) must leave the tag and the row alone.
+  t.sqlite.prepare(`UPDATE tn_rows SET tags = 'ISSUE:MATCH_FAIL' WHERE id = 'aaaa'`).run();
   await night(t, { sha: SHA_1, files: { tn: MASTER_TN, tq: MASTER_TQ } });
+  eq(
+    { ...t.sqlite.prepare(`SELECT tags, version FROM tn_rows WHERE id = 'aaaa'`).get() },
+    { tags: "ISSUE:MATCH_FAIL", version: 1 },
+    "quiet master: a tn tag master cannot carry is kept, and the row is not rewritten",
+  );
   eq(d1Tn(t.sqlite), EXPECTED_LOCKED_TN, "quiet master: tn healed to master except the pending rows");
   eq(d1Tq(t.sqlite), EXPECTED_LOCKED_TQ, "quiet master: tq order healed");
 }

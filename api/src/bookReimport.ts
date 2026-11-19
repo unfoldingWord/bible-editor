@@ -10590,11 +10590,19 @@ export interface LockedMirrorResult {
   applyIncomplete: boolean;
 }
 
+// tn/tq Tags are left out on purpose: the export blanks that column on every
+// push (exportTags, export.ts), so master's blank says nothing about D1's
+// value, and copying it would wipe app-side markers (ISSUE:MATCH_FAIL) on
+// every tagged row. twl exports its tags, so master owns them.
 const MIRROR_CONTENT_COLS: Record<TsvKind, readonly string[]> = {
-  tn: ["tags", "support_reference", "quote", "occurrence", "note"],
-  tq: ["tags", "quote", "occurrence", "question", "response"],
+  tn: ["support_reference", "quote", "occurrence", "note"],
+  tq: ["quote", "occurrence", "question", "response"],
   twl: ["tags", "orig_words", "occurrence", "tw_link"],
 };
+
+function mirrorSignature(kind: TsvKind, row: ParsedTsvRow): string {
+  return tsvRowSignature(kind, kind === "twl" ? row : { ...row, tags: null });
+}
 
 function mirrorKeptReason(reason: MirrorKeepReason): string {
   return reason === "not_on_door43"
@@ -10631,7 +10639,7 @@ async function mirrorLockedTsv(
     const p = parseTsvRow(r, kind);
     if (!p || p.chapter < 0) continue;
     if (!masterRows.has(p.id)) masterRows.set(p.id, p);
-    masterList.push({ id: p.id, chapter: p.chapter, verse: p.verse, sig: tsvRowSignature(kind, p) });
+    masterList.push({ id: p.id, chapter: p.chapter, verse: p.verse, sig: mirrorSignature(kind, p) });
   }
   if (masterList.length === 0) return { ...out, skipped: "empty_master" };
 
@@ -10644,9 +10652,13 @@ async function mirrorLockedTsv(
     .bind(book)
     .all<Record<string, unknown>>();
 
+  // `book = ?2` without the legacy `OR book IS NULL` arm: every write path has
+  // set edit_log.book since migration 0017 backfilled it, a pending edit is by
+  // definition recent, and the plain equality lets this use
+  // edit_log_row_by_book (kind, book, row_key) instead of scanning the kind.
   const pendingRs = await env.DB.prepare(
     `SELECT DISTINCT row_key FROM edit_log
-      WHERE kind = ?1 AND (book = ?2 OR book IS NULL) AND ${cutoff.editId != null ? "id > ?3" : "created_at >= ?3"}
+      WHERE kind = ?1 AND book = ?2 AND ${cutoff.editId != null ? "id > ?3" : "created_at >= ?3"}
         AND (source IS NULL OR source <> '${REIMPORT_SOURCE}')
         AND action <> 'dismiss_review'`,
   )
@@ -10665,7 +10677,7 @@ async function mirrorLockedTsv(
       id,
       chapter: Number(row.chapter),
       verse: Number(row.verse),
-      sig: tsvRowSignature(kind, storedTsvRowToParsed(kind, row)),
+      sig: mirrorSignature(kind, storedTsvRowToParsed(kind, row)),
       sort_order: row.sort_order == null ? null : Number(row.sort_order),
       removed: row.deleted_at != null || (kind === "tn" && row.trashed_at != null),
       pending:
