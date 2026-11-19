@@ -40,6 +40,19 @@ import type { VerseDto } from "../sync/api.ts";
 // x-content and the UHB \w text. -1 when nothing matches.
 export function resolveSourcePos(s: SourceWord, indexMap: Map<string, number>): number {
   const c = nfc(s.content ?? "");
+  // An x-ref'd word whose verse this joined bridge source holds runs the same
+  // fallback chain inside that verse only: its occurrence counts there, so a
+  // whole-bridge t:/s: key would land on another verse's copy (#1414). Mirrors
+  // occurrenceScope in alignment.ts.
+  if (s.ref && indexMap.has(`rv:${s.ref}`)) {
+    return (
+      refPos(s, indexMap) ??
+      indexMap.get(`r:${s.ref}|${c}|1`) ??
+      indexMap.get(`rs:${s.ref}|${s.strong}|${s.occurrence}`) ??
+      indexMap.get(`rs:${s.ref}|${s.strong}|1`) ??
+      -1
+    );
+  }
   return (
     refPos(s, indexMap) ??
     indexMap.get(`t:${c}|${s.occurrence}`) ??
@@ -154,9 +167,12 @@ export function buildSourceIndexMap(sourceVerse: VerseDto | null): Map<string, n
   const textCount = new Map<string, number>();
   const strongCount = new Map<string, number>();
   // A joined bridge source also gets per-source-verse keys, `r:{x-ref}|{text}|
-  // {occurrence within that verse}`, for tCore's x-ref'd milestones (#1401).
+  // {occurrence within that verse}`, for tCore's x-ref'd milestones (#1401),
+  // the same by strong (`rs:`), and `rv:{x-ref}` marking that the verse is
+  // present, so an x-ref'd word's fallbacks stay inside its verse (#1414).
   let ref: string | undefined;
   const refCount = new Map<string, number>();
+  const refStrongCount = new Map<string, number>();
   const walk = (nodes: unknown[]) => {
     for (const n of nodes ?? []) {
       const o = n as Record<string, unknown> | null;
@@ -177,6 +193,11 @@ export function buildSourceIndexMap(sourceVerse: VerseDto | null): Map<string, n
           const rOcc = (refCount.get(rc) ?? 0) + 1;
           refCount.set(rc, rOcc);
           map.set(`r:${rc}|${rOcc}`, idx);
+          const rs = `${ref}|${strong}`;
+          const rsOcc = (refStrongCount.get(rs) ?? 0) + 1;
+          refStrongCount.set(rs, rsOcc);
+          map.set(`rs:${rs}|${rsOcc}`, idx);
+          if (!map.has(`rv:${ref}`)) map.set(`rv:${ref}`, idx);
         }
         idx++;
       } else if (
@@ -283,7 +304,11 @@ export function buildTargetIdToGroupId(displayGroups: AlignmentGroup[]): Map<str
 // See findReusedSourceWordIds.
 export function reusedTokenKey(s: SourceWord, indexMap: Map<string, number>): string | null {
   const content = nfc(s.content ?? "");
-  const pos = refPos(s, indexMap) ?? indexMap.get(`t:${content}|${s.occurrence}`);
+  // An x-ref'd word in a verse this bridge source holds never takes the
+  // whole-bridge t: key: that numbering names another verse's copy (#1414).
+  const pos = s.ref && indexMap.has(`rv:${s.ref}`)
+    ? refPos(s, indexMap)
+    : refPos(s, indexMap) ?? indexMap.get(`t:${content}|${s.occurrence}`);
   if (pos !== undefined) return `p${pos}`;
   return content === "" ? null : `c${content}|${s.occurrence}${s.ref ? `|${s.ref}` : ""}`;
 }

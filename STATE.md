@@ -956,6 +956,10 @@ Highlights that bite repeatedly:
   the joined array): a joined source built any other way, or a copy of that array, silently gets whole-bridge
   behaviour, so x-ref'd milestones resolve against the wrong copy of a repeated word. Any identity key on a
   source word (`content|occurrence`) must include `ref`, or the same 1/1 in two bridged verses collapses.
+  A bridged row joined against ONE of its verses (highlights, word gloss, TN Quick, picker verse blocks) has no
+  side table, so it must be told which verse that is (`sourceRef`, #1414); without it, x-ref'd milestones from
+  the other verses join too. Comparing two copies of these modules (a main snapshot vs the branch) needs each
+  copy's own `concatSourceRange`: the side table is per module instance.
 
 ## Stop conditions / goals
 

@@ -1261,7 +1261,13 @@ function zalnLintKey(node: Record<string, unknown>): string | null {
   // correctly aligned verse. Unkeyable milestones are simply not evidence.
   const occurrence = node["occurrence"];
   if (occurrence === undefined || occurrence === null || occurrence === "") return null;
-  return `${content.normalize("NFC")}|${String(occurrence)}`;
+  // tCore's x-ref ("9:12") inside a bridged verse: the occurrence counts within
+  // that source verse, so אֶת 1/1 in 9:11 and אֶת 1/1 in 9:12 are two tokens
+  // (#1414). It sits before the `|occurrence` suffix so stripOccurrenceSuffix
+  // still strips only the occurrence. U+0002 cannot occur in USFM x-content.
+  const ref = node["ref"];
+  const verse = typeof ref === "string" && ref !== "" ? `\u0002${ref}` : "";
+  return `${content.normalize("NFC")}${verse}|${String(occurrence)}`;
 }
 function isZalnMilestone(n: unknown): n is Record<string, unknown> {
   return !!n && typeof n === "object" && (n as Record<string, unknown>)["type"] === "milestone" &&
@@ -1322,18 +1328,21 @@ interface ReusedTokenWord {
   occurrence: number;
   occurrences: string | undefined;
   rawKey: string; // zalnLintKey(node) — the pre-reform identity
+  ref?: string; // x-ref ("9:12"): the bridged source verse it counts within (#1414)
 }
 function collectZalnChainWords(node: Record<string, unknown>): ReusedTokenWord[] {
   const out: ReusedTokenWord[] = [];
   const rawKey = zalnLintKey(node);
   if (rawKey !== null) {
     const occurrences = node["occurrences"];
-    out.push({
+    const word: ReusedTokenWord = {
       content: (node["content"] as string).normalize("NFC"),
       occurrence: parseInt(String(node["occurrence"]), 10) || 0,
       occurrences: occurrences === undefined || occurrences === null ? undefined : String(occurrences),
       rawKey,
-    });
+    };
+    if (typeof node["ref"] === "string" && node["ref"] !== "") word.ref = node["ref"];
+    out.push(word);
   }
   const children = node["children"];
   if (Array.isArray(children)) out.push(...collectZalnChainWordsFromList(children));
@@ -1366,7 +1375,17 @@ function collectZalnChainWordsFromList(nodes: unknown[]): ReusedTokenWord[] {
 // physical token); a chain that could not be reformed (no source supplied, or
 // a word whose content matches no real source token) falls back to its raw
 // (content|occurrence) identity — byte-identical to pre-reform behaviour.
-function resolveChainPositions(chains: ReusedTokenWord[][], srcTokens: string[]): string[][] {
+//
+// `srcRefs` (bridged rows only) gives each source token's verse as tCore spells
+// x-ref ("9:12"). A word whose x-ref names one of those verses resolves among
+// that verse's tokens alone, where its occurrence counts (#1414), mirroring
+// occurrenceScope in web/src/lib/alignment.ts; every other word resolves
+// across the whole joined source as before.
+function resolveChainPositions(
+  chains: ReusedTokenWord[][],
+  srcTokens: string[],
+  srcRefs: string[] | null = null,
+): string[][] {
   if (srcTokens.length === 0) return chains.map((words) => words.map((w) => w.rawKey));
 
   const positionsByContent = new Map<string, number[]>();
@@ -1376,6 +1395,12 @@ function resolveChainPositions(chains: ReusedTokenWord[][], srcTokens: string[])
     if (list) list.push(i);
     else positionsByContent.set(key, [i]);
   });
+  const refsPresent = new Set(srcRefs ?? []);
+  const candidatesFor = (w: ReusedTokenWord): number[] => {
+    const all = positionsByContent.get(w.content) ?? [];
+    if (!srcRefs || !w.ref || !refsPresent.has(w.ref)) return all;
+    return all.filter((i) => srcRefs[i] === w.ref);
+  };
 
   // Highest position already claimed for each surface by an EARLIER chain in
   // this verse (document order) — mirrors renumberSourceOccurrences's cursor,
@@ -1388,7 +1413,7 @@ function resolveChainPositions(chains: ReusedTokenWord[][], srcTokens: string[])
 
   return chains.map((words) => {
     if (words.length === 0) return [];
-    const candidates = words.map((w) => positionsByContent.get(w.content) ?? []);
+    const candidates = words.map(candidatesFor);
     // No anchor for at least one word — never guess; keep the chain's raw
     // identity untouched, same fallback direction as renumberSourceOccurrences.
     if (candidates.some((c) => c.length === 0)) return words.map((w) => w.rawKey);
@@ -1476,8 +1501,8 @@ function pickBestPositions(
   return best;
 }
 
-function hasReusedSourceToken(nodes: unknown[], srcTokens: string[] = []): boolean {
-  const chains = resolveChainPositions(findTopLevelZalns(nodes).map(collectZalnChainWords), srcTokens);
+function hasReusedSourceToken(nodes: unknown[], srcTokens: string[] = [], srcRefs: string[] | null = null): boolean {
+  const chains = resolveChainPositions(findTopLevelZalns(nodes).map(collectZalnChainWords), srcTokens, srcRefs);
   const chainKeysByToken = new Map<string, Set<string>>();
   // Same-content reversal (#1225): chains over the SAME full keys in a
   // different nesting order. The occurrence-stripped signature below collapses
@@ -1857,6 +1882,29 @@ export function lintTranslationRows(verses: VerseRow[], source: Map<string, Sour
   }
 }
 
+// Each token's verse ("chapter:verse", tCore's x-ref spelling) in the joined
+// source of a bridged row, parallel to what wordsForRow returns for the same
+// span; null when the two cannot be lined up (a gap, or a source row that is
+// itself a bridge covering several of these verses), so the caller keeps
+// whole-bridge resolution (#1414).
+function bridgeTokenRefs(
+  byRef: Map<string, SourceToken[]>,
+  chapter: number,
+  verse: number,
+  verseEnd: number,
+  expected: number,
+): string[] | null {
+  const out: string[] = [];
+  const seen = new Set<SourceToken[]>();
+  for (let n = verse; n <= verseEnd; n++) {
+    const w = byRef.get(`${chapter}:${n}`);
+    if (!w || seen.has(w)) return null;
+    seen.add(w);
+    for (let i = 0; i < w.length; i++) out.push(`${chapter}:${n}`);
+  }
+  return out.length === expected ? out : null;
+}
+
 function lintUsfmVerseRows(
   verses: VerseRow[],
   source?: VerseRow[] | Map<string, SourceToken[]>,
@@ -1887,6 +1935,7 @@ function lintUsfmVerseRows(
           `${v.chapter}:${v.verse}${v.verse_end && v.verse_end > v.verse ? `-${v.verse_end}` : ""}`,
         ).map((t) => t.text.normalize("NFC"))
       : [];
+    const srcRefs = byRef && v.verse_end && v.verse_end > v.verse ? bridgeTokenRefs(byRef, v.chapter, v.verse, v.verse_end, srcTokens.length) : null;
     const delta = footnoteDelta(vos);
     if (delta !== 0) {
       issues.push({
@@ -1904,7 +1953,7 @@ function lintUsfmVerseRows(
         message: "alignment milestone x-content spans a maqqef/minus (two source words glued into one).",
       });
     }
-    if (hasReusedSourceToken(vos, srcTokens)) {
+    if (hasReusedSourceToken(vos, srcTokens, srcRefs)) {
       issues.push({
         check: "Reused source token",
         bucket: "flag",

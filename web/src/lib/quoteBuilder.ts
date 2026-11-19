@@ -118,6 +118,10 @@ export interface QuoteBuildSegment {
   uhb: unknown[] | null;
   ult: unknown[] | null;
   ust: unknown[] | null;
+  // "chapter:verse" of `uhb`, set when the ULT or UST row here is a bridge,
+  // so x-ref'd milestones of the bridge's other verses stay out of this
+  // block's chips (collectTargetTokens, #1414).
+  sourceRef?: string;
 }
 
 function quoteGroupStrings(quote: string): string[] {
@@ -315,6 +319,13 @@ interface MilestoneRecord {
 export function collectTargetTokens(
   verseObjects: unknown[] | undefined | null,
   sourceVerseObjects?: unknown[] | undefined | null,
+  // The single source verse `sourceVerseObjects` is ("9:12"), when a bridged
+  // target row is shown against one of its verses (the picker's verse blocks).
+  // A milestone whose x-ref names another verse aligns that verse's word,
+  // counted within it, so it contributes no source here: otherwise אֶת 1/1
+  // x-ref 9:11 and אֶת 1/1 x-ref 9:12 share one key and each verse block maps
+  // both copies' English to its own אֶת (#1414). Mirrors highlight.ts.
+  sourceRef?: string,
 ): TargetToken[] {
   if (!Array.isArray(verseObjects)) return [];
   const sourceTokens: WordToken[] =
@@ -335,7 +346,11 @@ export function collectTargetTokens(
       const o = node as Record<string, unknown> | null;
       if (!o) continue;
       if (o["type"] === "milestone" && o["tag"] === "zaln") {
-        const content = String(o["content"] ?? "");
+        const ref = typeof o["ref"] === "string" && o["ref"] !== "" ? o["ref"] : undefined;
+        // Another verse's milestone gets an empty record: no selection key, no
+        // pin, and pin indices still line up.
+        const content =
+          sourceRef !== undefined && ref !== undefined && ref !== sourceRef ? "" : String(o["content"] ?? "");
         // Clamp occurrence into [1, occurrences]. A split-gloss continuation —
         // one source token whose target words are NON-CONTIGUOUS — is stamped
         // occurrence="2" while occurrences stays "1", which is impossible ("the

@@ -208,6 +208,10 @@ interface RawRun {
   occurrence: number;
   occurrences: number;
   targets: WordToken[];
+  // tCore's x-ref ("9:12"): inside a bridged target verse, the source verse
+  // this milestone's word sits in, its occurrence counted within that verse
+  // (#1401). Absent on most milestones.
+  ref?: string;
 }
 
 // Pass 1: walk the tree exactly as the old single-pass implementation did
@@ -229,7 +233,9 @@ function collectRawRuns(verseObjects: unknown[]): RawRun[] {
       const occurrences = parseInt(String(node["occurrences"] ?? "1"), 10) || 1;
       const children = (node["children"] as unknown[] | undefined) ?? [];
       const targets = collectSubtreeWords(children);
-      out.push({ source, occurrence, occurrences, targets });
+      const run: RawRun = { source, occurrence, occurrences, targets };
+      if (typeof node["ref"] === "string" && node["ref"] !== "") run.ref = node["ref"];
+      out.push(run);
       // Recurse into nested milestones as their own runs.
       for (const c of children) {
         if (nodeIsMilestone(c)) walk([c]);
@@ -340,22 +346,35 @@ export function pinSourceOccurrences(
 // the same merge loop; because their effOccs are distinct source-token
 // positions they naturally stay separate rather than needing a separate
 // code path.
+//
+// `sourceRef` ("9:12") names the one source verse `sourceTokens` came from,
+// when the caller joins a bridged target row against a single verse of it
+// (rowHighlightsFor). A milestone whose x-ref names a DIFFERENT verse aligns a
+// word of that other verse, numbered within it, so it is left out entirely:
+// otherwise אֶת 1/1 x-ref 9:11 and אֶת 1/1 x-ref 9:12 both key as אֶת|1 and a
+// note on either lights both verses' English (#1414). Milestones without an
+// x-ref, and every milestone when no sourceRef is given, behave as before.
 function collectMilestoneRuns(
   verseObjects: unknown[],
   sourceTotals?: Map<string, number>,
   sourceTokens?: WordToken[],
+  sourceRef?: string,
 ): Run[] {
   const entries = collectRawRuns(verseObjects);
+  const otherVerse = (e: RawRun) => sourceRef !== undefined && e.ref !== undefined && e.ref !== sourceRef;
   const pins =
     sourceTotals && sourceTokens && sourceTokens.length > 0
       ? pinSourceOccurrences(
-          entries.map((e) => e.source),
+          // "" keeps indices aligned while keeping another verse's milestones
+          // out of the pinning groups.
+          entries.map((e) => (otherVerse(e) ? "" : e.source)),
           sourceTotals,
           sourceTokens,
         )
       : new Map<number, number>();
   const out: Run[] = [];
   entries.forEach((e, i) => {
+    if (otherVerse(e)) return;
     const { source, occurrence, occurrences, targets } = e;
     const want = source ? matchNorm(source) : "";
     const pinned = pins.get(i);
@@ -588,12 +607,16 @@ export function findTargetHighlights(
   occurrence: number,
   sourceVerseObjects?: unknown[],
   partialGroups = false,
+  // The single source verse `sourceVerseObjects` is, as tCore spells x-ref
+  // ("9:12"), when the target row is a bridge joined against one of its
+  // verses. See collectMilestoneRuns.
+  sourceRef?: string,
 ): Set<HighlightKey> {
   const sourceTokens = Array.isArray(sourceVerseObjects)
     ? collectBareWords(sourceVerseObjects)
     : undefined;
   const sourceTotals = sourceTokens ? surfaceTotalsFromTokens(sourceTokens) : undefined;
-  const runs = collectMilestoneRuns(verseObjects, sourceTotals, sourceTokens);
+  const runs = collectMilestoneRuns(verseObjects, sourceTotals, sourceTokens, sourceRef);
   const out = new Set<HighlightKey>();
   if (runs.length === 0) return out;
   // `occurrence: -1` means "every occurrence of the quote" (TSV spec).
@@ -760,9 +783,10 @@ export function extractTargetSelectionText(
   quote: string,
   occurrence: number,
   sourceVerseObjects?: unknown[],
-  options?: { gapMarker?: string },
+  // sourceRef: see findTargetHighlights (a bridged row joined on one verse).
+  options?: { gapMarker?: string; sourceRef?: string },
 ): string {
-  const highlights = findTargetHighlights(verseObjects, quote, occurrence, sourceVerseObjects);
+  const highlights = findTargetHighlights(verseObjects, quote, occurrence, sourceVerseObjects, false, options?.sourceRef);
   if (highlights.size === 0) return "";
   const gapMarker = options?.gapMarker;
   const seen = new Set<HighlightKey>();
@@ -1374,6 +1398,7 @@ export function highlightsFor(
   occurrence: number | null | undefined,
   sourceContent?: unknown,
   partialGroups = false,
+  sourceRef?: string,
 ): Set<HighlightKey> {
   if (!quote || bibleVersion === "T4T") return new Set();
   const verseObjects = (verseContent as { verseObjects?: unknown[] } | null)?.verseObjects;
@@ -1389,6 +1414,7 @@ export function highlightsFor(
     occ,
     Array.isArray(sourceVo) ? sourceVo : undefined,
     partialGroups,
+    sourceRef,
   );
 }
 

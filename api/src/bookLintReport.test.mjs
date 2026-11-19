@@ -236,7 +236,7 @@ assert.equal(mergeChapterReport(f1, unversionedChunk), null, "a chapter report w
 // so a new check name fails typecheck until it is listed there, and then fails
 // here until the version is bumped and this list updated.
 const PINNED_CHECKS = {
-  version: 2,
+  version: 3,
   names: [
     "12. Alternate translation Label",
     "13. Paired Square Bracket",

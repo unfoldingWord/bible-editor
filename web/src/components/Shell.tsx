@@ -69,7 +69,7 @@ import {
   guardBlocksSave,
   type AlignmentIntent,
 } from "../lib/alignmentDelta";
-import { bridgeNoteAnchor, buildVerseIndex, concatSourceRange, coveredVersesKey, formatVerseLabel, noteCoveredVerses, sourceForTargetRow, verseSpan, versesFromKey } from "../lib/verseRange";
+import { bridgeNoteAnchor, buildVerseIndex, concatSourceRange, coveredVersesKey, formatVerseLabel, isRangeRow, noteCoveredVerses, sourceForTargetRow, verseSpan, versesFromKey } from "../lib/verseRange";
 import { createSaveDoneAndNextGuard, runSaveChain, type SaveStep } from "../lib/saveChain";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText, extractTargetSelectionText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
@@ -179,12 +179,23 @@ function quoteBuildSegmentsForRow(
     const vo = (dto?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
     return Array.isArray(vo) ? vo : null;
   };
-  return verses.map((verse) => ({
-    verse,
-    uhb: grab("UHB", verse) ?? grab("UGNT", verse),
-    ult: grab("ULT", verse),
-    ust: grab("UST", verse),
-  }));
+  return verses.map((verse) => {
+    const seg: QuoteBuildSegment = {
+      verse,
+      uhb: grab("UHB", verse) ?? grab("UGNT", verse),
+      ult: grab("ULT", verse),
+      ust: grab("UST", verse),
+    };
+    // A bridged ULT/UST row shows against this one verse's source: name it,
+    // as tCore's x-ref spells it, so the bridge's other verses stay out (#1414).
+    const src = verseIndexByVersion["UHB"]?.[verse] ?? verseIndexByVersion["UGNT"]?.[verse];
+    const bridged = ["ULT", "UST"].some((bv) => {
+      const dto = verseIndexByVersion[bv]?.[verse];
+      return !!dto && isRangeRow(dto);
+    });
+    if (src && bridged) seg.sourceRef = `${src.chapter}:${verse}`;
+    return seg;
+  });
 }
 
 // Word-token count of one source verse row — text/punctuation nodes excluded,
@@ -5191,8 +5202,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               Array.isArray(src) ? src : undefined,
               // Show the gap: one source word can align to non-contiguous ULT
               // words (ISA 60:6 "and … the praises of"), and hiding that reads
-              // as a phrase the ULT never says.
-              { gapMarker: "…" },
+              // as a phrase the ULT never says. A bridged row joined on the
+              // note's own verse names it, so x-ref'd words of the bridge's
+              // other verses stay out (#1414).
+              {
+                gapMarker: "…",
+                sourceRef: !anchor && ultRow && isRangeRow(ultRow) ? `${ultRow.chapter}:${row.verse}` : undefined,
+              },
             );
           }}
           onWordFocus={(row) => {

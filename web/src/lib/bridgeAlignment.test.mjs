@@ -18,7 +18,7 @@ import {
   moveTarget,
   dropDuplicateSourceMilestones,
 } from "./alignment.ts";
-import { buildSourceIndexMap, resolveSourcePos } from "./alignmentHover.ts";
+import { buildSourceIndexMap, resolveSourcePos, reusedTokenKey } from "./alignmentHover.ts";
 import { concatSourceRange } from "./verseRange.ts";
 import { nfc } from "./hebrew.ts";
 
@@ -163,6 +163,30 @@ const baseline = (() => {
   };
   const expected = wordsIn(10).length + wordsIn(11).length + wordsIn(12).findIndex((t) => nfc(t) === nfc("אֶת"));
   assert(pos === expected, `אֶת ref 9:12 resolves to its 9:12 token (pos ${pos}, want ${expected})`);
+}
+
+// ── 4b. an x-ref'd word that misses its own verse stays in that verse (#1414) ─
+// אֶת occurs once in 9:11 and once in 9:12. A milestone claiming אֶת 2 in 9:11
+// (more than that verse holds) used to fall through to the whole-bridge key
+// t:אֶת|2, which is 9:12's token. It must resolve inside 9:11, and the reused-
+// token identity must not collide with 9:12's אֶת either.
+{
+  console.log("\n[4b] an x-ref'd fallback resolves inside the named verse");
+  const indexMap = buildSourceIndexMap(bridgeSource);
+  const wordsIn = (v) => {
+    const out = [];
+    const w = (ns) => { for (const n of ns ?? []) { if (n?.type === "word" && n.tag === "w") out.push(n.text); else if (n?.type === "milestone") w(n.children); } };
+    w(sourceByVerse[v].content.verseObjects);
+    return out;
+  };
+  const in11 = wordsIn(10).length + wordsIn(11).findIndex((t) => nfc(t) === nfc("אֶת"));
+  const in12 = wordsIn(10).length + wordsIn(11).length + wordsIn(12).findIndex((t) => nfc(t) === nfc("אֶת"));
+  const over = { id: "x", strong: "H0853", occurrence: "2", occurrences: "2", content: "אֶת", ref: "9:11" };
+  const pos = resolveSourcePos(over, indexMap);
+  assert(pos === in11, `אֶת 2 x-ref 9:11 resolves to 9:11's token, not 9:12's (pos ${pos}, want ${in11}, 9:12 is ${in12})`);
+  const k11 = reusedTokenKey(over, indexMap);
+  const k12 = reusedTokenKey({ ...over, occurrence: "1", occurrences: "1", ref: "9:12" }, indexMap);
+  assert(k11 !== k12, `reused-token identity keeps 9:11 and 9:12 apart (${k11} vs ${k12})`);
 }
 
 // ── 5. a legacy whole-bridge-numbered verse (no x-ref) is unchanged ──────────

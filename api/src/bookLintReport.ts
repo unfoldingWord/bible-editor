@@ -62,8 +62,10 @@ export interface BookLintReportIssue extends LintIssue {
  *
  *  2 (#1344): catches up on checks added by #1326, #1341 and #1343 without a
  *  bump (Malformed TWLink; straight quotes in TWL OrigWords, tn Quote and
- *  SupportReference, tq Quote). */
-export const LINT_REPORT_VERSION = 2;
+ *  SupportReference, tq Quote).
+ *  3 (#1414): "Reused source token" keys x-ref'd bridge milestones per source
+ *  verse, so tCore-aligned bridges (2CH 9:10-12) stop flagging. */
+export const LINT_REPORT_VERSION = 3;
 
 export interface BookLintReport {
   book: string;

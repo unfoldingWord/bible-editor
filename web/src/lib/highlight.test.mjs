@@ -20,6 +20,12 @@ import {
 } from "./highlight.ts";
 import { extractEditableText, extractTrailingMarkers } from "./usfm.ts";
 import { buildQuoteFromSelection, selectionFromQuote, tokenKey, collectTargetTokens } from "./quoteBuilder.ts";
+import { extractTargetSelectionText } from "./highlight.ts";
+import { rowHighlightsFor } from "./verseRange.ts";
+import usfm from "usfm-js";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -763,6 +769,79 @@ const JOIN = "⁠";
   assert(
     litAll.length === 6 && litAll.includes("quiet1") && litAll.includes("quiet2"),
     `occurrence -1 lights every first-group match (got ${JSON.stringify(litAll)})`,
+  );
+}
+
+// --- x-ref inside a bridged target verse (#1414) ----------------------------
+// 2CH UST 9:10-12 (real Door43 data) counts each Hebrew word per SOURCE verse
+// and names that verse in x-ref: אֶת 1/1 x-ref 9:11 (twice, a split gloss) and
+// אֶת 1/1 x-ref 9:12. A note on one verse's אֶת joins against that verse's UHB
+// alone (rowHighlightsFor), so without x-ref every אֶת milestone keys as
+// אֶת|1 and the note lights the English of both verses.
+{
+  console.log("\n[x-ref] 2CH 9:10-12: a note lights only its own verse's English");
+  const here = dirname(fileURLToPath(import.meta.url));
+  const samples = resolve(here, "../../../docs/samples");
+  const ust = usfm.toJSON(readFileSync(resolve(samples, "en_ust_14-2CH-9_10-12.usfm"), "utf8"));
+  const uhb = usfm.toJSON(readFileSync(resolve(samples, "hbo_uhb_14-2CH-9_10-12.usfm"), "utf8"));
+  const sourceByVerse = {};
+  for (const v of [10, 11, 12]) {
+    sourceByVerse[v] = { chapter: 9, verse: v, verse_end: null, content: { verseObjects: uhb.chapters["9"][String(v)].verseObjects } };
+  }
+  const ustVo = ust.chapters["9"]["10-12"].verseObjects;
+  const target = { chapter: 9, verse: 10, verse_end: 12, content: { verseObjects: ustVo } };
+  const words = (set) => [...set].map((key) => key.split("|")[0]).sort();
+  const v12 = ["Jerusalem", "in", "many", "things"];
+  const v11 = ["it", "that", "wood"];
+
+  const lit12 = words(rowHighlightsFor("UST", target, "אֶת", 1, sourceByVerse, 12));
+  assert(JSON.stringify(lit12) === JSON.stringify(v12), `note on 9:12 אֶת lights only 9:12's English (got ${JSON.stringify(lit12)})`);
+  const lit11 = words(rowHighlightsFor("UST", target, "אֶת", 1, sourceByVerse, 11));
+  assert(JSON.stringify(lit11) === JSON.stringify(v11), `note on 9:11 אֶת lights both 9:11 split-gloss spans and nothing from 9:12 (got ${JSON.stringify(lit11)})`);
+
+  // A note of unknown verse joins the start verse unscoped, as before: אֶת is
+  // not in 9:10, so it still lights through the GL-only fallback.
+  const litNull = words(rowHighlightsFor("UST", target, "אֶת", 1, sourceByVerse, null));
+  assert(
+    JSON.stringify(litNull) === JSON.stringify(["Jerusalem", "in", "it", "many", "that", "things", "wood"]),
+    `a note with no verse is not scoped (got ${JSON.stringify(litNull)})`,
+  );
+
+  // Word-gloss preview / TN Quick join a later-verse note on its own verse too.
+  const gloss12 = extractTargetSelectionText(ustVo, "אֶת", 1, sourceByVerse[12].content.verseObjects, { sourceRef: "9:12" });
+  assert(gloss12 === "many things in Jerusalem", `selection text for 9:12 אֶת is 9:12's English only (got ${JSON.stringify(gloss12)})`);
+
+  // Quote picker: each verse block maps an English chip to its own verse's אֶת.
+  const etKey = tokenKey("אֶת", 1);
+  const etWords = (sourceRef, v) =>
+    collectTargetTokens(ustVo, sourceByVerse[v].content.verseObjects, sourceRef)
+      .filter((t) => t.sources.some((s) => s.key === etKey))
+      .map((t) => t.text)
+      .sort();
+  const p12 = etWords("9:12", 12);
+  const p11 = etWords("9:11", 11);
+  assert(JSON.stringify(p12) === JSON.stringify(v12), `picker v12 block: אֶת chips are 9:12's English (got ${JSON.stringify(p12)})`);
+  assert(JSON.stringify(p11) === JSON.stringify(v11), `picker v11 block: אֶת chips are 9:11's English (got ${JSON.stringify(p11)})`);
+}
+
+// Milestones WITHOUT x-ref keep the whole-bridge behaviour: the same verse with
+// every x-ref stripped lights what it did before #1414.
+{
+  console.log("\n[x-ref] a bridge without x-ref is unchanged");
+  const here = dirname(fileURLToPath(import.meta.url));
+  const samples = resolve(here, "../../../docs/samples");
+  const raw = readFileSync(resolve(samples, "en_ust_14-2CH-9_10-12.usfm"), "utf8").replace(/ x-ref="[^"]*"/g, "");
+  const ust = usfm.toJSON(raw);
+  const uhb = usfm.toJSON(readFileSync(resolve(samples, "hbo_uhb_14-2CH-9_10-12.usfm"), "utf8"));
+  const sourceByVerse = {};
+  for (const v of [10, 11, 12]) {
+    sourceByVerse[v] = { chapter: 9, verse: v, verse_end: null, content: { verseObjects: uhb.chapters["9"][String(v)].verseObjects } };
+  }
+  const target = { chapter: 9, verse: 10, verse_end: 12, content: { verseObjects: ust.chapters["9"]["10-12"].verseObjects } };
+  const lit = [...rowHighlightsFor("UST", target, "אֶת", 1, sourceByVerse, 12)].map((key) => key.split("|")[0]).sort();
+  assert(
+    JSON.stringify(lit) === JSON.stringify(["Jerusalem", "in", "it", "many", "that", "things", "wood"]),
+    `without x-ref every אֶת 1/1 still lights (got ${JSON.stringify(lit)})`,
   );
 }
 
