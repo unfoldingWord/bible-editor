@@ -84,7 +84,10 @@ function door43() {
         const ref = url.searchParams.get("ref");
         const text = ref === "master" || ref === WATERMARK ? d.master : d.branch;
         if (text == null) return new Response("nf", { status: 404 });
-        return json({ sha: "blob-" + text.length, size: Buffer.byteLength(text), content: b64(text), encoding: "base64" });
+        // d.noSize: Door43 gives no byte count, so the master read cannot be
+        // proven complete (fetchDcsMasterTextVerified's `verified`).
+        const size = d.noSize ? undefined : Buffer.byteLength(text);
+        return json({ sha: "blob-" + text.length, size, content: b64(text), encoding: "base64" });
       }
       const body = JSON.parse(init.body);
       d.branch = unb64(body.content);
@@ -390,6 +393,18 @@ console.log("\n[9. only Door43 deleted a row (D1 still has it) → it does not c
   ok(t.live(`export_kept_master:${BOOK}:tn`).length === 0, "alert cleared on a measured clean pass");
 }
 
+console.log("\n[9d. the same deletion, but the master read cannot be proven complete → ships as before]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  d.master = deleteRow(d.master, "bb22");
+  d.noSize = true;
+  await t.exportOne("export-night-2");
+  ok(hasRow(d.branch, "bb22"), "bb22 ships: a short read must not read as a Door43 deletion");
+  ok(t.live(`export_kept_master:${BOOK}:tn`).length === 0, "no kept-rows alert");
+}
+
 console.log("\n[10. Door43 deleted two rows; a translator edited one of them and another row → the edits ship, the untouched deletion holds]");
 {
   const d = door43();
@@ -402,6 +417,8 @@ console.log("\n[10. Door43 deleted two rows; a translator edited one of them and
   t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator kept this one.' WHERE id = 'cc33'`).run();
   t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
   await t.exportOne("export-night-2");
+  const syncs = t.sqlite.prepare(`SELECT pushed_read_at, master_confirmed_at FROM book_resource_syncs WHERE book = ?`).get(BOOK);
+  ok(syncs.master_confirmed_at !== syncs.pushed_read_at, "(setup: night 2's push is not proven on master, so 10c runs in carry mode)");
   ok(!hasRow(d.branch, "bb22"), "bb22 (deleted on Door43, untouched here) stays off the branch");
   ok(noteOf(d.branch, "cc33") === "Translator kept this one.", "cc33 (edited after the base) ships");
   ok(noteOf(d.branch, "aa11") === "Translator edit.", "aa11's edit ships");

@@ -1283,7 +1283,8 @@ export function tsvRevertReport(
 // such a row from D1 only when no person owns it (softDeleteRemovedTsvRows in
 // bookReimport.ts), so a human-edited or preserved row deleted on Door43 stays
 // in D1 and reaches this point. Dropped rows count with kept rows toward
-// MASTER_MOVED_REFUSE_THRESHOLD.
+// MASTER_MOVED_REFUSE_THRESHOLD. Only when the caller proves master's file was
+// read whole (`masterComplete`): a truncated read must not delete rows.
 //
 // A row Door43 moved to another Reference (with or without a text change) is
 // NOT kept: substituting it in place would leave it under the wrong verse in
@@ -1352,6 +1353,9 @@ export function planKeepMasterRows(
   // Restrict the plan to these IDs (the rows an unproven push kept; see
   // ExportWorkflow.masterMovedGuard). Absent = every row.
   onlyIds: ReadonlySet<string> | null = null,
+  // masterTsv is provably the whole file (fetchDcsMasterTextVerified). Rows
+  // master lacks are dropped only then; otherwise they ship as before (#1415).
+  masterComplete = false,
 ): KeepMasterPlan | null {
   const headers = kind === "tn" ? TN_HEADERS : kind === "tq" ? TQ_HEADERS : TWL_HEADERS;
   const refIdx = headers.indexOf("Reference");
@@ -1387,6 +1391,8 @@ export function planKeepMasterRows(
     if (!oursUnchanged) continue; // we changed it: today's behaviour
     if (!masterCells) {
       // Only Door43 deleted it (#1415): leave it out rather than add it back.
+      // A master read not proven complete could just be short: ship as before.
+      if (!masterComplete) continue;
       dropped.push({ id, ref: oursCells[refIdx] ?? "", fields: [] });
       keepLine.set(id, "");
       continue;
