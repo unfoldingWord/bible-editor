@@ -95,6 +95,9 @@ function PrintPreviewDialog({ book, chapter, versions, chapterVersesFor, onClose
   const bookKey = `${book}:${version}`;
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The book fetch's own failure, kept apart from `error` (which the popup
+  // message also uses) so the quote summary can say "could not load".
+  const [bookFailed, setBookFailed] = useState(false);
 
   // Chapter scope with Quotes on still needs the earlier chapters: a quote
   // opened in chapter 3 may still be open in chapter 16.
@@ -104,12 +107,15 @@ function PrintPreviewDialog({ book, chapter, versions, chapterVersesFor, onClose
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setBookFailed(false);
     fetchBookVerses(book, version)
       .then((verses) => {
         if (!cancelled) setBookVerses((prev) => ({ ...prev, [bookKey]: verses }));
       })
       .catch((e: unknown) => {
-        if (!cancelled) setError(`Could not load ${book}: ${e instanceof Error ? e.message : String(e)}`);
+        if (cancelled) return;
+        setError(`Could not load ${book}: ${e instanceof Error ? e.message : String(e)}`);
+        setBookFailed(true);
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -120,7 +126,7 @@ function PrintPreviewDialog({ book, chapter, versions, chapterVersesFor, onClose
       cancelled = true;
       setLoading(false);
     };
-  }, [needBook, version, book, bookKey, bookVerses]);
+  }, [needBook, scope, version, book, bookKey, bookVerses]);
 
   const verses = scope === "chapter" ? chapterVersesFor(version) : (bookVerses[bookKey] ?? null);
   const baseHtml = useMemo(
@@ -146,12 +152,15 @@ function PrintPreviewDialog({ book, chapter, versions, chapterVersesFor, onClose
         ? { state: "book" }
         : carry
           ? { state: "ready", earlierErrors: carry.earlierErrors }
-          : error
+          : bookFailed
             ? { state: "failed" }
             : { state: "loading" };
+    // Until the earlier chapters arrive, a closer for a quote they opened
+    // would read as "closes nothing": show the plain text meanwhile.
+    if (ctx.state === "loading") return quoteSummaryHtml(null, { carry: ctx }) + baseHtml;
     const r = annotateQuotes(baseHtml, { carryIn: carry?.open ?? [], atBookEnd: scope === "book" });
     return quoteSummaryHtml(r, { carry: ctx }) + r.html;
-  }, [baseHtml, showQuotes, scope, carry, error]);
+  }, [baseHtml, showQuotes, scope, carry, bookFailed]);
   const title = scope === "chapter" ? `${book} ${chapter} · ${version}` : `${book} · ${version}`;
 
   // Hand the rendered page to a new window: the print dialog can't target a

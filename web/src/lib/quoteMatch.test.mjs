@@ -48,7 +48,7 @@ const msgs = (r) => r.problems.map((x) => `${x.ref.chapter}:${x.ref.verse} ${x.s
 {
   const r = annotateQuotes(render([v(1, 1, t("He said ‘go’ and left."))]), { atBookEnd: true });
   assert(r.pairs === 1, "‘go’ pairs");
-  assert(r.html.includes("qm-warn") && r.html.includes("possessive"), "a letter-final ’ close is marked uncertain");
+  assert(!r.html.includes("qm-warn") && r.html.includes("possessive"), "a letter-final ’ close says on hover it might be a possessive, without a yellow mark");
 }
 
 // --- stray close, unclosed at book end ---
@@ -112,6 +112,15 @@ const msgs = (r) => r.problems.map((x) => `${x.ref.chapter}:${x.ref.verse} ${x.s
   );
   const m = msgs(r);
   assert(m.length === 1 && m[0].includes("straight"), `only the straight quote is reported (${m.join(" | ")})`);
+}
+
+// --- review fixes: paragraph boundary separates words; implied-word braces are see-through ---
+{
+  const r = annotateQuotes(render([v(1, 1, t("He said, ‘go’"), p(), t("Then he left."))]), { atBookEnd: true });
+  assert(r.pairs === 1 && r.problems.length === 0, `’ at a paragraph end closes the quote (${msgs(r).join(" | ")})`);
+  const r2 = annotateQuotes(render([v(1, 1, t("“See {the people}’s land,” he said."))]), { atBookEnd: true });
+  assert(r2.pairs === 1 && r2.problems.length === 0, `{implied}’s is a possessive (${msgs(r2).join(" | ")})`);
+  assert(quoteSummaryHtml(null, { carry: { state: "loading" } }).includes("Checking earlier chapters"), "loading summary renders without a result");
 }
 
 // --- off means untouched: annotate only changes text marks and badges ---

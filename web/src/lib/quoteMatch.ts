@@ -17,7 +17,8 @@
 // always an apostrophe; after a letter and before a non-letter (`sisters’ `,
 // `‘go’ `) it closes a ‘ only when a ‘ is the innermost open quote, and that
 // close is marked uncertain. Footnotes and headings are skipped (their quotes
-// are self-contained); straight `"` cannot be matched and is reported.
+// are self-contained); a straight `"` cannot be matched and is reported
+// (a straight `'` is left alone: it is far more often an apostrophe).
 //
 // Recovery keeps one mistake from poisoning the rest of the book: a ” that
 // meets an open ‘ closes the nearest open “ and reports the skipped ‘ as never
@@ -143,6 +144,9 @@ export function annotateQuotes(html: string, opts: QuoteOptions = {}): QuoteResu
       } else if (/^<\/h[1-6]>/.test(s)) {
         inHeading = false;
       }
+      // A block or footnote boundary separates words, so `go’</p><p>Then`
+      // never reads as the apostrophe in `go’Then`.
+      if (/^<\/?(p|h[1-6])[\s>]/.test(s) || s.startsWith('<span class="paras_usfm_f')) flat += " ";
       tokens.push({ t: "html", s });
       continue;
     }
@@ -189,7 +193,11 @@ export function annotateQuotes(html: string, opts: QuoteOptions = {}): QuoteResu
   const carriedIn = (opts.carryIn ?? []).map((c) => ({ ...c }));
   for (const c of carriedIn) push(c.mark, c.ref, true);
 
-  const isLetter = (i: number): boolean => i >= 0 && i < flat.length && LETTER_RE.test(flat[i]);
+  // Implied-word braces are see-through: `{the people}’s` is a possessive.
+  const isLetter = (i: number, step: -1 | 1): boolean => {
+    while (i >= 0 && i < flat.length && (flat[i] === "{" || flat[i] === "}")) i += step;
+    return i >= 0 && i < flat.length && LETTER_RE.test(flat[i]);
+  };
   const isSpaceOrEnd = (i: number): boolean => i < 0 || i >= flat.length || /\s/.test(flat[i]);
 
   // Close `o` (somewhere in the stack) at `ev`; anything above it is reported
@@ -217,7 +225,7 @@ export function annotateQuotes(html: string, opts: QuoteOptions = {}): QuoteResu
     return undefined;
   };
 
-  const sameKindByOuter = new Map<Opener, QuoteProblem & { outer: Opener; mark: OpenMark; count: number }>();
+  const sameKindByOuter = new Map<Opener, { problem: QuoteProblem; mark: OpenMark; count: number }>();
   let evIdx = 0;
   const chapterQueue = [...chapterTokens];
   for (; evIdx <= events.length; evIdx++) {
@@ -225,8 +233,8 @@ export function annotateQuotes(html: string, opts: QuoteOptions = {}): QuoteResu
     while (chapterQueue.length > 0 && chapterQueue[0].at <= evIdx) chapterQueue.shift()!.tok.carry = [...stack];
     if (evIdx === events.length) break;
     const ev = events[evIdx];
-    const prevLetter = isLetter(ev.at - 1);
-    const nextLetter = isLetter(ev.at + ev.raw.length);
+    const prevLetter = isLetter(ev.at - 1, -1);
+    const nextLetter = isLetter(ev.at + ev.raw.length, 1);
     const top = stack[stack.length - 1];
 
     if (ev.raw === "&quot;") {
@@ -251,9 +259,9 @@ export function annotateQuotes(html: string, opts: QuoteOptions = {}): QuoteResu
         const seen = sameKindByOuter.get(top!);
         if (seen) seen.count++;
         else {
-          const w = { ref: ev.ref, severity: "warning" as const, message: "", outer: top!, mark, count: 1 };
-          sameKindByOuter.set(top!, w);
-          problems.push(w);
+          const problem: QuoteProblem = { ref: ev.ref, severity: "warning", message: "" };
+          sameKindByOuter.set(top!, { problem, mark, count: 1 });
+          problems.push(problem);
         }
       } else if (isSpaceOrEnd(ev.at + 1) && !isSpaceOrEnd(ev.at - 1)) {
         ev.cls = "qm-warn";
@@ -281,10 +289,8 @@ export function annotateQuotes(html: string, opts: QuoteOptions = {}): QuoteResu
     if (prevLetter && nextLetter) continue; // don't, Yahweh’s
     if (top?.mark === "‘") {
       closeTo(top, ev);
-      if (prevLetter) {
-        ev.cls = "qm-warn";
-        ev.title = "Read as closing ‘ — if this is a possessive (sisters’), the quote is still open.";
-      }
+      // Usually right (`‘… Yahweh’`), so no yellow — the hover says it.
+      if (prevLetter) ev.title = `Read as closing ‘${top.id} (from ${formatRef(top.ref)}). If this is a possessive (sisters’), that quote is still open.`;
       continue;
     }
     if (prevLetter) continue; // sisters’ (possessive) — no ‘ to close
@@ -307,13 +313,11 @@ export function annotateQuotes(html: string, opts: QuoteOptions = {}): QuoteResu
     }
   }
 
-  for (const w of sameKindByOuter.values()) {
-    const o = w.outer;
-    w.message =
+  for (const [o, w] of sameKindByOuter) {
+    w.problem.message =
       `${w.mark} opens directly inside ${o.mark}${o.id} (from ${formatRef(o.ref)})` +
       (w.count > 1 ? `, and ${w.count - 1} more ${w.mark} after it do too` : "") +
       `; nested quotes normally switch between “ and ‘ — is ${o.mark}${o.id} missing its closing ${CLOSE_FOR[o.mark]}?`;
-    delete (w as Partial<typeof w>).outer;
   }
 
   // Pass 3: emit.
@@ -369,7 +373,9 @@ export interface QuoteSummaryContext {
 }
 
 // The box above the text: counts, carry-in, problems, what stays open, legend.
-export function quoteSummaryHtml(r: QuoteResult, ctx: QuoteSummaryContext): string {
+// `r` null = nothing annotated yet (earlier chapters still loading).
+export function quoteSummaryHtml(r: QuoteResult | null, ctx: QuoteSummaryContext): string {
+  if (r === null) return `<div class="qm-summary"><div>Checking earlier chapters for quotes still open…</div></div>\n`;
   const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const list = (qs: OpenQuote[]) => qs.map((q) => `${q.mark} ${formatRef(q.ref)}`).join(", ");
   const errors = r.problems.filter((p) => p.severity === "error").length;
@@ -381,8 +387,7 @@ export function quoteSummaryHtml(r: QuoteResult, ctx: QuoteSummaryContext): stri
       `${warnings ? ` · <span class="qm-sum-warn">${warnings} to check</span>` : ""}</div>`,
   );
   const c = ctx.carry;
-  if (c.state === "loading") lines.push(`<div>Checking earlier chapters for quotes still open…</div>`);
-  else if (c.state === "failed") lines.push(`<div class="qm-sum-warn">Could not load earlier chapters, so quotes opened before this chapter are not counted.</div>`);
+  if (c.state === "failed") lines.push(`<div class="qm-sum-warn">Could not load earlier chapters, so quotes opened before this chapter are not counted.</div>`);
   else if (c.state === "ready") {
     lines.push(
       r.carriedIn.length
