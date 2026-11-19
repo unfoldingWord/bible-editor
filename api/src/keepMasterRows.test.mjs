@@ -198,6 +198,29 @@ console.log("\n[replay: NUM TN, 2026-11-16 (#1407)]");
   ok(masterMovedGuardRefuses(plan), `79 > ${MASTER_MOVED_REFUSE_THRESHOLD}: the workflow refuses this push and alerts instead`);
 }
 
+console.log("\n[#1415: only Door43 deleted a row → it is left out; a row we changed or added still ships]");
+{
+  const base = tn([row("1:1", "aa11", "One."), row("1:2", "bb22", "Two."), row("1:3", "cc33", "Three.")]);
+  const ours = tn([row("1:1", "aa11", "One."), row("1:2", "bb22", "Two."), row("1:3", "cc33", "Three, edited."), row("1:4", "dd44", "New.")]);
+  const master = tn([row("1:1", "aa11", "One.")]);
+  const plan = planKeepMasterRows(ours, base, master, "tn");
+  ok(plan.dropped.map((r) => r.id).join() === "bb22", `bb22 dropped (got ${plan.dropped.map((r) => r.id)})`);
+  ok(plan.dropped[0].ref === "1:2", "dropped row carries our ref");
+  ok(plan.kept.length === 0 && plan.moved.length === 0, "nothing kept or moved");
+  ok(plan.content === tn([row("1:1", "aa11", "One."), row("1:3", "cc33", "Three, edited."), row("1:4", "dd44", "New.")]), "bb22's line is removed; cc33 (edited) and dd44 (new) ship");
+  ok(!masterMovedGuardRefuses(plan), "one dropped row ships");
+
+  const crlf = (s) => s.replace(/\n/g, "\r\n");
+  const p2 = planKeepMasterRows(crlf(ours), base, master, "tn");
+  ok(p2.content === crlf(tn([row("1:1", "aa11", "One."), row("1:3", "cc33", "Three, edited."), row("1:4", "dd44", "New.")])), "CRLF render: line removed cleanly");
+
+  const p3 = planKeepMasterRows(ours, base, master, "tn", new Set(["aa11"]));
+  ok(p3.dropped.length === 0 && p3.content === ours, "onlyIds without bb22: not dropped");
+
+  ok(masterMovedGuardRefuses({ kept: Array(11).fill({}), moved: [], dropped: Array(10).fill({}) }), "11 kept + 10 dropped refuses");
+  ok(!masterMovedGuardRefuses({ kept: Array(10).fill({}), moved: [], dropped: Array(10).fill({}) }), "10 kept + 10 dropped ships");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);

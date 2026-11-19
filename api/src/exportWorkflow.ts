@@ -83,13 +83,16 @@ export function d1RenderKey(r2Key: string): string {
 }
 
 // IDs whose line differs between D1's render and the bytes pushed for it:
-// the rows that push kept from master (#1403 carry mode).
+// the rows that push kept from master (#1403 carry mode), plus the rows it
+// left out because Door43 had deleted them (#1415).
 function keptIdsBetween(d1Render: string, pushed: string): Set<string> {
   const lines = (raw: string) =>
     new Map(raw.split(/\r?\n/).slice(1).filter(Boolean).map((l) => [l.split("\t")[1]?.trim() ?? "", l] as const));
   const a = lines(d1Render);
+  const b = lines(pushed);
   const out = new Set<string>();
-  for (const [id, line] of lines(pushed)) if (id && a.has(id) && a.get(id) !== line) out.add(id);
+  for (const [id, line] of b) if (id && a.has(id) && a.get(id) !== line) out.add(id);
+  for (const id of a.keys()) if (id && !b.has(id)) out.add(id);
   return out;
 }
 
@@ -1235,7 +1238,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         const { plan } = guard;
         if (masterMovedGuardRefuses(plan)) {
           await this.recordMasterMovedRefusal(book, resource, plan);
-          const reason = `master_moved_guard:${plan.kept.length}_kept_${plan.moved.length}_moved`;
+          const reason = `master_moved_guard:${plan.kept.length}_kept_${plan.moved.length}_moved_${plan.dropped.length}_dropped`;
           await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
           return {
             book,
@@ -1252,9 +1255,11 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           };
         }
         await this.clearExportAlert(`export_master_moved:${book}:${resource}`);
-        if (plan.kept.length > 0) {
+        if (plan.kept.length > 0 || plan.dropped.length > 0) {
           const d1Render = built.content;
           built.content = plan.content;
+          // Rows exported = rows that ship; dropped rows (#1415) do not.
+          built.rowCount -= plan.dropped.length;
           // D1's own render beside the pushed one, so the next export compares
           // D1 against what D1 was (not against the kept rows we pushed), which
           // keeps the kept rows kept until D1 itself changes them. Tied to the
@@ -1273,9 +1278,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             httpMetadata: { contentType: "text/tab-separated-values" },
           });
           console.log(
-            `export: kept Door43's version of ${plan.kept.length} ${book} ${resource} row(s) Bible Editor had not changed (#1403)`,
+            `export: kept Door43's version of ${plan.kept.length} and left out ${plan.dropped.length} Door43-deleted ` +
+              `${book} ${resource} row(s) Bible Editor had not changed (#1403, #1415)`,
           );
-          await this.recordKeptMasterRows(book, resource, plan.kept);
+          await this.recordKeptMasterRows(book, resource, plan.kept, plan.dropped);
         } else {
           await this.clearExportAlert(`export_kept_master:${book}:${resource}`);
         }
@@ -3674,13 +3680,35 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // #1403: the push shipped Door43's version of rows D1 had not changed. D1
   // still holds the older text, so this stays up (re-written each push) until
   // D1 catches up; a person pulling the book from Door43 clears it.
-  private async recordKeptMasterRows(book: string, resource: Resource, kept: KeptMasterRow[]): Promise<void> {
+  // #1415: the same banner names rows left out because Door43 deleted them.
+  // A pull does not remove such a row from D1 when a person owns it (the sync
+  // prunes only unowned rows: softDeleteRemovedTsvRows), so the advice differs.
+  private async recordKeptMasterRows(
+    book: string,
+    resource: Resource,
+    kept: KeptMasterRow[],
+    dropped: KeptMasterRow[],
+  ): Promise<void> {
+    const parts: string[] = [];
+    if (kept.length > 0) {
+      parts.push(
+        `kept Door43's version of ${kept.length} row(s) that Bible Editor ` +
+          `had not changed since its last push, instead of overwriting them with Bible Editor's older text: ` +
+          `${describeKeptRows(kept)}. Bible Editor still shows the older text for these rows. Pull ${book} ` +
+          `from Door43 to bring them in; editing one of them in Bible Editor instead makes that edit win on the next push.`,
+      );
+    }
+    if (dropped.length > 0) {
+      parts.push(
+        `left out ${dropped.length} row(s) that were deleted on Door43 and that Bible Editor had not changed ` +
+          `since its last push, instead of adding them back: ${describeKeptRows(dropped)}. Bible Editor still ` +
+          `shows these rows. Delete them in Bible Editor to match Door43; editing one of them in Bible Editor ` +
+          `instead puts it back on Door43 with the next push.`,
+      );
+    }
     await this.writeAlert(
       `export_kept_master:${book}:${resource}`,
-      `${book} ${resource.toUpperCase()}: kept Door43's version of ${kept.length} row(s) that Bible Editor ` +
-        `had not changed since its last push, instead of overwriting them with Bible Editor's older text: ` +
-        `${describeKeptRows(kept)}. Bible Editor still shows the older text for these rows. Pull ${book} ` +
-        `from Door43 to bring them in; editing one of them in Bible Editor instead makes that edit win on the next push.`,
+      `${book} ${resource.toUpperCase()}: ${parts.join(" Also ")}`,
       `${this.env.DCS_BASE_URL}/unfoldingWord`,
       "warning",
     );
@@ -3692,9 +3720,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // The kept-rows banner from an earlier push is superseded by this one.
     await this.clearExportAlert(`export_kept_master:${book}:${resource}`);
     const why: string[] = [];
-    if (plan.kept.length > MASTER_MOVED_REFUSE_THRESHOLD) {
+    const keptOrDropped = plan.kept.length + plan.dropped.length;
+    if (keptOrDropped > MASTER_MOVED_REFUSE_THRESHOLD) {
       why.push(
-        `${plan.kept.length} rows is more than ${MASTER_MOVED_REFUSE_THRESHOLD}, which usually means Bible Editor's ` +
+        `${keptOrDropped} rows is more than ${MASTER_MOVED_REFUSE_THRESHOLD}, which usually means Bible Editor's ` +
           `copy of ${book} is out of date`,
       );
     }
@@ -3704,8 +3733,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     await this.writeAlert(
       `export_master_moved:${book}:${resource}`,
       `${book} ${resource.toUpperCase()}: not pushed to Door43. Door43 has changes to ${plan.kept.length + plan.moved.length} ` +
-        `row(s) that Bible Editor has not changed since its last push, and pushing would undo them (${why.join("; ")}). ` +
-        `Pull ${book} from Door43, check these rows, then push again: ${describeKeptRows([...plan.moved, ...plan.kept])}.`,
+        `row(s)` +
+        (plan.dropped.length > 0 ? ` and deleted ${plan.dropped.length} row(s)` : "") +
+        ` that Bible Editor has not changed since its last push, and pushing would undo them (${why.join("; ")}). ` +
+        `Pull ${book} from Door43, check these rows, then push again: ` +
+        `${describeKeptRows([...plan.moved, ...plan.kept, ...plan.dropped])}.` +
+        (plan.dropped.length > 0
+          ? ` A row deleted on Door43 that a person edited in Bible Editor stays after the pull; delete it in Bible Editor too.`
+          : ""),
       `${this.env.DCS_BASE_URL}/unfoldingWord`,
       "error",
     );
