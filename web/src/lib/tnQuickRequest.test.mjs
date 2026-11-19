@@ -159,6 +159,18 @@ console.log("\n[Case] single verse unchanged (#968)");
     );
   }
 
+  console.log("\n[Case] a note spanning the bridge keeps the unscoped English lookup (#1426)");
+  {
+    // ref 9:10-12 may quote any of the three verses, so 9:12's English must
+    // still be found for a note stored on 9:10.
+    const data = { verses: { ULT: { 10: { ...ustBridge(ustRaw), bible_version: "ULT" } }, UST: { 10: ustBridge(ustRaw) }, UHB } };
+    const r = buildTnQuickRequest({ ...note2ch(10, "many things in Jerusalem"), ref_raw: "9:10-12" }, data);
+    assert(
+      r.ok && nfc(r.request.hebrewGuess).includes(nfc("כָּל")),
+      `range note: 9:12's English still derives its Hebrew (got ${r.ok ? JSON.stringify(r.request.hebrewGuess) : r.error.reason})`,
+    );
+  }
+
   console.log("\n[Case] English input on a bridge WITHOUT x-ref is unchanged (#1426)");
   {
     const data = { verses: { ULT, UST: { 10: ustBridge(ustRaw.replace(/ x-ref="[^"]*"/g, "")) }, UHB } };

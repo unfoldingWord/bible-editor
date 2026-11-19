@@ -184,13 +184,16 @@ export function buildTnQuickRequest(
     if (!ultVo) {
       return { ok: false, error: { reason: "hebrew_not_found" } };
     }
-    const derivedHebrew = findSourceForTargetText(ultVo, rawQuote, sourceRefFor(ultVerse));
+    // A note spanning several verses may quote any of them, so only a
+    // one-verse note scopes the English lookup to its verse.
+    const oneVerse = noteCoveredVerses(row).length <= 1;
+    const derivedHebrew = findSourceForTargetText(ultVo, rawQuote, oneVerse ? sourceRefFor(ultVerse) : undefined);
     if (!derivedHebrew) {
       return { ok: false, error: { reason: "hebrew_not_found" } };
     }
     hebrewGuess = derivedHebrew;
     ultSelection = rawQuote;
-    const ustSourceRef = sourceRefFor(ustVerse);
+    const ustSourceRef = oneVerse ? sourceRefFor(ustVerse) : undefined;
     ustSelection =
       (ustVo &&
         extractTargetSelectionText(ustVo, derivedHebrew, 1, sourceVo, ustSourceRef ? { sourceRef: ustSourceRef } : undefined)) ||
