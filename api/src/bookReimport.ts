@@ -136,6 +136,7 @@ import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { planVerseSortOrders, verseOrderKey, type LiveOrderRow, type VerseOrderPlan } from "./tsvVerseOrder";
 import {
   MIRROR_KEPT,
+  MIRROR_NON_CONTENT_ACTIONS,
   planLockedMirror,
   type MirrorKeepReason,
   type MirrorMasterRow,
@@ -10573,17 +10574,24 @@ async function softDeleteRemovedTsvRows(
 // test fails toward keeping:
 //   - edit_log: any entry for the row past the confirmed boundary (id past
 //     `cutoff.editId`, else created_at at or past `cutoff.confirmedAt`) that
-//     the sync did not write (source 'dcs_reimport') and that is not a
-//     review-flag dismissal. A person's PATCH/create/delete/trash, an AI
-//     apply, a bootstrap import: all keep the row.
+//     the sync did not write (source 'dcs_reimport') and whose action changes
+//     what the export renders (not in MIRROR_NON_CONTENT_ACTIONS: flag
+//     acknowledgments and the preserve/hint bits, #1428). A person's
+//     PATCH/create/delete/trash/untrash, an AI apply, a bootstrap import: all
+//     keep the row.
 //   - row provenance: last_change_source 'user' or 'ai_pipeline' with
 //     updated_at at or past confirmedAt (same second keeps), unless the last
-//     action only cleared or dismissed a review flag (a dismissal is not a
-//     content change; were it pending, dismissing a mirror_kept flag would
-//     keep the row over Door43 for good). This catches the in-app reorder, which
-//     writes no edit_log row.
+//     action is a non-content one (were a dismissal pending, dismissing a
+//     mirror_kept flag would keep the row over Door43 for good). This catches
+//     the in-app reorder, which writes no edit_log row. A preserve/hint
+//     stamp can hide such a reorder (those rows were pending, order and all,
+//     before #1428), so that row's verse keeps D1's order (holdOrder) while
+//     its content follows master. A flag dismissal does not hold order, as
+//     before #1428.
 // The flag writes below touch neither record (no edit_log row, no provenance,
 // no updated_at), so a kept row still reads as pending the next night.
+// A person who dismissed the mirror_kept flag after the boundary (the
+// dismiss_review payload names the kind) keeps the row unflagged (#1428).
 //
 // Fail-safe skips (the merge result stands): no confirmed boundary at all, the
 // book no longer locked (or the lock read failed), an empty master file.
@@ -10685,15 +10693,26 @@ async function mirrorLockedTsv(
   // set edit_log.book since migration 0017 backfilled it, a pending edit is by
   // definition recent, and the plain equality lets this use
   // edit_log_row_by_book (kind, book, row_key) instead of scanning the kind.
+  const nonContentSql = MIRROR_NON_CONTENT_ACTIONS.map((a) => `'${a}'`).join(", ");
   const pendingRs = await env.DB.prepare(
     `SELECT DISTINCT row_key FROM edit_log
       WHERE kind = ?1 AND book = ?2 AND ${cutoff.editId != null ? "id > ?3" : "created_at >= ?3"}
         AND (source IS NULL OR source <> '${REIMPORT_SOURCE}')
-        AND action <> 'dismiss_review'`,
+        AND action NOT IN (${nonContentSql})`,
   )
     .bind(kind, book, cutoff.editId ?? confirmedAt)
     .all<{ row_key: string }>();
   const pendingIds = new Set((pendingRs.results ?? []).map((r) => String(r.row_key)));
+  // Rows whose mirror_kept flag a person dismissed since the boundary.
+  const dismissedRs = await env.DB.prepare(
+    `SELECT DISTINCT row_key FROM edit_log
+      WHERE kind = ?1 AND book = ?2 AND ${cutoff.editId != null ? "id > ?3" : "created_at >= ?3"}
+        AND action = 'dismiss_review'
+        AND payload_json LIKE '%"review_kind":"${MIRROR_KEPT}"%'`,
+  )
+    .bind(kind, book, cutoff.editId ?? confirmedAt)
+    .all<{ row_key: string }>();
+  const dismissedIds = new Set((dismissedRs.results ?? []).map((r) => String(r.row_key)));
 
   const byId = new Map<string, Record<string, unknown>>();
   const stored: MirrorStoredRow[] = [];
@@ -10702,8 +10721,9 @@ async function mirrorLockedTsv(
     byId.set(id, row);
     const src = (row.last_change_source as string | null) ?? null;
     const action = (row.last_change_action as string | null) ?? null;
-    const flagOnly = action === "dismiss_review" || action === "review_clear";
+    const nonContent = action != null && MIRROR_NON_CONTENT_ACTIONS.includes(action);
     const updatedAt = row.updated_at == null ? null : Number(row.updated_at);
+    const stampedSince = (src === "user" || src === AI_SOURCE) && updatedAt != null && updatedAt >= confirmedAt;
     stored.push({
       id,
       chapter: Number(row.chapter),
@@ -10711,9 +10731,8 @@ async function mirrorLockedTsv(
       sig: mirrorSignature(kind, storedTsvRowToParsed(kind, row)),
       sort_order: row.sort_order == null ? null : Number(row.sort_order),
       removed: row.deleted_at != null || (kind === "tn" && row.trashed_at != null),
-      pending:
-        pendingIds.has(id) ||
-        ((src === "user" || src === AI_SOURCE) && !flagOnly && updatedAt != null && updatedAt >= confirmedAt),
+      pending: pendingIds.has(id) || (stampedSince && !nonContent),
+      holdOrder: stampedSince && nonContent && action !== "dismiss_review" && action !== "review_clear",
       review_kind: (row.review_kind as string | null) ?? null,
     });
   }
@@ -10845,10 +10864,12 @@ async function mirrorLockedTsv(
   // 5. Flags. Neither write bumps version, stamps provenance or updated_at, or
   //    logs to edit_log, so the kept row still reads as pending tomorrow. An
   //    identical standing flag is not rewritten.
+  // `kept` counts the rows that end up carrying the flag (standing or written).
   for (const k of plan.keep) {
-    out.kept++;
     if (!free(k.id)) continue;
     if (k.reason === "deleted_in_app") continue; // a tombstone shows no flag
+    if (dismissedIds.has(k.id)) continue; // kept, but the person dismissed the flag
+    out.kept++;
     const s = byId.get(k.id) as Record<string, unknown>;
     const reason = mirrorKeptReason(k.reason);
     const m = masterRows.get(k.id);
@@ -10906,7 +10927,7 @@ async function mirrorLockedTsv(
     }
   }
 
-  if (out.mirrored > 0 || out.kept > 0 || out.skippedLocked > 0 || out.removeUnverified > 0 || out.remaining > 0 || out.applyIncomplete) {
+  if (out.mirrored > 0 || out.kept > 0 || out.skippedLocked > 0 || out.removeUnverified > 0 || out.lostCas > 0 || out.remaining > 0 || out.applyIncomplete) {
     console.log("reimport locked mirror", { book, resource: kind, ...out });
   }
   return out;
@@ -11864,8 +11885,8 @@ export async function bookLockedForAlert(
 // instead of one step meeting the subrequest cap.
 //
 // A mirror that did not finish leaves the (book, kind) watermark uncertified:
-// a pipeline-held chapter, a write batch that threw, a removal skipped on an
-// unproven fetch, rows left past the last step, a missing staged file, or a
+// a pipeline-held chapter, a write batch that threw, a write that lost its
+// version check in the last step, a removal skipped on an unproven fetch, rows left past the last step, a missing staged file, or a
 // step that threw after its retries (caught here, so the book's remaining
 // steps still run). For an entry in `changed`, that rides perResource into the
 // reimport-sync step's own gate (prune_locked / apply_incomplete). An entry
@@ -11914,7 +11935,13 @@ async function runLockedMirrors(
       lockedChapters = Math.max(lockedChapters, res.skippedLocked);
       kept = res.kept; // re-counted by every step's plan: the last one stands
       if (res.applyIncomplete || res.removeUnverified > 0) incomplete = true;
-      if (res.remaining === 0) break;
+      if (res.remaining === 0) {
+        // A write that lost its version check left that row drifted (#1428).
+        // An earlier step's loss is re-planned by the next step; the last
+        // step's is not, so tonight cannot certify the watermark.
+        if (res.lostCas > 0) incomplete = true;
+        break;
+      }
       if (n === MIRROR_MAX_STEPS - 1) incomplete = true;
     }
     if (kept > 0) perResource[kind].mirror_kept = (perResource[kind].mirror_kept ?? 0) + kept;
