@@ -82,6 +82,8 @@ function editVerse(usfm, verse, from, to) {
 }
 // Change the first `\w` word of a verse (a person editing on Door43).
 const editFirstWord = (usfm, verse) => editVerse(usfm, verse, /\\w ([^|\s]+)\|/, "\\w $1Q|");
+// "ref/reason,…" for a plan's unplaceable verses.
+const cp = (plan) => (plan ? plan.cannotPlace.map((u) => `${u.ref}/${u.reason}`).join() : "null");
 
 const OBA = render(sample("31-OBA.usfm"));
 ok(normalizeUsfmFormatting(OBA) === OBA, "(setup: our render is already in our own layout)");
@@ -157,7 +159,7 @@ console.log("\n[8. bridged verse (2CH 9:10-12): kept by its bridge key; a re-bri
   ok(plan && plan.kept.join() === "9:10-12" && plan.content === master, `kept 9:10-12 (${plan?.kept})`);
   const rebridged = ours.replace("\\v 10-12", "\\v 10-11");
   const p2 = planKeepMasterVerses(ours, ours, rebridged);
-  ok(p2 && p2.cannotPlace.join() === "9:10-12" && masterMovedVerseGuardRefuses(p2), `cannot place 9:10-12 (${p2?.cannotPlace})`);
+  ok(cp(p2) === "9:10-12/structure" && masterMovedVerseGuardRefuses(p2), `cannot place 9:10-12 (${cp(p2)})`);
 }
 
 console.log("\n[9. master lacks a verse: overlap or a proven-whole read → cannot place; otherwise ships]");
@@ -166,13 +168,13 @@ console.log("\n[9. master lacks a verse: overlap or a proven-whole read → cann
   const s3 = verseSpan(OBA, 3);
   const bridged = (OBA.slice(0, s3.start) + OBA.slice(s3.start).replace(/^\\v 3\s*/, "")).replace(/\\v 2(?=\s)/, "\\v 2-3");
   const p1 = planKeepMasterVerses(OBA, OBA, bridged);
-  ok(p1 && p1.cannotPlace.join() === "1:2,1:3", `re-bridge: cannot place 1:2, 1:3 (${p1?.cannotPlace})`);
+  ok(cp(p1) === "1:2/structure,1:3/structure", `re-bridge: cannot place 1:2, 1:3 (${cp(p1)})`);
   // The last verse missing with nothing overlapping: a short read looks the same.
   const short = OBA.slice(0, verseSpan(OBA, 21).start);
   const p2 = planKeepMasterVerses(OBA, OBA, short);
   ok(p2 && p2.cannotPlace.length === 0 && p2.kept.length === 0, "unverified read: ships as before");
   const p3 = planKeepMasterVerses(OBA, OBA, short, null, true);
-  ok(p3 && p3.cannotPlace.join() === "1:21", `verified read: cannot place 1:21 (${p3?.cannotPlace})`);
+  ok(cp(p3) === "1:21/structure", `verified read: cannot place 1:21 (${cp(p3)})`);
 }
 
 console.log("\n[10. master doubled a verse marker → cannot place]");
@@ -180,7 +182,7 @@ console.log("\n[10. master doubled a verse marker → cannot place]");
   const s = verseSpan(OBA, 5);
   const doubled = OBA.slice(0, s.end) + OBA.slice(s.start, s.end) + OBA.slice(s.end);
   const plan = planKeepMasterVerses(OBA, OBA, doubled);
-  ok(plan && plan.cannotPlace.join() === "1:5", `cannot place 1:5 (${plan?.cannotPlace})`);
+  ok(cp(plan) === "1:5/structure", `cannot place 1:5 (${cp(plan)})`);
 }
 
 console.log("\n[11. onlyRefs limits the plan (carry mode)]");
@@ -209,7 +211,7 @@ console.log("\n[14. threshold: kept verses count one each, a bridge too; any can
   ok(MASTER_MOVED_REFUSE_THRESHOLD === 20, "threshold is 20");
   ok(!masterMovedVerseGuardRefuses({ kept: refs(20), cannotPlace: [] }), "20 kept ships");
   ok(masterMovedVerseGuardRefuses({ kept: refs(21), cannotPlace: [] }), "21 kept refuses");
-  ok(masterMovedVerseGuardRefuses({ kept: [], cannotPlace: ["1:2"] }), "one cannot-place refuses");
+  ok(masterMovedVerseGuardRefuses({ kept: [], cannotPlace: [{ ref: "1:2", reason: "structure" }] }), "one cannot-place refuses");
 }
 
 console.log("\n[15. replay: 1CH ULT, 2026-08-11 (chapters 1-3)]");
@@ -221,13 +223,13 @@ console.log("\n[15. replay: 1CH ULT, 2026-08-11 (chapters 1-3)]");
   ok(plan && plan.kept.length === 17, `17 verses Door43 changed and Bible Editor did not are kept (${plan?.kept.length})`);
   // Door43's text for these lays out differently under our validator layout
   // (1:45 ends `\ts*  \v 46`), so it cannot ship as master's verse.
-  ok(plan && plan.cannotPlace.join() === "1:19,1:45,1:48", `1:19, 1:45, 1:48 cannot be placed (${plan?.cannotPlace})`);
+  ok(cp(plan) === "1:19/layout,1:45/layout,1:48/layout", `1:19, 1:45, 1:48 cannot be placed (${cp(plan)})`);
   ok(masterMovedVerseGuardRefuses(plan), "so this push is refused, and master keeps every one of them");
 
   // Chapters 2-3 alone: nothing unplaceable, 16 kept, and the push ships them.
   const from2 = (u) => u.slice(0, u.search(/\\c\s+1\s/)) + u.slice(u.search(/\\c\s+2\s/));
   const p2 = planKeepMasterVerses(from2(ours), from2(base), from2(master));
-  ok(p2 && p2.kept.length === 16 && p2.cannotPlace.length === 0, `chapters 2-3: 16 kept, 0 cannot place (${p2?.kept.length}, ${p2?.cannotPlace})`);
+  ok(p2 && p2.kept.length === 16 && p2.cannotPlace.length === 0, `chapters 2-3: 16 kept, 0 cannot place (${p2?.kept.length}, ${cp(p2)})`);
   ok(!masterMovedVerseGuardRefuses(p2), "…which ships");
   ok(validateUsfm(p2.content).length === 0, "the result passes validateUsfm");
   const reverted = new Set(usfmRevertReport(p2.content, from2(master), from2(base)).entries.map((e) => e.ref));

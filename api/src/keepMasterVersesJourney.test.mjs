@@ -375,6 +375,24 @@ console.log("\n[9. Door43 aligned a verse D1 holds unaligned → kept, and the a
   ok(t.live(`export_kept_master:${BOOK}:ult`).some((a) => a.message.includes("1:5")), "the kept-verses alert names 1:5");
 }
 
+console.log("\n[10. Door43's fixed verse ends in a line its USFM check rejects (1CH 1:45's shape) → refused, worded as such]");
+{
+  const d = door43();
+  const t = freshEnv();
+  await confirmedNight1(t, d);
+  d.master = editMasterWord(d.master, 3, "deceived", "fooled");
+  const s4 = verseSpan(d.master, 4);
+  d.master = d.master.slice(0, s4.start) + "\\ts*  " + d.master.slice(s4.start);
+  const r = await t.exportOne("export-night-2");
+  ok(String(r.dcsSkippedReason) === "master_moved_guard:0_kept_1_cannot_place", `refused (got ${r.dcsSkippedReason})`);
+  ok(d.writes.length === 0, "nothing committed");
+  const alert = t.live(`export_master_moved:${BOOK}:ult`);
+  ok(
+    alert.length === 1 && alert[0].message.includes("USFM check rejects") && !alert[0].message.includes("re-bridged"),
+    `the alert names the layout cause, not a re-bridge (${alert[0]?.message})`,
+  );
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);

@@ -1466,17 +1466,28 @@ export function masterMovedGuardRefuses(plan: Pick<KeepMasterPlan, "kept" | "mov
 // marker up to the next `\v` or `\c`, which is exactly the span usfm-js
 // assigns to that verse (its `\zaln` milestones, words, and the paragraph or
 // poetry markers before the next verse). Re-rendering the whole book through
-// usfm-js would instead rewrite the verses that do not round-trip. The
-// result is then parsed again: each kept verse must parse to master's tree
-// and every other verse to ours exactly, or the plan is null (not measured,
-// the caller ships as before). Fails open (null) on any parse failure.
+// usfm-js would instead rewrite the verses that do not round-trip. Only when
+// master's bytes bring in a line validateUsfm rejects is the result laid out
+// by normalizeUsfmFormatting. The result is then parsed again: every other
+// verse must parse to ours exactly, or the plan is null (not measured, the
+// caller ships as before); a kept verse that no longer reads as master's
+// under the same lens goes to `cannotPlace` with reason "layout". Fails open
+// (null) on any parse failure.
+export interface UnplaceableVerse {
+  ref: string;
+  // "structure": master no longer holds this key once (re-bridged, split,
+  // removed or doubled). "layout": master's text for it does not survive our
+  // validator layout as the same verse.
+  reason: "structure" | "layout";
+}
+
 export interface KeepMasterVersePlan {
   // `rendered` with each kept verse's text replaced by master's. Equal to
   // `rendered` when nothing is kept.
   content: string;
   // `chapter:verse` keys, in document order.
   kept: string[];
-  cannotPlace: string[];
+  cannotPlace: UnplaceableVerse[];
 }
 
 interface UsfmVerseSpans {
@@ -1552,7 +1563,7 @@ export function planKeepMasterVerses(
   }
   const masked = (json: string) => verseCompareKey(json);
   const kept: string[] = [];
-  const cannotPlace: string[] = [];
+  const cannotPlace: UnplaceableVerse[] = [];
   for (const ref of ours.spans.keys()) {
     if (onlyRefs && !onlyRefs.has(ref)) continue;
     if (ours.dupes.has(ref) || base.dupes.has(ref)) continue;
@@ -1565,7 +1576,7 @@ export function planKeepMasterVerses(
     if (m === undefined || master.dupes.has(ref)) {
       const { chapter, lo, hi } = verseRefRange(ref);
       const overlaps = (master.ranges.get(chapter) ?? []).some((r) => r.lo <= hi && lo <= r.hi);
-      if (master.dupes.has(ref) || overlaps || masterComplete) cannotPlace.push(ref);
+      if (master.dupes.has(ref) || overlaps || masterComplete) cannotPlace.push({ ref, reason: "structure" });
       continue;
     }
     const masterKey = masked(m);
@@ -1614,7 +1625,7 @@ export function planKeepMasterVerses(
     if (keptSet.has(ref)) {
       const got = lens(json);
       if (got !== null && got === lens(masterText.get(ref)!)) placed.push(ref);
-      else cannotPlace.push(ref);
+      else cannotPlace.push({ ref, reason: "layout" });
     } else if (json !== oursText.get(ref)) {
       return null;
     }

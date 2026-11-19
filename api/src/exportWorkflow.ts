@@ -1444,8 +1444,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // block above: a verse Bible Editor has not changed since its last push
     // that reached master, but that Door43 changed substantively, ships as
     // master's verse. More than MASTER_MOVED_REFUSE_THRESHOLD such verses, or
-    // one Door43 re-bridged, split, removed or doubled (it cannot be placed by
-    // its key), refuses the push. Runs once checkUsfmAlignmentShrink has read
+    // one that cannot be placed (Door43 re-bridged, split, removed or doubled
+    // it, or its Door43 text does not survive our validator layout), refuses
+    // the push. Runs once checkUsfmAlignmentShrink has read
     // master, before that backstop's verdict is acted on and before
     // validateUsfm, so both, the R2 copy, commitToDcs, recordPushedRender and
     // the revert report all judge the content that ships.
@@ -3918,18 +3919,29 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           `copy of ${book} is out of date`,
       );
     }
-    if (plan.cannotPlace.length > 0) {
+    // Each reason worded for what the plan measured (STATE.md: an alert may
+    // only state a measured cause).
+    const structure = plan.cannotPlace.filter((u) => u.reason === "structure").map((u) => u.ref);
+    const layout = plan.cannotPlace.filter((u) => u.reason === "layout").map((u) => u.ref);
+    if (structure.length > 0) {
       why.push(
-        `${plan.cannotPlace.length} of them were re-bridged, split, removed or doubled on Door43 ` +
-          `(${describeVerseRefs(plan.cannotPlace)}), which the export cannot place on its own`,
+        `${structure.length} of them Door43 no longer holds as one verse with the same number ` +
+          `(re-bridged, split, removed or doubled: ${describeVerseRefs(structure)}), which the export cannot place on its own`,
       );
     }
+    if (layout.length > 0) {
+      why.push(
+        `${layout.length} of them hold a line on Door43 that Door43's USFM check rejects, and laying it out ` +
+          `correctly changes the verse (${describeVerseRefs(layout)}), so the export cannot ship Door43's version as it is`,
+      );
+    }
+    const unplaced = plan.cannotPlace.map((u) => u.ref);
     await this.writeAlert(
       `export_master_moved:${book}:${resource}`,
       `${book} ${resource.toUpperCase()}: not pushed to Door43. Door43 has changes to ` +
-        `${plan.kept.length + plan.cannotPlace.length} verse(s) that Bible Editor has not changed since its last push, ` +
+        `${plan.kept.length + unplaced.length} verse(s) that Bible Editor has not changed since its last push, ` +
         `and pushing would undo them (${why.join("; ")}). Pull ${book} from Door43, check these verses, then push ` +
-        `again: ${describeVerseRefs([...plan.cannotPlace, ...plan.kept])}.`,
+        `again: ${describeVerseRefs([...unplaced, ...plan.kept])}.`,
       `${this.env.DCS_BASE_URL}/unfoldingWord`,
       "error",
     );
