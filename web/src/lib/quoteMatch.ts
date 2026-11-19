@@ -41,6 +41,8 @@ export interface QuoteProblem {
   ref: QuoteRef;
   severity: "error" | "warning";
   message: string;
+  // id of the mark element to jump to, when the problem has one in this text.
+  target?: string;
 }
 
 export interface QuoteResult {
@@ -70,6 +72,7 @@ interface Opener {
   status: "ok" | "unclosed" | "open-at-end";
   note: string | null;
   carried: boolean;
+  ev: MarkEvent | null; // its own mark; null when carried in from earlier text
 }
 
 interface MarkEvent {
@@ -82,6 +85,8 @@ interface MarkEvent {
   level: number;
   cls: "" | "qm-bad" | "qm-warn" | "qm-open";
   title: string;
+  // Element id, set only for marks a problem points at.
+  anchor: string | null;
 }
 
 type Token =
@@ -168,6 +173,7 @@ export function annotateQuotes(html: string, opts: QuoteOptions = {}): QuoteResu
         level: 0,
         cls: "",
         title: "",
+        anchor: null,
       };
       parts.push(ev);
       events.push(ev);
@@ -184,14 +190,16 @@ export function annotateQuotes(html: string, opts: QuoteOptions = {}): QuoteResu
   const stack: Opener[] = [];
   let nextId = 1;
   let pairs = 0;
-  const push = (mark: OpenMark, at: QuoteRef, carried: boolean): Opener => {
-    const o: Opener = { id: nextId++, mark, ref: at, level: stack.length + 1, closedAt: null, status: "ok", note: null, carried };
+  const push = (mark: OpenMark, at: QuoteRef, ev: MarkEvent | null): Opener => {
+    const o: Opener = { id: nextId++, mark, ref: at, level: stack.length + 1, closedAt: null, status: "ok", note: null, carried: ev === null, ev };
     stack.push(o);
     openers.push(o);
     return o;
   };
   const carriedIn = (opts.carryIn ?? []).map((c) => ({ ...c }));
-  for (const c of carriedIn) push(c.mark, c.ref, true);
+  for (const c of carriedIn) push(c.mark, c.ref, null);
+  let anchors = 0;
+  const anchorOf = (ev: MarkEvent): string => (ev.anchor ??= `qm-m${++anchors}`);
 
   // Implied-word braces are see-through: `{the people}’s` is a possessive.
   const isLetter = (i: number, step: -1 | 1): boolean => {
@@ -212,6 +220,9 @@ export function annotateQuotes(html: string, opts: QuoteOptions = {}): QuoteResu
         ref: top.ref,
         severity: "error",
         message: `${top.mark}${top.id} is never closed: the ${CLOSE_FOR[o.mark]} at ${formatRef(ev.ref)} closes the outer ${o.mark}${o.id} (from ${formatRef(o.ref)}) while it is still open`,
+        // A quote carried in from an earlier chapter has no mark here: jump to
+        // the closer that exposed it instead.
+        target: anchorOf(top.ev ?? ev),
       });
     }
     o.closedAt = ev.ref;
@@ -241,13 +252,13 @@ export function annotateQuotes(html: string, opts: QuoteOptions = {}): QuoteResu
       ev.kind = "straight";
       ev.cls = "qm-bad";
       ev.title = "Straight quote mark: can't tell whether it opens or closes. Use “ ” or ‘ ’.";
-      problems.push({ ref: ev.ref, severity: "error", message: "straight \" quote mark — use “ or ”" });
+      problems.push({ ref: ev.ref, severity: "error", message: "straight \" quote mark — use “ or ”", target: anchorOf(ev) });
       continue;
     }
     if (ev.raw === "“" || ev.raw === "‘") {
       const mark = ev.raw as OpenMark;
       const sameKind = top?.mark === mark;
-      const o = push(mark, ev.ref, false);
+      const o = push(mark, ev.ref, ev);
       ev.kind = "open";
       ev.opener = o;
       ev.level = o.level;
@@ -259,13 +270,13 @@ export function annotateQuotes(html: string, opts: QuoteOptions = {}): QuoteResu
         const seen = sameKindByOuter.get(top!);
         if (seen) seen.count++;
         else {
-          const problem: QuoteProblem = { ref: ev.ref, severity: "warning", message: "" };
+          const problem: QuoteProblem = { ref: ev.ref, severity: "warning", message: "", target: anchorOf(ev) };
           sameKindByOuter.set(top!, { problem, mark, count: 1 });
           problems.push(problem);
         }
       } else if (isSpaceOrEnd(ev.at + 1) && !isSpaceOrEnd(ev.at - 1)) {
         ev.cls = "qm-warn";
-        problems.push({ ref: ev.ref, severity: "warning", message: `${mark} is followed by a space — should it be ${CLOSE_FOR[mark]}?` });
+        problems.push({ ref: ev.ref, severity: "warning", message: `${mark} is followed by a space — should it be ${CLOSE_FOR[mark]}?`, target: anchorOf(ev) });
       }
       continue;
     }
@@ -275,13 +286,13 @@ export function annotateQuotes(html: string, opts: QuoteOptions = {}): QuoteResu
         ev.kind = "close";
         ev.cls = "qm-bad";
         ev.title = "Closes nothing: no “ is open here.";
-        problems.push({ ref: ev.ref, severity: "error", message: "” closes nothing — no “ is open here" });
+        problems.push({ ref: ev.ref, severity: "error", message: "” closes nothing — no “ is open here", target: anchorOf(ev) });
         continue;
       }
       closeTo(o, ev);
       if (isSpaceOrEnd(ev.at - 1) && nextLetter) {
         ev.cls = "qm-warn";
-        problems.push({ ref: ev.ref, severity: "warning", message: "” is followed by a letter after a space — should it be “?" });
+        problems.push({ ref: ev.ref, severity: "warning", message: "” is followed by a letter after a space — should it be “?", target: anchorOf(ev) });
       }
       continue;
     }
@@ -302,14 +313,19 @@ export function annotateQuotes(html: string, opts: QuoteOptions = {}): QuoteResu
     ev.kind = "close";
     ev.cls = "qm-bad";
     ev.title = "Closes nothing: no ‘ is open here.";
-    problems.push({ ref: ev.ref, severity: "error", message: "’ closes nothing — no ‘ is open here" });
+    problems.push({ ref: ev.ref, severity: "error", message: "’ closes nothing — no ‘ is open here", target: anchorOf(ev) });
   }
 
   const openAtEnd: OpenQuote[] = stack.map((o) => ({ mark: o.mark, ref: o.ref }));
   for (const o of stack) {
     o.status = opts.atBookEnd ? "unclosed" : "open-at-end";
     if (opts.atBookEnd) {
-      problems.push({ ref: o.ref, severity: "error", message: `${o.mark}${o.id} is never closed (still open at the end of the book)` });
+      problems.push({
+        ref: o.ref,
+        severity: "error",
+        message: `${o.mark}${o.id} is never closed (still open at the end of the book)`,
+        target: o.ev ? anchorOf(o.ev) : undefined,
+      });
     }
   }
 
@@ -343,7 +359,8 @@ export function annotateQuotes(html: string, opts: QuoteOptions = {}): QuoteResu
     }
     const lvl = ev.level > 0 ? ` qm-l${((ev.level - 1) % 4) + 1}` : "";
     const num = o ? `<sub class="qm-n">${o.id}</sub>` : "";
-    return `<span class="qm${lvl}${cls ? ` ${cls}` : ""}" title="${escapeAttr(title)}">${ev.raw}${num}</span>`;
+    const id = ev.anchor ? ` id="${ev.anchor}"` : "";
+    return `<span${id} class="qm${lvl}${cls ? ` ${cls}` : ""}" title="${escapeAttr(title)}">${ev.raw}${num}</span>`;
   };
   const out = tokens
     .map((tok) => {
@@ -370,10 +387,18 @@ export interface QuoteSummaryContext {
   // computed from earlier chapters with `earlierErrors` errors among them.
   // "loading" / "failed": carry-in could not be computed (yet).
   carry: { state: "book" } | { state: "ready"; earlierErrors: number } | { state: "loading" } | { state: "failed" };
+  // Box expanded (default) or collapsed to its one-line head.
+  open?: boolean;
 }
 
 // The box above the text: counts, carry-in, problems, what stays open, legend.
 // `r` null = nothing annotated yet (earlier chapters still loading).
+//
+// It is a <details>, so it collapses to its head line with no script (the
+// print / new-tab copy too), and CSS keeps it stuck to the top while the text
+// scrolls. Each problem with a mark in the text is a link to it: a plain
+// `#id` link in the new-tab copy; the dialog intercepts `data-qm-target`
+// itself, because a hash link there would drive the app's hash router.
 export function quoteSummaryHtml(r: QuoteResult | null, ctx: QuoteSummaryContext): string {
   if (r === null) return `<div class="qm-summary"><div>Checking earlier chapters for quotes still open…</div></div>\n`;
   const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -381,11 +406,10 @@ export function quoteSummaryHtml(r: QuoteResult | null, ctx: QuoteSummaryContext
   const errors = r.problems.filter((p) => p.severity === "error").length;
   const warnings = r.problems.length - errors;
   const lines: string[] = [];
-  lines.push(
-    `<div class="qm-head"><strong>Quote check:</strong> ${r.pairs} pair${r.pairs === 1 ? "" : "s"} matched · ` +
-      `${errors === 0 ? "no errors" : `<span class="qm-sum-bad">${errors} error${errors === 1 ? "" : "s"}</span>`}` +
-      `${warnings ? ` · <span class="qm-sum-warn">${warnings} to check</span>` : ""}</div>`,
-  );
+  const head =
+    `<summary class="qm-head"><strong>Quote check:</strong> ${r.pairs} pair${r.pairs === 1 ? "" : "s"} matched · ` +
+    `${errors === 0 ? "no errors" : `<span class="qm-sum-bad">${errors} error${errors === 1 ? "" : "s"}</span>`}` +
+    `${warnings ? ` · <span class="qm-sum-warn">${warnings} to check</span>` : ""}</summary>`;
   const c = ctx.carry;
   if (c.state === "failed") lines.push(`<div class="qm-sum-warn">Could not load earlier chapters, so quotes opened before this chapter are not counted.</div>`);
   else if (c.state === "ready") {
@@ -403,7 +427,13 @@ export function quoteSummaryHtml(r: QuoteResult | null, ctx: QuoteSummaryContext
   if (r.problems.length) {
     lines.push(
       `<ul class="qm-problems">${r.problems
-        .map((p) => `<li class="${p.severity === "error" ? "qm-sum-bad" : "qm-sum-warn"}">${formatRef(p.ref)} — ${esc(p.message)}</li>`)
+        .map((p) => {
+          const cls = p.severity === "error" ? "qm-sum-bad" : "qm-sum-warn";
+          const text = `${formatRef(p.ref)} — ${esc(p.message)}`;
+          return p.target
+            ? `<li class="${cls}"><a class="qm-jump" href="#${p.target}" data-qm-target="${p.target}" title="Go to this mark">${text}</a></li>`
+            : `<li class="${cls}">${text}</li>`;
+        })
         .join("")}</ul>`,
     );
   }
@@ -412,7 +442,7 @@ export function quoteSummaryHtml(r: QuoteResult | null, ctx: QuoteSummaryContext
   }
   lines.push(
     `<div class="qm-legend">Level: <span class="qm qm-l1">“</span> 1 · <span class="qm qm-l2">‘</span> 2 · <span class="qm qm-l3">“</span> 3 · <span class="qm qm-l4">‘</span> 4 · ` +
-      `small numbers pair an opening mark with its closing mark · <span class="qm qm-bad">red</span> = error · <span class="qm qm-warn">yellow</span> = check · hover a mark for details</div>`,
+      `small numbers pair an opening mark with its closing mark · <span class="qm qm-bad">red</span> = error · <span class="qm qm-warn">yellow</span> = check · hover a mark for details · click a problem to go to it</div>`,
   );
-  return `<div class="qm-summary">${lines.join("")}</div>\n`;
+  return `<details class="qm-summary"${ctx.open === false ? "" : " open"}>${head}<div class="qm-body">${lines.join("")}</div></details>\n`;
 }
