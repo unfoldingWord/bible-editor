@@ -45,6 +45,13 @@ export function resolveSpanToSource(
   uhbVerseObjects: unknown[] | null | undefined,
   englishSpan: string,
   glOccurrence: number,
+  // The verse `uhbVerseObjects` is ("9:12"), when the ULT row is a bridge
+  // resolved against one of its verses. English under a milestone whose x-ref
+  // names another verse then contributes no source, so it can't resolve to
+  // this verse's copy of the same word. Those tokens stay in the list, so the
+  // run count still matches glOccurrence, which the suggest route counts over
+  // the row's whole text (#1426).
+  sourceRef?: string,
 ): ResolvedQuote | null {
   if (!Array.isArray(ultVerseObjects) || !Array.isArray(uhbVerseObjects)) return null;
   const want = spanWords(englishSpan);
@@ -56,7 +63,7 @@ export function resolveSpanToSource(
   // while buildQuoteFromSelection below keys the UHB tokens 1 and 2 — so the
   // SECOND English "all" resolved to the FIRST Hebrew word and returned it as
   // confident, writing the wrong orig_words onto a TWL row.
-  const tokens = collectTargetTokens(ultVerseObjects, uhbVerseObjects);
+  const tokens = collectTargetTokens(ultVerseObjects, uhbVerseObjects, sourceRef);
   if (tokens.length === 0) return null;
   const normTokens = tokens.map((t) => normWord(t.text));
 

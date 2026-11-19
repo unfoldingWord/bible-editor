@@ -198,6 +198,18 @@ function quoteBuildSegmentsForRow(
   });
 }
 
+// The verse a TWL suggestion resolves against, as tCore's x-ref spells it
+// ("9:12"), when its ULT row is a bridge: resolveSpanToSource joins the whole
+// bridged row against this one verse's UHB, so x-ref'd English of the bridge's
+// other verses must stay out (#1426). Undefined for an ordinary verse.
+function twlSourceRef(
+  verseIndexByVersion: Record<string, Record<number, VerseDto>>,
+  verse: number,
+): string | undefined {
+  const ult = verseIndexByVersion["ULT"]?.[verse];
+  return ult && isRangeRow(ult) ? `${ult.chapter}:${verse}` : undefined;
+}
+
 // Word-token count of one source verse row — text/punctuation nodes excluded,
 // matching the position enumeration in UhbStrip/buildSourceIndexMap. Used to
 // compute each dual panel's posOffset within the union span.
@@ -2638,7 +2650,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       };
       const ult = grab("ULT");
       const uhb = grab("UHB") ?? grab("UGNT");
-      const resolved = resolveSpanToSource(ult, uhb, s.matchedText, s.glOccurrence);
+      const resolved = resolveSpanToSource(ult, uhb, s.matchedText, s.glOccurrence, twlSourceRef(verseIndexByVersion, verse));
 
       const twLink = `rc://*/tw/dict/bible/${chosenArticleId}`;
       // Tag follows the CHOSEN article's category, not the server's primary — a
@@ -2752,7 +2764,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         return Array.isArray(vo) ? vo : undefined;
       };
       const uhb = grab("UHB") ?? grab("UGNT");
-      const resolved = resolveSpanToSource(grab("ULT"), uhb, s.matchedText, s.glOccurrence);
+      const resolved = resolveSpanToSource(
+        grab("ULT"),
+        uhb,
+        s.matchedText,
+        s.glOccurrence,
+        twlSourceRef(verseIndexByVersion, verse),
+      );
       // Deleted deny-list: this reference + quote was deleted upstream (any
       // article — the table is article-agnostic). Applies regardless of whether
       // the verse currently carries any links, so it runs before the rows check.
@@ -2822,7 +2840,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // unlinked, would resurface as a "suggested" alternative on the row.
       const sugs = suggestions
         .map((s) => {
-          const resolved = resolveSpanToSource(ult, uhb, s.matchedText, s.glOccurrence);
+          const resolved = resolveSpanToSource(ult, uhb, s.matchedText, s.glOccurrence, twlSourceRef(verseIndexByVersion, verse));
           if (!resolved) return null;
           if (twlFilters.isDeletedHere(`${chapter}:${verse}`, resolved.orig_words)) return null;
           const keys = selectionFromQuote(uhb, resolved.orig_words, resolved.occurrence);
@@ -2872,6 +2890,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         grab("UHB") ?? grab("UGNT"),
         s.matchedText,
         s.glOccurrence,
+        twlSourceRef(verseIndexByVersion, verse),
       );
       if (!resolved) return blocked;
       // Check the full candidate set the picker will show (server disambiguation

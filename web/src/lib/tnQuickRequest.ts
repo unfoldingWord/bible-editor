@@ -152,14 +152,16 @@ export function buildTnQuickRequest(
   // A bridged ULT/UST row numbered across its span joins on the whole
   // bridge's source with a shifted occurrence (#968); anything else keeps
   // the note's own verse and occurrence.
+  // A bridged row joined on the note's own verse: name that verse so x-ref'd
+  // words of the bridge's other verses stay out (#1414, #1426).
+  const sourceRefFor = (target: VerseDto | undefined): string | undefined =>
+    target && isRangeRow(target) ? `${target.chapter}:${row.verse}` : undefined;
   const selectionFor = (target: VerseDto | undefined, vo: unknown[], quote: string, occurrence: number): string => {
     const anchor = bridgeNoteAnchor(sourceByVerse, target, row.verse, quote, occurrence);
     if (anchor) {
       return extractTargetSelectionText(vo, quote, anchor.occurrence, verseObjectsOf(anchor.source) ?? undefined);
     }
-    // A bridged row joined on the note's own verse: name that verse so x-ref'd
-    // words of the bridge's other verses stay out (#1414).
-    const sourceRef = target && isRangeRow(target) ? `${target.chapter}:${row.verse}` : undefined;
+    const sourceRef = sourceRefFor(target);
     return extractTargetSelectionText(vo, quote, occurrence, sourceVo, sourceRef ? { sourceRef } : undefined);
   };
 
@@ -182,14 +184,16 @@ export function buildTnQuickRequest(
     if (!ultVo) {
       return { ok: false, error: { reason: "hebrew_not_found" } };
     }
-    const derivedHebrew = findSourceForTargetText(ultVo, rawQuote);
+    const derivedHebrew = findSourceForTargetText(ultVo, rawQuote, sourceRefFor(ultVerse));
     if (!derivedHebrew) {
       return { ok: false, error: { reason: "hebrew_not_found" } };
     }
     hebrewGuess = derivedHebrew;
     ultSelection = rawQuote;
+    const ustSourceRef = sourceRefFor(ustVerse);
     ustSelection =
-      (ustVo && extractTargetSelectionText(ustVo, derivedHebrew, 1, sourceVo)) ||
+      (ustVo &&
+        extractTargetSelectionText(ustVo, derivedHebrew, 1, sourceVo, ustSourceRef ? { sourceRef: ustSourceRef } : undefined)) ||
       ustText.slice(0, 500);
   }
 
