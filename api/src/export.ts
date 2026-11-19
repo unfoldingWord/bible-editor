@@ -11,8 +11,9 @@ import { normalizeUsfmFormatting } from "./usfmFormat.ts";
 import { normalizeNoteText, sortRowsByReference } from "./tsvFormat.ts";
 import { orderTwlRows } from "./twlCanonicalOrder.ts";
 import { renderOccurrence } from "./occurrenceRule.ts";
-import type { UsfmValidationIssue, UsfmValidationRule } from "./usfmValidate.ts";
+import { validateUsfm, type UsfmValidationIssue, type UsfmValidationRule } from "./usfmValidate.ts";
 import { findOverlappingRanges, VerseRangeOverlapError } from "./verseBridge.ts";
+import { verseCompareKey } from "./verseMerge.ts";
 import type { LockedPush } from "./verseMergeEditorAlerts.ts";
 import { masterMayHoldHumanEditForVerse, parseTsvRefColumn, type MasterLineageSummary } from "./masterLineage.ts";
 
@@ -1431,6 +1432,212 @@ export function planKeepMasterRows(
 // MASTER_MOVED_REFUSE_THRESHOLD kept-or-dropped rows (#1415), refuses the push.
 export function masterMovedGuardRefuses(plan: Pick<KeepMasterPlan, "kept" | "moved" | "dropped">): boolean {
   return plan.moved.length > 0 || plan.kept.length + plan.dropped.length > MASTER_MOVED_REFUSE_THRESHOLD;
+}
+
+// ── Keep master's ULT/UST verse where only master moved (#1412) ───────────
+//
+// The verse half of planKeepMasterRows, with the same three versions per
+// verse (base = D1's render for our last push that reached master, ours =
+// D1's render now, master = Door43 now) and the same policy: when ours still
+// equals base and master differs from base substantively, ship master's
+// verse instead of reverting it.
+//
+// Verse renders do not round-trip (STATE.md: 16-19% of verses come back with
+// a different tree), so both tests go through verseMerge.ts's comparison
+// masks (verseCompareKey: whitespace runs, `\w` occurrence numbers, empty
+// text nodes, key order). "Ours unchanged" is the masked compare alone.
+// "Master moved substantively" also folds NFC and escaped whitespace
+// (canonicalizeForRevertCompare, the revert report's formatting/substantive
+// split), so a master that differs only in Hebrew mark order or layout stays
+// ours, as today.
+//
+// A verse is keyed `chapter:verse` as verseTextByRef keys it, so a bridge is
+// one key ("3:6-9") and counts as one verse toward
+// MASTER_MOVED_REFUSE_THRESHOLD. Only a key present exactly once in all three
+// files is kept. A verse we did not change that master no longer holds under
+// the same key (Door43 re-bridged, split or deleted it) or holds twice cannot
+// be placed by key: it is returned in `cannotPlace` and the caller refuses
+// the push, like a `moved` TSV row. A missing key counts only when master
+// holds an overlapping verse in that chapter or the master read is proven
+// whole; otherwise a short read could pose as a deletion, so it ships as
+// before.
+//
+// The substitution splices master's own text for the verse, from its `\v`
+// marker up to the next `\v` or `\c`, which is exactly the span usfm-js
+// assigns to that verse (its `\zaln` milestones, words, and the paragraph or
+// poetry markers before the next verse). Re-rendering the whole book through
+// usfm-js would instead rewrite the verses that do not round-trip. The
+// result is then parsed again: each kept verse must parse to master's tree
+// and every other verse to ours exactly, or the plan is null (not measured,
+// the caller ships as before). Fails open (null) on any parse failure.
+export interface KeepMasterVersePlan {
+  // `rendered` with each kept verse's text replaced by master's. Equal to
+  // `rendered` when nothing is kept.
+  content: string;
+  // `chapter:verse` keys, in document order.
+  kept: string[];
+  cannotPlace: string[];
+}
+
+interface UsfmVerseSpans {
+  spans: Map<string, { start: number; end: number }>;
+  dupes: Set<string>;
+  // Each chapter's verse ranges, for the overlap test.
+  ranges: Map<string, Array<{ lo: number; hi: number }>>;
+}
+
+// Where each verse sits in raw USFM: its `\v` marker up to the next `\v` or
+// `\c` marker (or the end). `\va`, `\vp`, `\ca`, `\cl` do not match (a letter
+// follows the marker name, not whitespace). Null when a marker's number is not
+// a plain verse or range, or a verse comes before any chapter.
+function usfmVerseSpans(text: string): UsfmVerseSpans | null {
+  const marks: Array<{ at: number; kind: "c" | "v"; num: string }> = [];
+  for (const m of text.matchAll(/\\([cv])\s+(\S+)/g)) {
+    marks.push({ at: m.index ?? 0, kind: m[1] as "c" | "v", num: m[2] });
+  }
+  const spans = new Map<string, { start: number; end: number }>();
+  const dupes = new Set<string>();
+  const ranges = new Map<string, Array<{ lo: number; hi: number }>>();
+  let chapter: string | null = null;
+  for (let i = 0; i < marks.length; i++) {
+    const { at, kind, num } = marks[i];
+    if (kind === "c") {
+      if (!/^\d+$/.test(num)) return null;
+      chapter = String(Number(num));
+      continue;
+    }
+    const v = num.match(/^(\d+)(?:-(\d+))?$/);
+    if (!v || chapter == null) return null;
+    const ref = `${chapter}:${num}`;
+    if (spans.has(ref)) dupes.add(ref);
+    spans.set(ref, { start: at, end: i + 1 < marks.length ? marks[i + 1].at : text.length });
+    const lo = Number(v[1]);
+    const list = ranges.get(chapter) ?? [];
+    list.push({ lo, hi: v[2] ? Math.max(lo, Number(v[2])) : lo });
+    ranges.set(chapter, list);
+  }
+  return { spans, dupes, ranges };
+}
+
+function verseRefRange(ref: string): { chapter: string; lo: number; hi: number } {
+  const [chapter, verse] = ref.split(":");
+  const [a, b] = verse.split("-").map(Number);
+  return { chapter, lo: a, hi: b != null && b > a ? b : a };
+}
+
+export function planKeepMasterVerses(
+  renderedUsfm: string,
+  baseUsfm: string,
+  masterUsfm: string,
+  // Restrict the plan to these keys (the verses an unproven push kept; see
+  // ExportWorkflow's keep-master base selection). Absent = every verse.
+  onlyRefs: ReadonlySet<string> | null = null,
+  // masterUsfm is provably the whole file. Only then does a verse master
+  // lacks with nothing overlapping it count as one Door43 removed.
+  masterComplete = false,
+): KeepMasterVersePlan | null {
+  const oursText = verseTextByRef(renderedUsfm);
+  const baseText = verseTextByRef(baseUsfm);
+  const masterText = verseTextByRef(masterUsfm);
+  const ours = usfmVerseSpans(renderedUsfm);
+  const base = usfmVerseSpans(baseUsfm);
+  const master = usfmVerseSpans(masterUsfm);
+  if (!oursText || !baseText || !masterText || !ours || !base || !master) return null;
+  // The span scan and usfm-js must agree on which verses exist, or a splice
+  // could land somewhere usfm-js does not put that verse.
+  const sameKeys = (a: Map<string, unknown>, b: Map<string, unknown>) =>
+    a.size === b.size && [...a.keys()].every((k) => b.has(k));
+  if (!sameKeys(oursText, ours.spans) || !sameKeys(baseText, base.spans) || !sameKeys(masterText, master.spans)) {
+    return null;
+  }
+  const masked = (json: string) => verseCompareKey(json);
+  const kept: string[] = [];
+  const cannotPlace: string[] = [];
+  for (const ref of ours.spans.keys()) {
+    if (onlyRefs && !onlyRefs.has(ref)) continue;
+    if (ours.dupes.has(ref) || base.dupes.has(ref)) continue;
+    const b = baseText.get(ref);
+    if (b === undefined) continue; // new in ours: ships
+    const oursKey = masked(oursText.get(ref)!);
+    const baseKey = masked(b);
+    if (oursKey === null || baseKey === null || oursKey !== baseKey) continue; // we changed it: ships
+    const m = masterText.get(ref);
+    if (m === undefined || master.dupes.has(ref)) {
+      const { chapter, lo, hi } = verseRefRange(ref);
+      const overlaps = (master.ranges.get(chapter) ?? []).some((r) => r.lo <= hi && lo <= r.hi);
+      if (master.dupes.has(ref) || overlaps || masterComplete) cannotPlace.push(ref);
+      continue;
+    }
+    const masterKey = masked(m);
+    if (masterKey === null) continue;
+    if (canonicalizeForRevertCompare(masterKey) === canonicalizeForRevertCompare(baseKey)) continue; // no substantive move
+    kept.push(ref);
+  }
+  if (kept.length === 0) return { content: renderedUsfm, kept, cannotPlace };
+  const keptSet = new Set(kept);
+  let out = "";
+  let at = 0;
+  for (const [ref, span] of ours.spans) {
+    if (!keptSet.has(ref)) continue;
+    const from = master.spans.get(ref)!;
+    // Verbatim, trailing whitespace included: usfm-js parks the whitespace
+    // after a `\ts*` on the node itself (1CH 1:45 ULT on Door43 ends
+    // `\ts*  \v 46`), so trimming or adding to it changes the verse. Only a
+    // master verse ending its file with no whitespace at all gets a line break,
+    // which our next `\v`/`\c` needs.
+    let piece = masterUsfm.slice(from.start, from.end);
+    if (span.end < renderedUsfm.length && !/\s$/.test(piece)) piece += "\n";
+    out += renderedUsfm.slice(at, span.start) + piece;
+    at = span.end;
+  }
+  out += renderedUsfm.slice(at);
+  // Master's bytes as they are, so the push matches master at those verses
+  // and the revert report finds nothing there. Only when that brings in a
+  // line Door43's validator rejects (1CH 1:45 ULT's `\ts*  \v 46`), which
+  // would hold the whole book, is the result laid out by our normalizer; a
+  // verse that then no longer reads as master's cannot be placed (below).
+  if (validateUsfm(out).length > validateUsfm(renderedUsfm).length) out = normalizeUsfmFormatting(out);
+  // Proof the result is what a verse-object swap would give: every verse we
+  // did not keep parses to ours byte for byte (else not measured), and each
+  // kept verse to master's tree under the same lens that found it moved. A
+  // kept verse the layout changed beyond that cannot be shipped as master's,
+  // so it cannot be placed.
+  const result = verseTextByRef(out);
+  if (!result || !sameKeys(result, oursText)) return null;
+  const lens = (json: string) => {
+    const k = masked(json);
+    return k === null ? null : canonicalizeForRevertCompare(k);
+  };
+  const placed: string[] = [];
+  for (const ref of ours.spans.keys()) {
+    const json = result.get(ref)!;
+    if (keptSet.has(ref)) {
+      const got = lens(json);
+      if (got !== null && got === lens(masterText.get(ref)!)) placed.push(ref);
+      else cannotPlace.push(ref);
+    } else if (json !== oursText.get(ref)) {
+      return null;
+    }
+  }
+  return { content: out, kept: placed, cannotPlace };
+}
+
+// Same decision as masterMovedGuardRefuses, for verses: any verse that cannot
+// be placed, or more than MASTER_MOVED_REFUSE_THRESHOLD kept verses, refuses.
+export function masterMovedVerseGuardRefuses(plan: Pick<KeepMasterVersePlan, "kept" | "cannotPlace">): boolean {
+  return plan.cannotPlace.length > 0 || plan.kept.length > MASTER_MOVED_REFUSE_THRESHOLD;
+}
+
+// The verse keys whose text differs between D1's render for a push and the
+// bytes that push shipped: the verses that push kept from master. Null when
+// either does not parse.
+export function keptVerseRefsBetween(d1Render: string, pushed: string): Set<string> | null {
+  const a = verseTextByRef(d1Render);
+  const b = verseTextByRef(pushed);
+  if (!a || !b) return null;
+  const out = new Set<string>();
+  for (const [ref, json] of a) if (b.get(ref) !== json) out.add(ref);
+  return out;
 }
 
 // ── Partitioning the revert report by master's measured lineage (#1231) ───

@@ -62,6 +62,10 @@ import {
   MASTER_MOVED_REFUSE_THRESHOLD,
   type KeepMasterPlan,
   type KeptMasterRow,
+  planKeepMasterVerses,
+  masterMovedVerseGuardRefuses,
+  keptVerseRefsBetween,
+  type KeepMasterVersePlan,
   RECORD_PUSHED_RENDER_SQL,
   isMasterConfirmed,
   lockedPushLanded,
@@ -102,6 +106,12 @@ function describeKeptRows(rows: KeptMasterRow[]): string {
   return shown.join(", ") + (rows.length > shown.length ? `, and ${rows.length - shown.length} more` : "");
 }
 
+// "1:3, 2:6-9, …" for the #1412 verse alerts, capped the same way.
+function describeVerseRefs(refs: string[]): string {
+  const shown = refs.slice(0, 12);
+  return shown.join(", ") + (refs.length > shown.length ? `, and ${refs.length - shown.length} more` : "");
+}
+
 // Legacy export branch, superseded by per-(book,resource) contributor branches.
 // Pruned best-effort on each export so it doesn't linger; safe to delete since
 // the live-snapshot flow is no longer used (its post-export path is dormant).
@@ -135,7 +145,7 @@ import {
   ALL_RESOURCES as REIMPORT_RESOURCES,
 } from "./bookReimport";
 import { noteLockedPushOnVerseMergeAlert, retireVerseKeptAiMasterFlags } from "./verseMergeConflicts.ts";
-import { dcsResourceFile, fetchDcsMasterText, fetchDcsMasterTextVerified, fileBlobShaAtCommit, fileHeadCommit, repoHeadCommitSha, type ReimportResource } from "./dcsSources";
+import { dcsResourceFile, fetchDcsMasterTextVerified, fileBlobShaAtCommit, fileHeadCommit, repoHeadCommitSha, type ReimportResource } from "./dcsSources";
 import { readLedgerMasterLineage, type LedgerLineageResult } from "./masterLineageLedger.ts";
 import { DCS_POLL_FETCH_TIMEOUT_MS } from "./dcsCommitPoll.ts";
 import { gitBlobSha, gitBlobShaOrNull, findOurMergeForPr, judgeOwnPublishDecline } from "./ownPublish";
@@ -1422,9 +1432,85 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // verse, systemic scale, a broken render, an unverifiable master) still
     // holds the book back.
     let usfmMasterContentForRevertReport: string | null = null;
+    let usfmMasterVerified = false;
+    let alignGuard: Awaited<ReturnType<ExportWorkflow["checkUsfmAlignmentShrink"]>> | null = null;
     if (dcsAllowed && (resource === "ult" || resource === "ust")) {
-      const guard = await this.checkUsfmAlignmentShrink(book, resource, built.content, fresh.masterSha);
-      usfmMasterContentForRevertReport = guard.masterContent;
+      alignGuard = await this.checkUsfmAlignmentShrink(book, resource, built.content, fresh.masterSha);
+      usfmMasterContentForRevertReport = alignGuard.masterContent;
+      usfmMasterVerified = alignGuard.masterVerified === true;
+    }
+
+    // Keep-master guard for verses (#1412), the ULT/UST half of the #1403
+    // block above: a verse Bible Editor has not changed since its last push
+    // that reached master, but that Door43 changed substantively, ships as
+    // master's verse. More than MASTER_MOVED_REFUSE_THRESHOLD such verses, or
+    // one Door43 re-bridged, split, removed or doubled (it cannot be placed by
+    // its key), refuses the push. Runs once checkUsfmAlignmentShrink has read
+    // master, before that backstop's verdict is acted on and before
+    // validateUsfm, so both, the R2 copy, commitToDcs, recordPushedRender and
+    // the revert report all judge the content that ships.
+    // Not measured (no proven base, unparseable USFM) → ships as before.
+    if (dcsAllowed && (resource === "ult" || resource === "ust") && usfmMasterContentForRevertReport != null) {
+      const guard = await this.masterMovedVerseGuard(
+        book,
+        resource,
+        built.content,
+        usfmMasterContentForRevertReport,
+        r2Key,
+        usfmMasterVerified,
+      );
+      if (guard.measured) {
+        const { plan } = guard;
+        if (masterMovedVerseGuardRefuses(plan)) {
+          await this.recordMasterMovedVerseRefusal(book, resource, plan);
+          const reason = `master_moved_guard:${plan.kept.length}_kept_${plan.cannotPlace.length}_cannot_place`;
+          await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
+          return {
+            book,
+            resource,
+            rowCount: built.rowCount,
+            bytes: built.content.length,
+            r2Key,
+            branch: null,
+            dcsCommitSha: null,
+            dcsChanged: false,
+            dcsSkippedReason: reason,
+            prNumber: null,
+            prReason: null,
+          };
+        }
+        await this.clearExportAlert(`export_master_moved:${book}:${resource}`);
+        if (plan.kept.length > 0) {
+          const d1Render = built.content;
+          built.content = plan.content;
+          // Same order and metadata as the TSV path: the sibling first, so a
+          // failed put below retries before anything is recorded.
+          const pushedSha = await gitBlobSha(built.content);
+          await this.env.BLOBS.put(d1RenderKey(r2Key), d1Render, {
+            httpMetadata: { contentType: "text/plain" },
+            customMetadata: { pushedsha: pushedSha, basesha: guard.baseBlobSha, basemode: guard.mode },
+          });
+          await this.env.BLOBS.put(r2Key, built.content, {
+            httpMetadata: { contentType: "text/plain" },
+          });
+          console.log(
+            `export: kept Door43's version of ${plan.kept.length} ${book} ${resource} verse(s) Bible Editor had not changed (#1412)`,
+          );
+          await this.recordKeptMasterVerses(book, resource, plan.kept);
+          // The backstop above judged D1's render. A kept verse is master's,
+          // so judge what ships: a verse Door43 aligned that D1 holds flat
+          // must not hold the book as lost alignment.
+          if (alignGuard) {
+            alignGuard = this.alignmentShrinkVerdict(built.content, usfmMasterContentForRevertReport, usfmMasterVerified);
+          }
+        } else {
+          await this.clearExportAlert(`export_kept_master:${book}:${resource}`);
+        }
+      }
+    }
+
+    if (alignGuard) {
+      const guard = alignGuard;
       if (guard.ok && guard.detail === "ok") {
         // Checked this book+resource against master and found no alignment
         // loss — clear any stale rows a PAST export's loss left behind so the
@@ -2845,11 +2931,31 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // usfmRevertReport) WITHOUT a second fetch. null whenever master was
     // never actually read (no_file / master_unreadable).
     masterContent: string | null;
+    // #1412: masterContent is provably the whole file (pinned sha, size
+    // matched), the same flag checkTsvShrink carries for #1415.
+    masterVerified?: boolean;
   }> {
     const file = dcsResourceFile(book, resource as ReimportResource);
     if (!file) return { ok: true, detail: "no_file", masterContent: null };
-    const masterUsfm = await fetchDcsMasterText(this.env, file.repo, file.path, masterSha ?? undefined);
+    const fetched = await fetchDcsMasterTextVerified(this.env, file.repo, file.path, masterSha ?? undefined);
+    const masterUsfm = fetched.text;
     if (masterUsfm == null) return { ok: false, detail: "master_unreadable", masterContent: null };
+    return this.alignmentShrinkVerdict(renderedUsfm, masterUsfm, fetched.verified);
+  }
+
+  // The verdict half of checkUsfmAlignmentShrink, on a master already read.
+  // Also re-run on the render the keep-master verse guard produced (#1412).
+  private alignmentShrinkVerdict(
+    renderedUsfm: string,
+    masterUsfm: string,
+    masterVerified: boolean,
+  ): {
+    ok: boolean;
+    detail: string;
+    offenders?: AlignmentShrinkResult["offenders"];
+    masterContent: string | null;
+    masterVerified?: boolean;
+  } {
     const result = usfmAlignmentShrinkRefused(renderedUsfm, masterUsfm);
     if (result.refused) {
       const sample = result.offenders
@@ -2866,6 +2972,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         detail: `align_loss_${result.offenders.length}:${sample}`,
         offenders: result.offenders,
         masterContent: masterUsfm,
+        masterVerified,
       };
     }
     // Master fetched but did not parse: nothing was compared, so this must
@@ -2874,9 +2981,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // prior evidence (STATE.md). Ship decision unchanged (ok:true, as
     // designed for an unprovable loss); only the "measured clean" claim goes.
     if (result.masterUnparseable) {
-      return { ok: true, detail: "master_unparseable", masterContent: masterUsfm };
+      return { ok: true, detail: "master_unparseable", masterContent: masterUsfm, masterVerified };
     }
-    return { ok: true, detail: "ok", masterContent: masterUsfm };
+    return { ok: true, detail: "ok", masterContent: masterUsfm, masterVerified };
   }
 
   // Banner alert when the alignment-shrink backstop finds an ULT/UST verse that
@@ -3598,10 +3705,66 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     | { measured: true; plan: KeepMasterPlan; baseBlobSha: string; mode: "full" | "carry" }
     | { measured: false; reason: string }
   > {
-    const notMeasured = (reason: string) => {
-      console.log(`export: keep-master guard not measured for ${book} ${resource} (${reason}); ships as before`);
-      return { measured: false as const, reason };
-    };
+    const base = await this.keepMasterBase(book, resource, r2Key);
+    if (!base.ok) return { measured: false, reason: base.reason };
+    try {
+      const plan = planKeepMasterRows(rendered, base.baseText, masterTsv, resource, base.onlyKeys, masterVerified);
+      if (plan == null) return this.keepMasterNotMeasured(book, resource, "unparseable");
+      return { measured: true, plan, baseBlobSha: base.baseBlobSha, mode: base.mode };
+    } catch (e) {
+      return this.keepMasterFailed(book, resource, e);
+    }
+  }
+
+  // #1412: the same guard for ULT/UST verses, on the same base.
+  private async masterMovedVerseGuard(
+    book: string,
+    resource: "ult" | "ust",
+    rendered: string,
+    masterUsfm: string,
+    r2Key: string,
+    masterVerified: boolean,
+  ): Promise<
+    | { measured: true; plan: KeepMasterVersePlan; baseBlobSha: string; mode: "full" | "carry" }
+    | { measured: false; reason: string }
+  > {
+    const base = await this.keepMasterBase(book, resource, r2Key);
+    if (!base.ok) return { measured: false, reason: base.reason };
+    try {
+      const plan = planKeepMasterVerses(rendered, base.baseText, masterUsfm, base.onlyKeys, masterVerified);
+      if (plan == null) return this.keepMasterNotMeasured(book, resource, "unparseable");
+      return { measured: true, plan, baseBlobSha: base.baseBlobSha, mode: base.mode };
+    } catch (e) {
+      return this.keepMasterFailed(book, resource, e);
+    }
+  }
+
+  private keepMasterNotMeasured(book: string, resource: Resource, reason: string): { measured: false; reason: string } {
+    console.log(`export: keep-master guard not measured for ${book} ${resource} (${reason}); ships as before`);
+    return { measured: false, reason };
+  }
+
+  private keepMasterFailed(book: string, resource: Resource, e: unknown): { measured: false; reason: string } {
+    console.error("export: keep-master guard failed; ships as before", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return { measured: false, reason: "error" };
+  }
+
+  // The base selection described above, shared by the row and verse guards.
+  // `onlyKeys` (carry mode) holds the row ids, or the verse `chapter:verse`
+  // keys, that the unproven base push kept.
+  private async keepMasterBase(
+    book: string,
+    resource: Resource,
+    r2Key: string,
+  ): Promise<
+    | { ok: true; baseText: string; onlyKeys: Set<string> | null; baseBlobSha: string; mode: "full" | "carry" }
+    | { ok: false; reason: string }
+  > {
+    const notMeasured = (reason: string) => ({ ok: false as const, ...this.keepMasterNotMeasured(book, resource, reason) });
     try {
       const prior = await this.env.DB.prepare(
         `SELECT pushed_blob_sha, pushed_r2_key, prev_pushed_blob_sha, prev_pushed_r2_key,
@@ -3662,26 +3825,21 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         mode = "carry";
       }
       let baseText = d1Base;
-      let onlyIds: Set<string> | null = null;
+      let onlyKeys: Set<string> | null = null;
       if (mode === "carry") {
         if (d1Base == null) return notMeasured("carry_base_missing");
         const pushed = await readVerifiedPushedRenderText(this.env, book, resource, pointer.r2Key, pointer.blobSha);
         if (pushed == null) return notMeasured("base_unreadable");
-        onlyIds = keptIdsBetween(d1Base, pushed);
+        onlyKeys =
+          resource === "ult" || resource === "ust" ? keptVerseRefsBetween(d1Base, pushed) : keptIdsBetween(d1Base, pushed);
+        if (onlyKeys == null) return notMeasured("base_unreadable");
       } else if (baseText == null) {
         baseText = await readVerifiedPushedRenderText(this.env, book, resource, pointer.r2Key, pointer.blobSha);
       }
       if (baseText == null) return notMeasured("base_unreadable");
-      const plan = planKeepMasterRows(rendered, baseText, masterTsv, resource, onlyIds, masterVerified);
-      if (plan == null) return notMeasured("unparseable");
-      return { measured: true, plan, baseBlobSha: pointer.blobSha, mode };
+      return { ok: true, baseText, onlyKeys, baseBlobSha: pointer.blobSha, mode };
     } catch (e) {
-      console.error("export: keep-master guard failed; ships as before", {
-        book,
-        resource,
-        error: e instanceof Error ? e.message : String(e),
-      });
-      return { measured: false, reason: "error" };
+      return { ok: false, ...this.keepMasterFailed(book, resource, e) };
     }
   }
 
@@ -3733,6 +3891,47 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       `${book} ${resource.toUpperCase()}: ${parts.join(" Also ")}`,
       `${this.env.DCS_BASE_URL}/unfoldingWord`,
       "warning",
+    );
+  }
+
+  // #1412: the verse version of recordKeptMasterRows. Same source, so it
+  // clears the same way (a measured pass with nothing kept).
+  private async recordKeptMasterVerses(book: string, resource: Resource, kept: string[]): Promise<void> {
+    await this.writeAlert(
+      `export_kept_master:${book}:${resource}`,
+      `${book} ${resource.toUpperCase()}: kept Door43's version of ${kept.length} verse(s) that Bible Editor had not ` +
+        `changed since its last push, instead of overwriting them with Bible Editor's older text: ${describeVerseRefs(kept)}. ` +
+        `Bible Editor still shows the older text for these verses. Pull ${book} from Door43 to bring them in; editing ` +
+        `one of them in Bible Editor instead makes that edit win on the next push.`,
+      `${this.env.DCS_BASE_URL}/unfoldingWord`,
+      "warning",
+    );
+  }
+
+  // #1412: the verse version of recordMasterMovedRefusal.
+  private async recordMasterMovedVerseRefusal(book: string, resource: Resource, plan: KeepMasterVersePlan): Promise<void> {
+    await this.clearExportAlert(`export_kept_master:${book}:${resource}`);
+    const why: string[] = [];
+    if (plan.kept.length > MASTER_MOVED_REFUSE_THRESHOLD) {
+      why.push(
+        `${plan.kept.length} verses is more than ${MASTER_MOVED_REFUSE_THRESHOLD}, which usually means Bible Editor's ` +
+          `copy of ${book} is out of date`,
+      );
+    }
+    if (plan.cannotPlace.length > 0) {
+      why.push(
+        `${plan.cannotPlace.length} of them were re-bridged, split, removed or doubled on Door43 ` +
+          `(${describeVerseRefs(plan.cannotPlace)}), which the export cannot place on its own`,
+      );
+    }
+    await this.writeAlert(
+      `export_master_moved:${book}:${resource}`,
+      `${book} ${resource.toUpperCase()}: not pushed to Door43. Door43 has changes to ` +
+        `${plan.kept.length + plan.cannotPlace.length} verse(s) that Bible Editor has not changed since its last push, ` +
+        `and pushing would undo them (${why.join("; ")}). Pull ${book} from Door43, check these verses, then push ` +
+        `again: ${describeVerseRefs([...plan.cannotPlace, ...plan.kept])}.`,
+      `${this.env.DCS_BASE_URL}/unfoldingWord`,
+      "error",
     );
   }
 

@@ -371,6 +371,13 @@ function stableKey(json: string): string | null {
   }
 }
 
+// The masked compare form itself, for export.ts's keep-master verse guard
+// (#1412), which needs it per verse on three sides at once. Same lens,
+// same null-on-failure contract as stableKey.
+export function verseCompareKey(json: string): string | null {
+  return stableKey(json);
+}
+
 // Two stableKey results are "equal" only when both are non-null and match.
 // A null on either side (unparseable JSON) is never equal to anything.
 function keysEqual(a: string | null, b: string | null): boolean {

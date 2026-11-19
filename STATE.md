@@ -619,6 +619,13 @@ Highlights that bite repeatedly:
     row, so comparing D1 to it reads as "we changed it" and the next export reverts it.
     D1's render is stored beside the pushed one (`<r2Key>.d1-render`, R2 metadata ties
     it to the pushed sha).
+    ULT/UST verses follow the same rule since #1412 (`planKeepMasterVerses`). A verse is
+    swapped by splicing master's own bytes from its `\v` to the next `\v`/`\c`, not by
+    re-rendering through usfm-js: a re-render rewrites the 16-19% of verses that do not
+    round-trip. Keep the splice verbatim, trailing whitespace included: usfm-js stores
+    the whitespace after a `\ts*` on the node (`content: " "`), so trimming it changes the
+    verse. Replaying the real 1CH 2026-08-11 push: 195 verses kept, 4 not placeable, so
+    that push would now be refused instead of reverting them.
 
 - **A ported validator's FIDELITY is the gate's whole justification — diff it against the
   real source, don't eyeball it.** `usfmValidate.ts` had drifted from DCS in six places,
