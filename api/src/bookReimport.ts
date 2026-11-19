@@ -10583,9 +10583,11 @@ async function softDeleteRemovedTsvRows(
 //     updated_at at or past confirmedAt (same second keeps), unless the last
 //     action is a non-content one (were a dismissal pending, dismissing a
 //     mirror_kept flag would keep the row over Door43 for good). This catches
-//     the in-app reorder, which writes no edit_log row. A non-content stamp
-//     can hide such a reorder, so that row's verse keeps D1's order
-//     (holdOrder) while its content follows master.
+//     the in-app reorder, which writes no edit_log row. A preserve/hint
+//     stamp can hide such a reorder (those rows were pending, order and all,
+//     before #1428), so that row's verse keeps D1's order (holdOrder) while
+//     its content follows master. A flag dismissal does not hold order, as
+//     before #1428.
 // The flag writes below touch neither record (no edit_log row, no provenance,
 // no updated_at), so a kept row still reads as pending the next night.
 // A person who dismissed the mirror_kept flag after the boundary (the
@@ -10730,7 +10732,7 @@ async function mirrorLockedTsv(
       sort_order: row.sort_order == null ? null : Number(row.sort_order),
       removed: row.deleted_at != null || (kind === "tn" && row.trashed_at != null),
       pending: pendingIds.has(id) || (stampedSince && !nonContent),
-      holdOrder: stampedSince && nonContent,
+      holdOrder: stampedSince && nonContent && action !== "dismiss_review" && action !== "review_clear",
       review_kind: (row.review_kind as string | null) ?? null,
     });
   }
