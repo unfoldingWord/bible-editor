@@ -79,7 +79,10 @@ function door43() {
         const ref = url.searchParams.get("ref");
         const text = ref === "master" || ref === WATERMARK ? d.master : d.branch;
         if (text == null) return new Response("nf", { status: 404 });
-        return json({ sha: "blob-" + text.length, size: Buffer.byteLength(text), content: b64(text), encoding: "base64" });
+        // d.noSize: Door43 gives no byte count, so the master read cannot be
+        // proven complete (fetchDcsMasterTextVerified's `verified`).
+        const size = d.noSize ? undefined : Buffer.byteLength(text);
+        return json({ sha: "blob-" + text.length, size, content: b64(text), encoding: "base64" });
       }
       const body = JSON.parse(init.body);
       d.branch = unb64(body.content);
@@ -391,6 +394,38 @@ console.log("\n[10. Door43's fixed verse ends in a line its USFM check rejects (
     alert.length === 1 && alert[0].message.includes("USFM check rejects") && !alert[0].message.includes("re-bridged"),
     `the alert names the layout cause, not a re-bridge (${alert[0]?.message})`,
   );
+}
+
+console.log("\n[11. a master read not proven whole, cut inside its last verse → nothing kept, ours ships (review A1)]");
+{
+  const d = door43();
+  const t = freshEnv();
+  await confirmedNight1(t, d);
+  const full21 = verseText(d.master, 21);
+  const s21 = verseSpan(d.master, 21);
+  d.master = d.master.slice(0, s21.start + Math.floor((s21.end - s21.start) / 2));
+  d.noSize = true;
+  await t.exportOne("export-night-2");
+  ok(t.live(`export_kept_master:${BOOK}:ult`).length === 0, "no kept-verses alert");
+  ok(t.live(`export_master_moved:${BOOK}:ult`).length === 0, "no refusal alert");
+  ok(verseText(d.branch, 21) === full21, "the branch holds D1's whole 1:21, not the cut one");
+}
+
+console.log("\n[12. a refused push still records the alignment backstop's finding (review A4)]");
+{
+  // D1 holds 1:5 unaligned; Door43 aligns it AND bridges 1:2-3 (cannot place).
+  const s5 = verseSpan(DOOR43_OBA, 5);
+  const flat5 = DOOR43_OBA.slice(s5.start, s5.end).replace(/\\zaln-s \|[^\\]*\\\*/g, "").replace(/\\zaln-e\\\*/g, "");
+  const d = door43();
+  const t = freshEnv(DOOR43_OBA.slice(0, s5.start) + flat5 + DOOR43_OBA.slice(s5.end));
+  await confirmedNight1(t, d);
+  const m5 = verseSpan(d.master, 5);
+  d.master = d.master.slice(0, m5.start) + verseText(DOOR43_OBA, 5) + d.master.slice(m5.end);
+  const s3 = verseSpan(d.master, 3);
+  d.master = (d.master.slice(0, s3.start) + d.master.slice(s3.start).replace(/^\\v 3\s*/, "")).replace(/\\v 2(?=\s)/, "\\v 2-3");
+  const r = await t.exportOne("export-night-2");
+  ok(String(r.dcsSkippedReason).startsWith("master_moved_guard:"), `refused (got ${r.dcsSkippedReason})`);
+  ok(t.live(`export_align_shrink:${BOOK}:ult`).length === 1, "the lost-alignment alert for D1's render is still recorded");
 }
 
 if (failed > 0) {

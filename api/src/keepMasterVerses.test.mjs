@@ -99,7 +99,7 @@ console.log("\n[1. round trip: unchanged ours, base and master keep nothing]");
 console.log("\n[2. only master changed a verse → master's verse is kept, every other verse is ours byte for byte]");
 {
   const master = editFirstWord(OBA, 3);
-  const plan = planKeepMasterVerses(OBA, OBA, master);
+  const plan = planKeepMasterVerses(OBA, OBA, master, null, true);
   ok(plan && plan.kept.join() === "1:3" && plan.cannotPlace.length === 0, `kept 1:3 (${plan?.kept})`);
   ok(plan.content === master, "the result equals master's file");
   ok(!masterMovedVerseGuardRefuses(plan), "one kept verse does not refuse");
@@ -109,7 +109,7 @@ console.log("\n[2. only master changed a verse → master's verse is kept, every
 console.log("\n[3. the first and last verse of the file]");
 {
   const master = editFirstWord(editFirstWord(OBA, 1), 21);
-  const plan = planKeepMasterVerses(OBA, OBA, master);
+  const plan = planKeepMasterVerses(OBA, OBA, master, null, true);
   ok(plan && plan.kept.join() === "1:1,1:21" && plan.content === master, `kept 1:1 and 1:21 (${plan?.kept})`);
 }
 
@@ -117,7 +117,7 @@ console.log("\n[4. ours changed the verse too → ours ships]");
 {
   const master = editFirstWord(OBA, 3);
   const ours = editVerse(OBA, 3, "\\w pride|", "\\w arrogance|");
-  const plan = planKeepMasterVerses(ours, OBA, master);
+  const plan = planKeepMasterVerses(ours, OBA, master, null, true);
   ok(plan && plan.kept.length === 0 && plan.content === ours, "nothing kept");
 }
 
@@ -126,7 +126,7 @@ console.log("\n[5. ours differs from base only by render churn (masked) → stil
   // recomputeTargetOccurrences renumbering a `\w` (STATE.md) is churn, not an edit.
   const base = editVerse(OBA, 3, /(\\w pride\|x-occurrence=")1(" x-occurrences=")1"/, '$12$22"');
   const master = editFirstWord(base, 3);
-  const plan = planKeepMasterVerses(OBA, base, master);
+  const plan = planKeepMasterVerses(OBA, base, master, null, true);
   ok(plan && plan.kept.join() === "1:3", `kept 1:3 (${plan?.kept})`);
 }
 
@@ -134,12 +134,12 @@ console.log("\n[6. master moved only formatting (spaces between words, Hebrew ma
 {
   const spaced = editVerse(OBA, 3, /\\w\*\n\\w /, "\\w*   \n\\w ");
   ok(spaced !== OBA, "(setup: master differs in bytes)");
-  const p1 = planKeepMasterVerses(OBA, OBA, spaced);
+  const p1 = planKeepMasterVerses(OBA, OBA, spaced, null, true);
   ok(p1 && p1.kept.length === 0, `whitespace: nothing kept (${p1?.kept})`);
   // Every x-content in NFC order instead of the UHB's legacy order.
   const nfc = OBA.replace(/x-content="([^"]+)"/g, (_, c) => `x-content="${c.normalize("NFC")}"`);
   ok(nfc !== OBA, "(setup: some x-content is not NFC)");
-  const p2 = planKeepMasterVerses(OBA, OBA, nfc);
+  const p2 = planKeepMasterVerses(OBA, OBA, nfc, null, true);
   ok(p2 && p2.kept.length === 0, `mark order: nothing kept (${p2?.kept})`);
 }
 
@@ -147,7 +147,7 @@ console.log("\n[7. a verse new in ours (not in base) is never kept]");
 {
   const base = OBA.replace(/\\v 21 [\s\S]*$/, "");
   const master = editFirstWord(OBA, 21);
-  const plan = planKeepMasterVerses(OBA, base, master);
+  const plan = planKeepMasterVerses(OBA, base, master, null, true);
   ok(plan && plan.kept.length === 0 && plan.cannotPlace.length === 0, "nothing kept");
 }
 
@@ -155,10 +155,10 @@ console.log("\n[8. bridged verse (2CH 9:10-12): kept by its bridge key; a re-bri
 {
   const ours = render(sample("en_ust_14-2CH-9_10-12.usfm"), "UST");
   const master = editVerse(ours, "10-12", /\\w ([^|\s]+)\|/, "\\w $1Q|");
-  const plan = planKeepMasterVerses(ours, ours, master);
+  const plan = planKeepMasterVerses(ours, ours, master, null, true);
   ok(plan && plan.kept.join() === "9:10-12" && plan.content === master, `kept 9:10-12 (${plan?.kept})`);
   const rebridged = ours.replace("\\v 10-12", "\\v 10-11");
-  const p2 = planKeepMasterVerses(ours, ours, rebridged);
+  const p2 = planKeepMasterVerses(ours, ours, rebridged, null, true);
   ok(cp(p2) === "9:10-12/structure" && masterMovedVerseGuardRefuses(p2), `cannot place 9:10-12 (${cp(p2)})`);
 }
 
@@ -167,7 +167,7 @@ console.log("\n[9. master lacks a verse: overlap or a proven-whole read → cann
   // Door43 bridged 2 and 3: "1:2" and "1:3" are gone, "1:2-3" overlaps both.
   const s3 = verseSpan(OBA, 3);
   const bridged = (OBA.slice(0, s3.start) + OBA.slice(s3.start).replace(/^\\v 3\s*/, "")).replace(/\\v 2(?=\s)/, "\\v 2-3");
-  const p1 = planKeepMasterVerses(OBA, OBA, bridged);
+  const p1 = planKeepMasterVerses(OBA, OBA, bridged, null, true);
   ok(cp(p1) === "1:2/structure,1:3/structure", `re-bridge: cannot place 1:2, 1:3 (${cp(p1)})`);
   // The last verse missing with nothing overlapping: a short read looks the same.
   const short = OBA.slice(0, verseSpan(OBA, 21).start);
@@ -181,21 +181,21 @@ console.log("\n[10. master doubled a verse marker → cannot place]");
 {
   const s = verseSpan(OBA, 5);
   const doubled = OBA.slice(0, s.end) + OBA.slice(s.start, s.end) + OBA.slice(s.end);
-  const plan = planKeepMasterVerses(OBA, OBA, doubled);
+  const plan = planKeepMasterVerses(OBA, OBA, doubled, null, true);
   ok(cp(plan) === "1:5/structure", `cannot place 1:5 (${cp(plan)})`);
 }
 
 console.log("\n[11. onlyRefs limits the plan (carry mode)]");
 {
   const master = editFirstWord(editFirstWord(OBA, 3), 4);
-  const plan = planKeepMasterVerses(OBA, OBA, master, new Set(["1:4"]));
+  const plan = planKeepMasterVerses(OBA, OBA, master, new Set(["1:4"]), true);
   ok(plan && plan.kept.join() === "1:4", `only 1:4 kept (${plan?.kept})`);
   ok(verseText(plan.content, 3) === verseText(OBA, 3), "1:3 stays ours");
 }
 
 console.log("\n[12. keptVerseRefsBetween reads back what a push kept]");
 {
-  const pushed = planKeepMasterVerses(OBA, OBA, editFirstWord(editFirstWord(OBA, 3), 7)).content;
+  const pushed = planKeepMasterVerses(OBA, OBA, editFirstWord(editFirstWord(OBA, 3), 7), null, true).content;
   ok([...keptVerseRefsBetween(OBA, pushed)].join() === "1:3,1:7", "1:3 and 1:7");
 }
 
@@ -214,12 +214,41 @@ console.log("\n[14. threshold: kept verses count one each, a bridge too; any can
   ok(masterMovedVerseGuardRefuses({ kept: [], cannotPlace: [{ ref: "1:2", reason: "structure" }] }), "one cannot-place refuses");
 }
 
+console.log("\n[14b. a master read not proven whole keeps nothing (review A1)]");
+{
+  // A read cut inside the last verse still parses, and the stub of 1:21
+  // would read as a Door43 edit.
+  const s21 = verseSpan(OBA, 21);
+  const cut = OBA.slice(0, s21.start + Math.floor((s21.end - s21.start) / 2));
+  ok(verseTextByRef(cut)?.has("1:21"), "(setup: the cut file still parses with a 1:21)");
+  const unverified = planKeepMasterVerses(OBA, OBA, cut);
+  ok(unverified && unverified.kept.length === 0 && unverified.content === OBA, `unverified: nothing kept, ours ships (${unverified?.kept})`);
+  const real = planKeepMasterVerses(OBA, OBA, editFirstWord(OBA, 3));
+  ok(real && real.kept.length === 0 && !masterMovedVerseGuardRefuses(real), "unverified: even a real Door43 edit ships as before");
+}
+
+console.log("\n[14c. a measured refusal does not depend on the splice (review A2)]");
+{
+  let master = OBA;
+  for (let v = 1; v <= 21; v++) master = editFirstWord(master, v);
+  const plan = planKeepMasterVerses(OBA, OBA, master, null, true);
+  ok(plan && plan.kept.length === 21 && masterMovedVerseGuardRefuses(plan), `21 kept → refuses (${plan?.kept.length})`);
+  ok(plan.content === OBA && plan.unspliced.length === 0, "nothing was spliced for a push that will not ship");
+}
+
+console.log("\n[14d. master byte-equal to base: early exit, same answer (review A3)]");
+{
+  const ours = editVerse(OBA, 3, "\\w pride|", "\\w arrogance|");
+  const plan = planKeepMasterVerses(ours, OBA, OBA, null, true);
+  ok(plan && plan.kept.length === 0 && plan.cannotPlace.length === 0 && plan.content === ours, "nothing kept, ours ships");
+}
+
 console.log("\n[15. replay: 1CH ULT, 2026-08-11 (chapters 1-3)]");
 {
   const base = normalizeUsfmFormatting(fixture("1ch-ult-2026-08-11.base.usfm.txt"));
   const master = fixture("1ch-ult-2026-08-11.master.usfm.txt");
   const ours = normalizeUsfmFormatting(fixture("1ch-ult-2026-08-11.ours.usfm.txt"));
-  const plan = planKeepMasterVerses(ours, base, master);
+  const plan = planKeepMasterVerses(ours, base, master, null, true);
   ok(plan && plan.kept.length === 17, `17 verses Door43 changed and Bible Editor did not are kept (${plan?.kept.length})`);
   // Door43's text for these lays out differently under our validator layout
   // (1:45 ends `\ts*  \v 46`), so it cannot ship as master's verse.
@@ -228,7 +257,7 @@ console.log("\n[15. replay: 1CH ULT, 2026-08-11 (chapters 1-3)]");
 
   // Chapters 2-3 alone: nothing unplaceable, 16 kept, and the push ships them.
   const from2 = (u) => u.slice(0, u.search(/\\c\s+1\s/)) + u.slice(u.search(/\\c\s+2\s/));
-  const p2 = planKeepMasterVerses(from2(ours), from2(base), from2(master));
+  const p2 = planKeepMasterVerses(from2(ours), from2(base), from2(master), null, true);
   ok(p2 && p2.kept.length === 16 && p2.cannotPlace.length === 0, `chapters 2-3: 16 kept, 0 cannot place (${p2?.kept.length}, ${cp(p2)})`);
   ok(!masterMovedVerseGuardRefuses(p2), "…which ships");
   ok(validateUsfm(p2.content).length === 0, "the result passes validateUsfm");

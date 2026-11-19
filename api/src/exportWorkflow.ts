@@ -1464,6 +1464,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         const { plan } = guard;
         if (masterMovedVerseGuardRefuses(plan)) {
           await this.recordMasterMovedVerseRefusal(book, resource, plan);
+          // Nothing ships, but the alignment backstop's measurement of D1's
+          // render still clears or records its alert (review A4).
+          if (alignGuard) await this.reportAlignmentVerdict(book, resource, alignGuard);
           const reason = `master_moved_guard:${plan.kept.length}_kept_${plan.cannotPlace.length}_cannot_place`;
           await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
           return {
@@ -1481,6 +1484,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           };
         }
         await this.clearExportAlert(`export_master_moved:${book}:${resource}`);
+        if (plan.unspliced.length > 0) {
+          console.log(
+            `export: found ${plan.unspliced.length} ${book} ${resource} verse(s) Door43 changed and Bible Editor did not ` +
+              `(${plan.unspliced.slice(0, 12).join(", ")}), but splicing them changed other verses; ships as before (#1412)`,
+          );
+        }
         if (plan.kept.length > 0) {
           const d1Render = built.content;
           built.content = plan.content;
@@ -1511,49 +1520,23 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     }
 
     if (alignGuard) {
-      const guard = alignGuard;
-      if (guard.ok && guard.detail === "ok") {
-        // Checked this book+resource against master and found no alignment
-        // loss — clear any stale rows a PAST export's loss left behind so the
-        // app's sticky indicator goes away. `detail === "ok"` (not just
-        // `guard.ok`) excludes "no_file" (the book has no ult/ust file at
-        // all, so nothing was actually checked) from counting as clean.
-        await this.clearAlignmentAttention(book, resource);
-      }
-      if (!guard.ok) {
-        const severity = classifyAlignmentLossSeverity(guard.offenders ?? []);
-        await this.recordAlignmentShrinkSkipAlert(
+      const severity = await this.reportAlignmentVerdict(book, resource, alignGuard);
+      if (severity?.block) {
+        const reason = `align_shrink_guard:${severity.reason}:${alignGuard.detail}`;
+        await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
+        return {
           book,
           resource,
-          guard.detail,
-          guard.offenders ?? [],
-          severity.block,
-        );
-        if (!severity.block) {
-          // A night where the guard found loss and shipped anyway should be
-          // visible in the log, not only in a dismissible banner.
-          console.log(
-            `export: shipping ${book} ${resource} despite translator-scale alignment loss ` +
-              `(${severity.reason}; ${guard.detail}) — alerted, not blocked`,
-          );
-        }
-        if (severity.block) {
-          const reason = `align_shrink_guard:${severity.reason}:${guard.detail}`;
-          await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
-          return {
-            book,
-            resource,
-            rowCount: built.rowCount,
-            bytes: built.content.length,
-            r2Key,
-            branch: null,
-            dcsCommitSha: null,
-            dcsChanged: false,
-            dcsSkippedReason: reason,
-            prNumber: null,
-            prReason: null,
-          };
-        }
+          rowCount: built.rowCount,
+          bytes: built.content.length,
+          r2Key,
+          branch: null,
+          dcsCommitSha: null,
+          dcsChanged: false,
+          dcsSkippedReason: reason,
+          prNumber: null,
+          prReason: null,
+        };
       }
     }
 
@@ -2942,6 +2925,38 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     const masterUsfm = fetched.text;
     if (masterUsfm == null) return { ok: false, detail: "master_unreadable", masterContent: null };
     return this.alignmentShrinkVerdict(renderedUsfm, masterUsfm, fetched.verified);
+  }
+
+  // The alignment backstop's alert and cleanup for one verdict, without the
+  // block decision: clears the sticky indicator on a measured clean pass,
+  // records the alert on loss, and returns the loss severity (null when
+  // clean). Shared by exportOne's normal path and the keep-master verse
+  // refusal (#1412 review A4), which returns before that path.
+  private async reportAlignmentVerdict(
+    book: string,
+    resource: Resource,
+    guard: { ok: boolean; detail: string; offenders?: AlignmentShrinkResult["offenders"] },
+  ): Promise<{ block: boolean; reason: string } | null> {
+    if (guard.ok && guard.detail === "ok") {
+      // Checked this book+resource against master and found no alignment
+      // loss — clear any stale rows a PAST export's loss left behind so the
+      // app's sticky indicator goes away. `detail === "ok"` (not just
+      // `guard.ok`) excludes "no_file" (the book has no ult/ust file at
+      // all, so nothing was actually checked) from counting as clean.
+      await this.clearAlignmentAttention(book, resource);
+    }
+    if (guard.ok) return null;
+    const severity = classifyAlignmentLossSeverity(guard.offenders ?? []);
+    await this.recordAlignmentShrinkSkipAlert(book, resource, guard.detail, guard.offenders ?? [], severity.block);
+    if (!severity.block) {
+      // A night where the guard found loss and shipped anyway should be
+      // visible in the log, not only in a dismissible banner.
+      console.log(
+        `export: shipping ${book} ${resource} despite translator-scale alignment loss ` +
+          `(${severity.reason}; ${guard.detail}) — alerted, not blocked`,
+      );
+    }
+    return severity;
   }
 
   // The verdict half of checkUsfmAlignmentShrink, on a master already read.

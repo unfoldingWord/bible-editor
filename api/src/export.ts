@@ -1469,7 +1469,7 @@ export function masterMovedGuardRefuses(plan: Pick<KeepMasterPlan, "kept" | "mov
 // usfm-js would instead rewrite the verses that do not round-trip. Only when
 // master's bytes bring in a line validateUsfm rejects is the result laid out
 // by normalizeUsfmFormatting. The result is then parsed again: every other
-// verse must parse to ours exactly, or the plan is null (not measured, the
+// verse must parse to ours exactly, or nothing is kept (`unspliced`, the
 // caller ships as before); a kept verse that no longer reads as master's
 // under the same lens goes to `cannotPlace` with reason "layout". Fails open
 // (null) on any parse failure.
@@ -1488,6 +1488,10 @@ export interface KeepMasterVersePlan {
   // `chapter:verse` keys, in document order.
   kept: string[];
   cannotPlace: UnplaceableVerse[];
+  // Verses found kept-worthy whose splice failed its own proof (another
+  // verse came out changed). Nothing is kept then and the export ships as
+  // before; the caller logs that Door43 edits were found. [] otherwise.
+  unspliced: string[];
 }
 
 interface UsfmVerseSpans {
@@ -1543,10 +1547,17 @@ export function planKeepMasterVerses(
   // Restrict the plan to these keys (the verses an unproven push kept; see
   // ExportWorkflow's keep-master base selection). Absent = every verse.
   onlyRefs: ReadonlySet<string> | null = null,
-  // masterUsfm is provably the whole file. Only then does a verse master
-  // lacks with nothing overlapping it count as one Door43 removed.
+  // masterUsfm is provably the whole file. Only then is any verse kept: a
+  // truncated read can end inside its last verse and still parse, and that
+  // partial verse would read as a Door43 edit (review A1). Also only then does
+  // a verse master lacks with nothing overlapping it count as one Door43
+  // removed.
   masterComplete = false,
 ): KeepMasterVersePlan | null {
+  // Master still holds the base byte for byte: no verse moved on Door43, so
+  // nothing can be kept or misplaced. Skips five whole-book parses on the
+  // usual night (review A3).
+  if (masterUsfm === baseUsfm) return { content: renderedUsfm, kept: [], cannotPlace: [], unspliced: [] };
   const oursText = verseTextByRef(renderedUsfm);
   const baseText = verseTextByRef(baseUsfm);
   const masterText = verseTextByRef(masterUsfm);
@@ -1582,9 +1593,14 @@ export function planKeepMasterVerses(
     const masterKey = masked(m);
     if (masterKey === null) continue;
     if (canonicalizeForRevertCompare(masterKey) === canonicalizeForRevertCompare(baseKey)) continue; // no substantive move
+    if (!masterComplete) continue; // an unproven read may be cut short: ships as before
     kept.push(ref);
   }
-  if (kept.length === 0) return { content: renderedUsfm, kept, cannotPlace };
+  // A refusal measured here stands whatever the splice would do (review A2):
+  // nothing ships, so there is nothing to splice.
+  if (kept.length === 0 || cannotPlace.length > 0 || kept.length > MASTER_MOVED_REFUSE_THRESHOLD) {
+    return { content: renderedUsfm, kept, cannotPlace, unspliced: [] };
+  }
   const keptSet = new Set(kept);
   let out = "";
   let at = 0;
@@ -1614,7 +1630,8 @@ export function planKeepMasterVerses(
   // kept verse the layout changed beyond that cannot be shipped as master's,
   // so it cannot be placed.
   const result = verseTextByRef(out);
-  if (!result || !sameKeys(result, oursText)) return null;
+  const unspliced: KeepMasterVersePlan = { content: renderedUsfm, kept: [], cannotPlace: [], unspliced: kept };
+  if (!result || !sameKeys(result, oursText)) return unspliced;
   const lens = (json: string) => {
     const k = masked(json);
     return k === null ? null : canonicalizeForRevertCompare(k);
@@ -1627,10 +1644,10 @@ export function planKeepMasterVerses(
       if (got !== null && got === lens(masterText.get(ref)!)) placed.push(ref);
       else cannotPlace.push({ ref, reason: "layout" });
     } else if (json !== oursText.get(ref)) {
-      return null;
+      return unspliced;
     }
   }
-  return { content: out, kept: placed, cannotPlace };
+  return { content: out, kept: placed, cannotPlace, unspliced: [] };
 }
 
 // Same decision as masterMovedGuardRefuses, for verses: any verse that cannot
