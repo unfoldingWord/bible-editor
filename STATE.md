@@ -77,6 +77,12 @@
   verse-data-repair pattern) before the next export re-ships the straight quotes to Door43. Not yet located
   by book+chapter+verse+bible_version — that inventory is the first step of the repair.
 
+- **twl rows can still fold a stale create ancestor after the edit_log sweep (issue #1461, open for twl)** — the
+  tq half is fixed by a version-chain check in `reconstructTsvBases`; twl versions were inflated by unlogged reorder
+  bumps (see the #1461 lesson below), so the same check would flag thousands of twl rows `merge_no_base` once their
+  creates pass the 180-day horizon (from about 2026-12-12). Benjamin's choice: keep the possibly stale twl ancestor,
+  accept the false flags, or apply the check only where the entry before the gap postdates #687 (2026-09-03).
+
 ## Lessons learned (write durable, cross-session facts here — not in chat)
 
 For the full corpus, see the memory index at
@@ -405,6 +411,22 @@ Highlights that bite repeatedly:
   writers that log less than they wrote (#546), and `(book = ? OR book IS NULL)` in the ancestor query — prod holds
   **7,689** tn/tq/twl `edit_log` rows with a NULL `book`, and row ids are unique only per `(book, id)`, so another
   book's history can fold into this one's ancestor (#545).
+
+- **A tq row's version chain proves its edit_log history is complete; a twl row's does not (#1461).** The sweep keeps
+  a tq/twl row's create and deletes its old updates, so `reconstructTsvBases` drops a tq fold's entries before any
+  prev/new version gap the sweep could have made. That works because every tq version bump is a logged write
+  (measured 2026-11-20: 0 chain breaks across all 37 tq books). Not every logged bump is content: a flag-only merge
+  write bumps the version too, so once swept it reads as a gap (a false merge_no_base, the safe failure). A gap
+  counts only when its missing entries must sit at or below the export boundary (the next surviving entry is below
+  it, or the boundary was read after the 180-day horizon); under a boundary frozen past the horizon (locked books,
+  stuck exports) a gap reaching above it is ambiguous and keeps the old fold. Once a gap is counted the row has no
+  ancestor, for good, for every field no later entry carries (the create is never swept), so later Door43 changes
+  to that field always keep D1 and flag. A writer that bumps the version in one batch and logs in a separate one
+  (prune, pristine/reseed/resurrect, edited-merge batches) would leave a real unlogged bump if the second batch
+  failed; prod had 0 chain breaks on 2026-11-20. twl versions are not evidence:
+  `twlSortOrderApply` bumped them on pure reorders without an edit_log row from 3005039 (2026-07-13) until #687
+  (2026-09-03), so about half of JER's create-only twl rows sit above version 1 with nothing deleted. twl keeps the
+  stale-create hazard until someone picks a different signal.
 
 - **`source_sha` and `master_confirmed_at` are two different points in master's history, and they drift apart by
   design.** `recordResourceSync` advances `source_sha` at the end of any successful reimport; `master_confirmed_at`
