@@ -1279,7 +1279,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // last push that reached master, but that Door43 changed substantively,
     // ships as master's row instead of reverting it. Such a row that Door43
     // deleted is left out instead of added back (#1415), but only when the
-    // master read is verified complete. Too many kept-or-dropped rows (or a
+    // master read is verified complete or the last push already left it out
+    // (#1424). Too many kept-or-dropped rows (or a
     // row Door43 also moved to another verse) refuses the push. Runs before
     // the hard-reject gate so every later step (that gate, the R2 copy,
     // commitToDcs, recordPushedRender, a conflict rebuild, the revert report)
@@ -2907,15 +2908,11 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     masterRows: number | null;
     explained?: number;
     unexplained?: number;
-    // Master's raw TSV, exactly as fetched above — carried out so the caller
-    // (exportOne) can build the export-revert report (export.ts's
-    // tsvRevertReport) WITHOUT a second fetch. null whenever master was never
-    // actually read (no_file / master_unreadable).
+    // Master's raw TSV as passed in, and whether it is provably the whole
+    // file. exportOne no longer reads these (#1424): it takes master from
+    // fetchTsvMaster before calling this guard. null whenever master was
+    // never actually read (no_file / master_unreadable).
     masterContent: string | null;
-    // True only when masterContent is provably the whole file (a pinned SHA
-    // whose contents-API size matched; fetchDcsMasterTextVerified). The
-    // keep-master guard leaves out a row master lacks only then (#1415): a
-    // short read must never read as "Door43 deleted it".
     masterVerified?: boolean;
   }> {
     if (!master) return { ok: true, detail: "no_file", masterRows: null, masterContent: null };
@@ -3922,7 +3919,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     masterTsv: string,
     r2Key: string,
     // masterTsv is provably the whole file: only then may a row master lacks
-    // be left out as deleted on Door43 (#1415).
+    // be left out as deleted on Door43 (#1415), apart from a row the base
+    // push already left out (#1424; keepMasterBase's droppedKeys).
     masterVerified: boolean,
   ): Promise<
     | { measured: true; plan: KeepMasterPlan; baseBlobSha: string; mode: "full" | "carry" }

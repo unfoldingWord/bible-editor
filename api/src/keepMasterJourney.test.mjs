@@ -494,7 +494,11 @@ console.log("\n[12. dropped rows must not hide master rows the render lacks from
   const n2 = await t.exportOne("export-night-2");
   ok(String(n2.dcsSkippedReason).startsWith("shrink_guard:shrink_30_of_100"), `refused by the shrink guard (got ${n2.dcsSkippedReason})`);
   ok(d.writes.length === 0, `nothing committed (writes: ${d.writes.length})`);
-  ok(t.live(`export_shrink:${BOOK}:tn`).length === 1, "a shrink alert is raised");
+  const shrinkAlert = t.live(`export_shrink:${BOOK}:tn`);
+  ok(
+    shrinkAlert.length === 1 && shrinkAlert[0].message.includes("the render has 70 rows but master has 100"),
+    `a shrink alert counts the rows that would ship (${shrinkAlert[0]?.message})`,
+  );
 }
 
 console.log("\n[13. a row dropped on a verified night stays off on an unverified night (#1424)]");
@@ -513,6 +517,12 @@ console.log("\n[13. a row dropped on a verified night stays off on an unverified
   console.log("\n[13b. a second unverified night still leaves it out]");
   const n4 = await t.exportOne("export-night-4");
   ok(d.writes.length === 0 && !hasRow(d.branch, "bb22"), `night 4 still leaves bb22 out (got ${n4.dcsSkippedReason}, writes ${d.writes.length})`);
+
+  console.log("\n[13b2. on an unverified night, a row the last push did NOT drop ships even if master lacks it]");
+  d.master = deleteRow(d.master, "cc33");
+  await t.exportOne("export-night-4b");
+  ok(hasRow(d.branch, "cc33"), "cc33 ships: only last push's drops carry over an unverified read");
+  ok(!hasRow(d.branch, "bb22"), "…while bb22 stays out");
 
   console.log("\n[13c. a translator edits bb22 in Bible Editor → it ships on an unverified night]");
   t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator restored it.' WHERE id = 'bb22'`).run();

@@ -1288,7 +1288,9 @@ export function tsvRevertReport(
 // bookReimport.ts), so a human-edited or preserved row deleted on Door43 stays
 // in D1 and reaches this point. Dropped rows count with kept rows toward
 // MASTER_MOVED_REFUSE_THRESHOLD. Only when the caller proves master's file was
-// read whole (`masterComplete`): a truncated read must not delete rows.
+// read whole (`masterComplete`): a truncated read must not delete rows. The
+// one exception is a row the base push itself already left out
+// (`previouslyDropped`, #1424): keeping it out changes nothing on the branch.
 //
 // A row Door43 moved to another Reference (with or without a text change) is
 // NOT kept: substituting it in place would leave it under the wrong verse in
@@ -1358,7 +1360,8 @@ export function planKeepMasterRows(
   // ExportWorkflow.masterMovedGuard). Absent = every row.
   onlyIds: ReadonlySet<string> | null = null,
   // masterTsv is provably the whole file (fetchDcsMasterTextVerified). Rows
-  // master lacks are dropped only then; otherwise they ship as before (#1415).
+  // master lacks are dropped only then (#1415), or when `previouslyDropped`
+  // holds them (#1424); otherwise they ship as before.
   masterComplete = false,
   // IDs the base push itself left out as deleted on Door43 (#1424). On a
   // night the master read is not proven complete, such a row that master
