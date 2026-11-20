@@ -1470,8 +1470,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         if (masterMovedVerseGuardRefuses(plan)) {
           await this.recordMasterMovedVerseRefusal(book, resource, plan);
           // Nothing ships, but the alignment backstop's measurement of D1's
-          // render still clears or records its alert (review A4).
-          if (alignGuard) await this.reportAlignmentVerdict(book, resource, alignGuard);
+          // render still clears or records its alert (review A4), worded as
+          // not pushed (#1434).
+          if (alignGuard) await this.reportAlignmentVerdict(book, resource, alignGuard, { pushed: false });
           const reason = `master_moved_guard:${plan.kept.length}_kept_${plan.cannotPlace.length}_cannot_place`;
           await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
           return {
@@ -1618,6 +1619,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       }
       dcsCommitSha = commit.commitSha || null;
       dcsChanged = commit.changed;
+      // The push went through, so an earlier night's keep-master refusal no
+      // longer holds, even on a night the verse guard could not measure and
+      // so never cleared it above (#1434).
+      if (resource === "ult" || resource === "ust") {
+        await this.clearExportAlert(`export_master_moved:${book}:${resource}`);
+      }
 
       // ONE write for two facts about this (book, resource), because both are
       // established by the same commitToDcs call and land on the same row:
@@ -3069,6 +3076,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     book: string,
     resource: Resource,
     guard: { ok: boolean; detail: string; offenders?: AlignmentShrinkResult["offenders"] },
+    // pushed:false: another guard already refused tonight's push, so the
+    // alert and log must not say the book ships (#1434).
+    { pushed = true }: { pushed?: boolean } = {},
   ): Promise<{ block: boolean; reason: string } | null> {
     if (guard.ok && guard.detail === "ok") {
       // Checked this book+resource against master and found no alignment
@@ -3080,8 +3090,13 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     }
     if (guard.ok) return null;
     const severity = classifyAlignmentLossSeverity(guard.offenders ?? []);
-    await this.recordAlignmentShrinkSkipAlert(book, resource, guard.detail, guard.offenders ?? [], severity.block);
-    if (!severity.block) {
+    await this.recordAlignmentShrinkSkipAlert(book, resource, guard.detail, guard.offenders ?? [], severity.block, !pushed);
+    if (!severity.block && !pushed) {
+      console.log(
+        `export: not pushing ${book} ${resource} tonight (another guard refused it); also found translator-scale ` +
+          `alignment loss (${severity.reason}; ${guard.detail}) — alerted`,
+      );
+    } else if (!severity.block) {
       // A night where the guard found loss and shipped anyway should be
       // visible in the log, not only in a dismissible banner.
       console.log(
@@ -3147,6 +3162,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     detail: string,
     offenders: AlignmentShrinkResult["offenders"],
     blocking: boolean,
+    notPushed = false,
   ): Promise<void> {
     const source = `export_align_shrink:${book}:${resource}`;
     const label = `${book} ${resource.toUpperCase()}`;
@@ -3164,6 +3180,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       offenders,
       provenance,
       blocking,
+      notPushed,
     });
     await this.writeAlert(
       source,
