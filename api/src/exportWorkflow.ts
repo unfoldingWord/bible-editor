@@ -1741,16 +1741,24 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         try {
           let marker = tsvMarker;
           if (marker == null) {
-            // No marker written this attempt: only an earlier attempt's
-            // committedids need clearing, and the body is needed to put it.
+            // No marker written this attempt: this commit shipped D1's render
+            // and dropped nothing, so an earlier attempt's committedids and
+            // droppedids both need clearing; a retry would otherwise trust
+            // droppedids of the recorded push this commit replaced (#1463).
+            // The body is needed to put it.
             const prev = await this.env.BLOBS.head(d1RenderKey(r2Key));
-            if (prev?.customMetadata?.committedids) {
+            if (prev?.customMetadata?.committedids || prev?.customMetadata?.droppedids) {
               const obj = await this.env.BLOBS.get(d1RenderKey(r2Key));
               if (obj != null) marker = { body: await obj.text(), meta: { ...(obj.customMetadata ?? {}) } };
             }
           }
-          if (marker != null && (marker.meta.committedids ?? "") !== (tsvMarker?.meta.droppedids ?? "")) {
+          if (
+            marker != null &&
+            ((marker.meta.committedids ?? "") !== (tsvMarker?.meta.droppedids ?? "") ||
+              (tsvMarker == null && marker.meta.droppedids))
+          ) {
             const { committedids: _old, ...meta } = marker.meta;
+            if (tsvMarker == null) delete meta.droppedids;
             const shipped = tsvMarker?.meta.droppedids;
             await this.env.BLOBS.put(d1RenderKey(r2Key), marker.body, {
               httpMetadata: { contentType: "text/tab-separated-values" },
