@@ -834,6 +834,47 @@ console.log("\n[raiseEditLogSweepBoundaryAlerts: writes a warning naming the boo
   assert(rows.length === 0, "an undismissed alert for a boundary that healed is cleared, not left stale forever");
 }
 
+console.log("\n[findStaleSweepBoundaries: tq/twl boundaries alarm on unlocked books, not on locked ones; ult/ust ignore locks as before (issue #1467)]");
+{
+  // ZEC and HAG are in PUBLISHED_BOOKS (locked by default); JER and ISA are not.
+  assert(PUBLISHED_BOOKS.has("ZEC") && PUBLISHED_BOOKS.has("HAG") && !PUBLISHED_BOOKS.has("JER") && !PUBLISHED_BOOKS.has("ISA"), "fixture assumption: ZEC and HAG are published, JER and ISA are not");
+  const d = freshDb();
+  const env = { DB: makeD1(d) };
+  const now = 20_000_000;
+  const staleAt = now - (EDIT_LOG_RETENTION_SECONDS - EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS + 86400);
+  // Unlocked (no lock row, not published): alarm.
+  syncRow(d, { book: "JER", resource: "tq", confirmedAt: staleAt, editId: 1 });
+  syncRow(d, { book: "JER", resource: "twl", confirmedAt: staleAt, editId: 1 });
+  // Published, no lock row: locked by default, frozen boundary expected.
+  syncRow(d, { book: "ZEC", resource: "tq", confirmedAt: staleAt, editId: 1 });
+  syncRow(d, { book: "ZEC", resource: "twl", confirmedAt: staleAt, editId: 1 });
+  // Not published, explicitly locked: no alarm.
+  syncRow(d, { book: "ISA", resource: "tq", confirmedAt: staleAt, editId: 1 });
+  lockRow(d, "ISA", 1);
+  // Published, explicitly unlocked (locked = 0 wins over the default): alarm.
+  syncRow(d, { book: "HAG", resource: "tq", confirmedAt: staleAt, editId: 1 });
+  lockRow(d, "HAG", 0);
+  // ult/ust keep alarming regardless of locks.
+  syncRow(d, { book: "ZEC", resource: "ult", confirmedAt: staleAt, editId: 1 });
+  syncRow(d, { book: "ISA", resource: "ust", confirmedAt: staleAt, editId: 1 });
+  // tn stays out; a fresh tq boundary stays quiet.
+  syncRow(d, { book: "JER", resource: "tn", confirmedAt: staleAt, editId: null });
+  syncRow(d, { book: "ECC", resource: "tq", confirmedAt: now - 10 * 86400, editId: 1 });
+
+  const stale = await findStaleSweepBoundaries(env, now, PUBLISHED_BOOKS);
+  const got = stale.map((s) => `${s.book}:${s.resource}`).sort();
+  const want = ["HAG:tq", "JER:tq", "JER:twl", "ISA:ust", "ZEC:ult"];
+  assert(JSON.stringify(got) === JSON.stringify(want.sort()), `stale set is ${JSON.stringify(want)} (got ${JSON.stringify(got)})`);
+
+  await raiseEditLogSweepBoundaryAlerts(env, now, PUBLISHED_BOOKS);
+  const tq = alertRows(d, "edit_log_sweep_boundary_stale:JER:tq");
+  assert(tq.length === 1 && tq[0].message.includes("JER TQ"), "the JER tq alert's message names the book and resource (TQ)");
+  const twl = alertRows(d, "edit_log_sweep_boundary_stale:JER:twl");
+  assert(twl.length === 1 && twl[0].message.includes("JER TWL"), "the JER twl alert's message names the book and resource (TWL)");
+  assert(alertRows(d, "edit_log_sweep_boundary_stale:ZEC:tq").length === 0, "a published (default-locked) book's tq raises no alert");
+  assert(alertRows(d, "edit_log_sweep_boundary_stale:ISA:tq").length === 0, "an explicitly locked book's tq raises no alert");
+}
+
 console.log("\n[raiseEditLogSweepBoundaryAlerts: a refresh's DELETE and INSERT stay in one batch across the 90-statement chunk boundary (Codex #781 P2)]");
 {
   const d = freshDb();
