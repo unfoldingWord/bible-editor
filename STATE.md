@@ -976,9 +976,11 @@ Highlights that bite repeatedly:
   the verse, folded like the client's `spanWords` (`api/src/twlGlOccurrence.ts`), so `Solomon's` and
   `Yahweh of Armies` no longer hide a `Solomon`/`Yahweh` from the count. It reads `plain_text`, not `\w` tokens:
   a `\w` with punctuation inside (`twenty-fourth`, `Jerusalem’s` as one token) still counts differently.
-  Canonical TWL order takes the same `sourceRef` (#1437); the export/reimport `orderTwlRows` finds a bridged ULT
-  row only for its start verse (exact `verse` match), so the bridge's later verses keep stored `sort_order` there
-  while the client orders them by the ULT. Prod D1 had no bridged ULT rows on 2026-11-19, so this was not hit yet.
+  Canonical TWL order takes the same `sourceRef` (#1437). D1 stores a bridge once under its start verse, so the
+  server's TWL ordering takes the ULT row covering verse v (`verse <= v AND COALESCE(verse_end, verse) >= v`),
+  not an exact `verse` match: `orderTwlRows` and the order-unlock route do since #1442, so a bridge's later
+  verses (with or without x-ref) order like the client's. Prod D1 had no bridged ULT rows (84 bridged UST) on
+  2026-11-19.
 - **The TSV revert report's quiet path reads the reimport's edit_log payload shape (#1419).** When
   `book_resource_syncs` says origin `reimport` with `source_sha` equal to the master commit the export diffs
   against, a tn/tq/twl row is labelled probably ours if its latest edit_log write at or before `synced_at` is a

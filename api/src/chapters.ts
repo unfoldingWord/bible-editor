@@ -469,8 +469,11 @@ chapters.delete("/:book/:chapter/twl-order-lock", requireEditor, async (c) => {
     if (twlRows.results.length > 0) {
       const links = [...new Set(twlRows.results.map((r) => r.tw_link).filter((l): l is string => !!l))];
       const [ultVerse, twTitles] = await Promise.all([
+        // The verse's own ULT row, or the bridge covering it (stored once under
+        // its start verse): orderTwlRows orders a bridge's later verse by it (#1442).
         c.env.DB.prepare(
-          `SELECT * FROM verses WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = 'ULT'`,
+          `SELECT * FROM verses WHERE book = ?1 AND chapter = ?2 AND verse <= ?3
+             AND COALESCE(verse_end, verse) >= ?3 AND bible_version = 'ULT'`,
         )
           .bind(book, chapter, verse)
           .all<VerseRow>(),
