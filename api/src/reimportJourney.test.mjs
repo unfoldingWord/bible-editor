@@ -2602,9 +2602,10 @@ console.log("\n[#1461: a tq row whose updates the sweep removed has no ancestor,
   }
 
   // 7. A #653 PROVISIONAL base is the create itself, above a frozen boundary.
-  //    If an update after it was swept, that base is stale too, and its one
-  //    allowed outcome (a clean `keep` when master equals it) would read a
-  //    Door43 revert to the create's value as "master never moved".
+  //    #653 never folds anything after that create (later entries are above
+  //    the boundary too), so sweeping a later update changes nothing the base
+  //    ever read: the row keeps #653's behavior, a clean keep when master
+  //    still equals the create.
   {
     const { sqlite, env } = freshEnv();
     seed(sqlite, "sw08", { version: 2, response: "r" });
@@ -2615,8 +2616,8 @@ console.log("\n[#1461: a tq row whose updates the sweep removed has no ancestor,
       confirmedAt: OLD - 86400, editId: 5, // frozen before the row existed: the create is above it
     });
     const row = sqlite.prepare(`SELECT response, review_kind FROM tq_rows WHERE id = 'sw08'`).all()[0];
-    eq(counts.merge_no_base, 1, "a provisional create followed by a swept update is no ancestor");
-    eq(row.review_kind, "merge_no_base", "…so the difference is flagged");
+    eq(counts.merge_no_base, 0, "a provisional create keeps #653's outcome after a later update is swept");
+    eq([row.response, row.review_kind], ["r", null], "…D1 kept, no flag");
   }
 
   // 8. A REAL FLAG MINT bumps the version: the keep_no_base flag goes through
@@ -2691,20 +2692,41 @@ console.log("\n[#1461: a tq row whose updates the sweep removed has no ancestor,
     eq(sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id = 'sw11'`).all()[0].review_kind, null, "…no flag");
   }
 
-  // 11. BOUNDARY GATE. The entry before the skip sits ABOVE the boundary, so
-  //     whatever is missing after it is above the boundary too, outside what
-  //     the bounded fold reads. The create stays the ancestor.
+  // 11. FROZEN BOUNDARY, TAIL (the review's case). The boundary is older than
+  //     the 180-day horizon, so the swept post-boundary update could sit on
+  //     either side of it; here it is above, outside what the bounded fold
+  //     reads, and the create alone IS the right ancestor. An ambiguous gap
+  //     leaves the fold as it was: master equals the create, her edit stands.
   {
     const { sqlite, env } = freshEnv();
-    seed(sqlite, "sw12", { version: 4, response: "her edit" });
-    log(sqlite, { id: 10, rowKey: "sw12", action: "create", prev: null, next: 1, payload: CREATE, at: OLD });
-    log(sqlite, { id: 35, rowKey: "sw12", action: "update", prev: 1, next: 2, payload: { response: "an older edit" }, at: OLD + 86400 });
-    log(sqlite, { id: 40, rowKey: "sw12", action: "update", prev: 3, next: 4, payload: { response: "her edit" }, at: RECENT });
+    seed(sqlite, "sw12", { version: 2, response: "her edit" });
+    log(sqlite, { id: 10, rowKey: "sw12", action: "create", prev: null, next: 1, payload: CREATE, at: OLD - 10 * 86400 });
+    log(sqlite, { id: 40, rowKey: "sw12", action: "update", prev: 1, next: 2, payload: { response: "her edit" }, at: OLD });
+    runSweep(sqlite);
+    eq(surviving(sqlite, "sw12"), [10], "the post-boundary update aged out");
     const counts = await applyTsvRows(env, BOOK, "tq", masterRow("sw12", ""), null, {
-      confirmedAt: RECENT - 86400, editId: BOUNDARY,
+      confirmedAt: OLD - 5 * 86400, editId: BOUNDARY, // frozen past the horizon
     });
-    eq(counts.merge_no_base, 0, "a gap above the boundary leaves the bounded ancestor alone");
+    eq(counts.merge_no_base, 0, "a frozen boundary's tail gap is not counted");
     eq(sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id = 'sw12'`).all()[0].review_kind, null, "…no flag");
+  }
+
+  // 12. FROZEN BOUNDARY, STRADDLING. The gap runs from the create (below) to a
+  //     surviving entry above the boundary; the swept entry is above it too.
+  //     Same ambiguity, same answer: the bounded fold is left alone.
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite, "sw13", { version: 3, response: "her edit" });
+    log(sqlite, { id: 10, rowKey: "sw13", action: "create", prev: null, next: 1, payload: CREATE, at: OLD - 10 * 86400 });
+    log(sqlite, { id: 40, rowKey: "sw13", action: "update", prev: 1, next: 2, payload: { response: "an older edit" }, at: OLD });
+    log(sqlite, { id: 50, rowKey: "sw13", action: "update", prev: 2, next: 3, payload: { response: "her edit" }, at: RECENT });
+    runSweep(sqlite);
+    eq(surviving(sqlite, "sw13"), [10, 50], "the older post-boundary update aged out");
+    const counts = await applyTsvRows(env, BOOK, "tq", masterRow("sw13", ""), null, {
+      confirmedAt: OLD - 5 * 86400, editId: BOUNDARY,
+    });
+    eq(counts.merge_no_base, 0, "a straddling gap under a frozen boundary is not counted");
+    eq(sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id = 'sw13'`).all()[0].review_kind, null, "…no flag");
   }
 }
 
