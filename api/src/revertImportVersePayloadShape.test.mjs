@@ -39,6 +39,9 @@ registerHooks({
 const { applyVerseRowsForTest } = await import("./bookReimport.ts");
 const { extractVersesForRange } = await import("./importParsers.ts");
 const { verseTextByRef } = await import("./export.ts");
+const { EDIT_LOG_RETENTION_SECONDS } = await import("./editLogSweep.ts");
+const { loadPreImportVerses, loadSourceWordsForRefs, masterVersesAsImported, partitionUsfmRevertEntriesByImport, preImportVerseMatchesMaster } =
+  await import("./revertImportVerses.ts");
 
 let failed = 0;
 function ok(cond, msg) {
@@ -237,6 +240,27 @@ ok(measured[3].action === "update" && measured[3].equalsD1Now && !measured[3].eq
 ok(measured[4].action === "update" && measured[4].source === "dcs_reimport" && !measured[4].equalsExtract, "source-attr reconcile: 'update', dcs_reimport, same payload keys, but NOT master's verse");
 ok(measured[4].keys === "content,plain_text", "source-attr reconcile: payload keys are the adoption's — source and shape cannot tell them apart, only content can");
 ok(measured[5].source === null && !measured[5].equalsExtract, "kept (keep_ai_master, nothing to reconcile): no reimport row; the newest is the translator's own");
+
+console.log("\n[3. the real loader + matcher read those payloads: D1 held master's verse for exactly the taken verses]");
+{
+  const syncedAt = Number(sqlite.prepare(`SELECT MAX(created_at) AS m FROM edit_log`).get().m);
+  const refs = [1, 2, 3, 4, 5, 6].map((v) => `1:${v}`);
+  const pre = await loadPreImportVerses(env.DB, BOOK, "ULT", refs, syncedAt);
+  const words = await loadSourceWordsForRefs(env.DB, BOOK, "UHB", refs);
+  const asImported = masterVersesAsImported(master);
+  const verdict = Object.fromEntries(refs.map((r) => [r, preImportVerseMatchesMaster(pre.get(r), asImported.get(r), words.get(r))]));
+  console.log(`    ${JSON.stringify(verdict)}`);
+  ok(verdict["1:1"] && verdict["1:6"], "pristine update and create match the raw extract");
+  ok(verdict["1:2"] && verdict["1:3"], "clean adopt and adopt_conflict match the canonized extract");
+  ok(!verdict["1:4"], "source-attr reconcile does not match (translator's wording)");
+  ok(!verdict["1:5"], "kept verse does not match (translator's own row)");
+  ok(!preImportVerseMatchesMaster(pre.get("1:2"), asImported.get("1:2"), []), "without the source words the adoption does not match (canonize is required, not a mask)");
+  const parts = partitionUsfmRevertEntriesByImport(refs.map((ref) => ({ ref, class: "substantive" })), asImported, pre, words);
+  ok(JSON.stringify([parts.attention.map((e) => e.ref), parts.probablyOurs.map((e) => e.ref)]) === JSON.stringify([["1:4", "1:5"], ["1:1", "1:2", "1:3", "1:6"]]), "partition: the taken verses are probably ours, the rest need attention");
+  // The sweep floor: the same rows, read as if the import were ~179 days old.
+  const late = await loadPreImportVerses(env.DB, BOOK, "ULT", refs, syncedAt, syncedAt + EDIT_LOG_RETENTION_SECONDS - 86400 + 1);
+  ok(refs.every((r) => late.get(r) === null), "a picked row within a day of the retention cutoff is no evidence");
+}
 
 if (failed > 0) {
   console.error(`\n${failed} revertImportVersePayloadShape check(s) FAILED`);

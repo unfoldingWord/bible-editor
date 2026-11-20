@@ -149,7 +149,8 @@ import {
   ALL_RESOURCES as REIMPORT_RESOURCES,
 } from "./bookReimport";
 import { noteLockedPushOnVerseMergeAlert, retireVerseKeptAiMasterFlags } from "./verseMergeConflicts.ts";
-import { dcsResourceFile, fetchDcsMasterTextVerified, fileBlobShaAtCommit, fileHeadCommit, repoHeadCommitSha, type ReimportResource } from "./dcsSources";
+import { dcsResourceFile, fetchDcsMasterTextVerified, fileBlobShaAtCommit, fileHeadCommit, NT_BOOKS, repoHeadCommitSha, type ReimportResource } from "./dcsSources";
+import { loadPreImportVerses, loadSourceWordsForRefs, masterVersesAsImported, partitionUsfmRevertEntriesByImport } from "./revertImportVerses.ts";
 import { readLedgerMasterLineage, type LedgerLineageResult } from "./masterLineageLedger.ts";
 import { DCS_POLL_FETCH_TIMEOUT_MS } from "./dcsCommitPoll.ts";
 import { gitBlobSha, gitBlobShaOrNull, findOurMergeForPr, judgeOwnPublishDecline } from "./ownPublish";
@@ -1928,12 +1929,71 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         (resource === "ult" || resource === "ust") &&
         shouldRecordRevertReport(dcsChanged, usfmMasterContentForRevertReport)
       ) {
-        const report = partitionByLineage(
+        const lineageReport = partitionByLineage(
           "usfm",
           computeEntries
             ? usfmRevertReport(built.content, usfmMasterContentForRevertReport as string, revertBase).entries
             : [],
         );
+        // #1439: the verse half of #1419's imported-head partition below. A
+        // verse D1 held as the import read it from the very master commit
+        // this report diffs against was changed in Bible Editor afterwards:
+        // label it probably ours. See revertImportVerses.ts. Any failure
+        // keeps every verse in attention.
+        let report: {
+          attention: Array<UsfmRevertEntry | TsvRevertEntry>;
+          probablyOurs: Array<UsfmRevertEntry | TsvRevertEntry>;
+          importedHead?: { importedSha: string; rows: ReadonlyArray<UsfmRevertEntry | TsvRevertEntry> };
+        } = lineageReport;
+        const importReason = importedHeadUnusableReason(importedSync, fresh.masterSha);
+        if (lineageReport.attention.length > 0) {
+          if (importReason !== "") {
+            console.log("export: revert report import partition skipped", { book, resource, reason: importReason });
+          } else {
+            try {
+              const attention = lineageReport.attention as UsfmRevertEntry[];
+              const refs = attention.map((e) => e.ref);
+              const preImport = await loadPreImportVerses(
+                this.env.DB,
+                book,
+                resource === "ult" ? "ULT" : "UST",
+                refs,
+                importedSync!.syncedAt as number,
+              );
+              const sourceWords = await loadSourceWordsForRefs(
+                this.env.DB,
+                book,
+                NT_BOOKS.has(book) ? "UGNT" : "UHB",
+                refs.filter((r) => typeof preImport.get(r) === "string"),
+              );
+              const split = partitionUsfmRevertEntriesByImport(
+                attention,
+                masterVersesAsImported(usfmMasterContentForRevertReport as string),
+                preImport,
+                sourceWords,
+              );
+              console.log("export: revert report import partition", {
+                book,
+                resource,
+                attention: split.attention.length,
+                probablyOurs: split.probablyOurs.length,
+              });
+              if (split.probablyOurs.length > 0) {
+                report = {
+                  attention: split.attention,
+                  probablyOurs: [...lineageReport.probablyOurs, ...split.probablyOurs],
+                  importedHead: { importedSha: importedSync!.sourceSha as string, rows: split.probablyOurs },
+                };
+              }
+            } catch (e) {
+              console.error("export: revert report import partition failed; every verse stays in attention", {
+                book,
+                resource,
+                error: e instanceof Error ? e.message : String(e),
+              });
+            }
+          }
+        }
         await this.recordExportRevertReport(book, resource, "usfm", report, mechanical, branch, instanceId, alertObservedAt);
       } else if (
         (resource === "tn" || resource === "tq" || resource === "twl") &&

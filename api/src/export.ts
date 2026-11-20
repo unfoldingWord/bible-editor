@@ -1842,7 +1842,9 @@ export function planRevertReportAlerts(p: {
   generation: string;
   /**
    * #1419: the subset of `probablyOurs` labelled by the imported-head evidence
-   * (partitionTsvRevertEntriesByImport), with the Door43 commit D1 imported.
+   * (partitionTsvRevertEntriesByImport; for verses, #1439,
+   * revertImportVerses.ts's partitionUsfmRevertEntriesByImport), with the
+   * Door43 commit D1 imported.
    * Every other probablyOurs row is ours by the persisted master lineage
    * (#1231). The record names each group with its own reason.
    */
@@ -1901,19 +1903,24 @@ export function planRevertReportAlerts(p: {
     const importedSet = new Set<unknown>(p.importedHead?.rows ?? []);
     const imported = probablyOurs.filter((e) => importedSet.has(e));
     const byLineage = probablyOurs.filter((e) => !importedSet.has(e));
+    // A verse (#1439) is matched against master's verse as the import read it
+    // (revertImportVerses.ts), not byte for byte against master's file, so it
+    // does not claim "exactly as master has it".
+    const held = kind === "usfm" ? "as that import read it from master" : "exactly as master has it";
     const importReason = (subject: string) =>
       `Bible Editor imported master's current file (Door43 commit ${(p.importedHead?.importedSha ?? "").slice(0, 10)}, ` +
-      `which master still held at export) and held ${subject} exactly as master has it, so every difference is an edit ` +
+      `which master still held at export) and held ${subject} ${held}, so every difference is an edit ` +
       `made in Bible Editor after that import.`;
+    const [all, each] = kind === "usfm" ? ["each of these verses", "each verse"] : ["each of these rows", "each row"];
     const why =
       imported.length === 0
         ? `The stored Door43 edit history shows no person touched these verses since master last held our export.`
         : byLineage.length === 0
-          ? `The stored Door43 edit history and sync record show ${importReason("each of these rows")}`
+          ? `The stored Door43 edit history and sync record show ${importReason(all)}`
           : `The stored Door43 edit history gives two reasons. No person touched ` +
             `${sample(uniqueRefs(byLineage), PROBABLY_OURS_LISTED_REFS)} since master last held our export. ` +
-            `For ${sample(uniqueRefs(imported), PROBABLY_OURS_LISTED_REFS)}, the sync record shows ${importReason("each row")}`;
-    const unit = imported.length > 0 ? "row(s)" : "verse(s)";
+            `For ${sample(uniqueRefs(imported), PROBABLY_OURS_LISTED_REFS)}, the sync record shows ${importReason(each)}`;
+    const unit = imported.length > 0 && kind === "tsv" ? "row(s)" : "verse(s)";
     out.push({
       source: `revert_probably_ours:${book}:${resource}`,
       message:
