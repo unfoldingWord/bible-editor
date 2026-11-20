@@ -1531,7 +1531,15 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       }
     }
 
-    if (alignGuard) {
+    // Translator-scale loss ships, and its banner says so ("shipped to
+    // Door43"), so it is recorded only once that is known: worded as not
+    // pushed if the USFM hold gate below stops the push, as shipped after
+    // commitToDcs returns (#1448). A commit that throws records nothing; the
+    // step.do retry re-runs this whole method and measures again.
+    let alignLossToReport: typeof alignGuard = null;
+    if (alignGuard && !alignGuard.ok && !classifyAlignmentLossSeverity(alignGuard.offenders ?? []).block) {
+      alignLossToReport = alignGuard;
+    } else if (alignGuard) {
       const severity = await this.reportAlignmentVerdict(book, resource, alignGuard);
       if (severity?.block) {
         const reason = `align_shrink_guard:${severity.reason}:${alignGuard.detail}`;
@@ -1574,6 +1582,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       if (issues.length > 0) {
         const summary = summarizeUsfmIssues(issues);
         await this.recordUsfmInvalidSkipAlert(book, resource, issues);
+        if (alignLossToReport) await this.reportAlignmentVerdict(book, resource, alignLossToReport, { pushed: false });
         const reason = `usfm_invalid_guard:${issues.length}:${summary}`;
         await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
         return {
@@ -1605,6 +1614,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       };
       const message = `bible-editor export: ${book} ${resource} → ${branch} (${instanceId})`;
       const commit = await commitToDcs(dcsCfg, filename, built.content, message);
+      if (alignLossToReport) await this.reportAlignmentVerdict(book, resource, alignLossToReport);
       if (!commit.branchTouched) {
         // Rendered content matches master — nothing to merge. Close any open PR
         // lingering from an earlier night (an edit since reverted in D1, or
