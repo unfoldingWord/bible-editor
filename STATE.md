@@ -974,6 +974,9 @@ Highlights that bite repeatedly:
   the client moves each suggestion to its x-ref verse (`regroupTwlSuggestionsByXref`, #1432) with the same run
   picker the resolver uses; the route and the client count occurrences differently (`Solomon's` is its own span
   on the route, `Solomon` + `s` tokens on the client), so a run can still land on the wrong word, bridge or not.
+  Canonical TWL order takes the same `sourceRef` (#1437); the export/reimport `orderTwlRows` finds a bridged ULT
+  row only for its start verse (exact `verse` match), so the bridge's later verses keep stored `sort_order` there
+  while the client orders them by the ULT. Prod D1 had no bridged ULT rows on 2026-11-19, so this was not hit yet.
 - **The TSV revert report's quiet path reads the reimport's edit_log payload shape (#1419).** When
   `book_resource_syncs` says origin `reimport` with `source_sha` equal to the master commit the export diffs
   against, a tn/tq/twl row is labelled probably ours if its latest edit_log write at or before `synced_at` is a

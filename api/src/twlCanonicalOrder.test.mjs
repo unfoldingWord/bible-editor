@@ -13,6 +13,10 @@ import {
   twlAnchorContext,
   twlSortPosition,
 } from "./twlCanonicalOrder.ts";
+import usfm from "usfm-js";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -866,6 +870,114 @@ function ultVerseOccSpans(chapter, verse, spans) {
     JSON.stringify(updates) === JSON.stringify({ "u-d": 100, "u-h": 200 }),
     `only the unlocked verse's rows get sortOrderUpdates (got ${JSON.stringify(updates)})`,
   );
+}
+
+// ─── a bridged ULT row with x-ref (#1437) ────────────────────────────────────
+// PARITY with web/src/lib/twlCanonicalOrder.test.mjs. Real Door43 2CH 9:10-12
+// (the UST bridge stands in for a bridged ULT): tCore counts x-occurrence per
+// source verse and names it in x-ref, so אֶת is 1/1 in both 9:12 (English 5)
+// and 9:11 (English 75), and אֲשֶׁר is 1/1 in both 9:12 (21) and 9:10 (50). D1
+// stores the bridge once, as verse=10 verse_end=12.
+{
+  console.log("\n[x-ref] bridged ULT: a verse's links sort by that verse's copy of a word");
+  const here = dirname(fileURLToPath(import.meta.url));
+  const ustRaw = readFileSync(resolve(here, "../../docs/samples/en_ust_14-2CH-9_10-12.usfm"), "utf8");
+  const bridgeVo = usfm.toJSON(ustRaw).chapters["9"]["10-12"].verseObjects;
+  const legacyVo = usfm.toJSON(ustRaw.replace(/ x-ref="[^"]*"/g, "")).chapters["9"]["10-12"].verseObjects;
+  const asRow = (verseObjects, verse_end = 12) => ({
+    ...ultVerse(9, 10, []),
+    book: "2CH",
+    verse_end,
+    content_json: JSON.stringify({ verseObjects }),
+  });
+  const bridge = asRow(bridgeVo);
+  const legacy = asRow(legacyVo);
+  // Milestone contents (outer → inner) above the first English `text` aligned
+  // to `ref`, read from the fixture so the Hebrew is never retyped.
+  const contentsOver = (vo, ref, text) => {
+    let found = null;
+    const walk = (nodes, stack) => {
+      for (const n of nodes ?? []) {
+        if (found || !n || typeof n !== "object") continue;
+        if (n.type === "milestone" && n.tag === "zaln") {
+          walk(n.children, [...stack, n]);
+        } else if (n.type === "word" && n.tag === "w") {
+          if (n.text === text && stack.length > 0 && stack[0].ref === ref) found = stack.map((m) => m.content);
+        } else walk(n.children, stack);
+      }
+    };
+    walk(vo, []);
+    return found;
+  };
+  const et = contentsOver(bridgeVo, "9:11", "that")[0];
+  const asher = contentsOver(bridgeVo, "9:10", "When")[1];
+  const hiram = contentsOver(bridgeVo, "9:10", "Hiram")[0];
+  const pos = (orig, ref, row = bridge) =>
+    twlSortPosition({ orig_words: orig, occurrence: 1 }, buildUltSequenceMap(row, ref));
+
+  // "that wood": "that" is skipped as a function word (tier 2).
+  assert(pos(et, "9:11") === 75, `9:11's אֶת sorts at its own "wood" (75), got ${pos(et, "9:11")}`);
+  assert(pos(et, "9:12") === 5, `9:12's אֶת sorts at its own "many" (5), got ${pos(et, "9:12")}`);
+  assert(pos(asher, "9:10") === 50, `9:10's אֲשֶׁר sorts at its own "took" (50), got ${pos(asher, "9:10")}`);
+  assert(pos(asher, "9:12") === 21, `9:12's אֲשֶׁר sorts at its own "gave" (21), got ${pos(asher, "9:12")}`);
+  assert(pos(hiram, "9:11") === null, "a 9:10 word does not resolve when ordering 9:11");
+
+  // The issue's own case: a 9:12 link for a word that also occurs in 9:10. The
+  // bare position matches either way (9:12 reads first), so it only shows when
+  // the TW headword ("take") picks 9:10's "took" (50) out of the merged span.
+  const takeCtx = twlAnchorContext("rc://en/tw/dict/bible/other/take", new Map([["rc://en/tw/dict/bible/other/take", "take"]]));
+  const pos12 = twlSortPosition({ orig_words: asher, occurrence: 1 }, buildUltSequenceMap(bridge, "9:12"), takeCtx);
+  assert(pos12 === 21, `9:12's אֲשֶׁר keeps its 9:12 position (21) with the "take" headword, got ${pos12}`);
+
+  // The export path: the bridge's start-verse bucket follows 9:10's English
+  // ("King Hiram's sailors took …"), not 9:12's copy of אֲשֶׁר.
+  const rows10 = [twl("asher", 9, 10, asher, 1, 100), twl("hiram", 9, 10, hiram, 1, 200)];
+  const { versePositions, sortOrderUpdates } = orderTwlRows(rows10, [bridge]);
+  assert(versePositions.get("hiram") === 0 && versePositions.get("asher") === 1, "9:10 bucket: hiram, asher");
+  const updates10 = toMap(sortOrderUpdates);
+  assert(
+    Object.keys(updates10).length === 2 && updates10.hiram === 100 && updates10.asher === 200,
+    `9:10 bucket writes hiram 100, asher 200 (got ${JSON.stringify(updates10)})`,
+  );
+
+  // Without x-ref (the older whole-bridge convention) the verse changes nothing,
+  // and the start-verse bucket keeps its pre-#1437 whole-bridge order.
+  const flat = (m) => JSON.stringify([...m]);
+  assert(
+    flat(buildUltSequenceMap(legacy, "9:10")) === flat(buildUltSequenceMap(legacy)),
+    "a bridge without x-ref builds the same map with or without the verse",
+  );
+  assert(
+    flat(buildUltSequenceMap(bridge)) !== flat(buildUltSequenceMap(bridge, "9:10")),
+    "no verse given: the whole x-ref'd bridge is used, as before",
+  );
+  const legacyOrder = orderTwlRows(rows10, [legacy]).versePositions;
+  assert(
+    legacyOrder.get("asher") === 0 && legacyOrder.get("hiram") === 1,
+    "no x-ref: 9:10 bucket keeps the whole-bridge order (asher, hiram)",
+  );
+
+  // Known gap, unchanged here: the bridge row is found only for its START verse
+  // (exact verse match), so 9:11 / 9:12 buckets get no ULT and keep stored order.
+  const rows11 = [twl("et", 9, 11, et, 1, 100), twl("x", 9, 11, hiram, 1, 200)];
+  const later = orderTwlRows(rows11, [bridge]);
+  assert(later.sortOrderUpdates.length === 0, "later bridge verses: no ULT found, stored order kept");
+}
+
+{
+  console.log("\n[x-ref] an ordinary verse is unchanged by the bridge scoping");
+  const rows = [twl("b", 1, 1, "ב", 1, 100), twl("a", 1, 1, "א", 1, 200)];
+  const verse = ultVerse(1, 1, [
+    { content: "א", text: "alpha" },
+    { content: "ב", text: "beta" },
+  ]);
+  assert(
+    flatPositions(orderTwlRows(rows, [verse])) === '[["a",0],["b",1]]',
+    "ordinary verse orders by ULT position as before",
+  );
+  function flatPositions(o) {
+    return JSON.stringify([...o.versePositions].sort((x, y) => x[1] - y[1]));
+  }
 }
 
 if (failed > 0) {

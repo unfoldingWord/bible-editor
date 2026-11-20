@@ -62,6 +62,9 @@ export interface WordRef {
 interface MilestoneEntry {
   content: string;
   words: WordRef[];
+  // Aligned to another verse of a bridge (x-ref ≠ sourceRef): never a phrase
+  // window, and no window runs across it.
+  foreign?: boolean;
 }
 
 // Merge two spans' word lists into one ascending, index-deduped list. Nested
@@ -89,9 +92,19 @@ function mergeWordRefs(a: WordRef[], b: WordRef[]): WordRef[] {
 // legitimately long OrigWords phrase can't silently fail to resolve the way a
 // hardcoded cap would (a verse only ever has a handful of milestones, so this
 // costs nothing).
+//
+// BRIDGES WITH x-ref (#1437). Inside a bridged verse (2CH 9:10-12) tCore counts
+// x-occurrence per SOURCE verse and names that verse in x-ref, so אֶת is 1/1 in
+// both 9:11 and 9:12. `sourceRef` ("9:11", as x-ref spells it) is the verse whose
+// links are being ordered: a milestone whose x-ref names another verse gets no
+// entry of its own (its English still counts toward every index) and breaks the
+// phrase windows, so occurrences count over that verse's milestones only.
+// Milestones without x-ref, and every milestone when no sourceRef is given,
+// take the pre-#1437 path unchanged.
 
 export function buildUltSequenceMap(
   verseObjects: unknown[] | null | undefined,
+  sourceRef?: string,
 ): Map<string, WordRef[]> {
   const sequenceMap = new Map<string, WordRef[]>();
   if (!Array.isArray(verseObjects)) return sequenceMap;
@@ -121,6 +134,20 @@ export function buildUltSequenceMap(
       // sibling-structured — left for a milestoneEnd below.
       if (o["type"] === "milestone" && o["tag"] === "zaln" && typeof o["content"] === "string") {
         const content = normalizeWordText(o["content"] as string);
+        const ref = typeof o["ref"] === "string" && o["ref"] !== "" ? (o["ref"] as string) : undefined;
+        if (sourceRef !== undefined && ref !== undefined && ref !== sourceRef) {
+          // Another verse's word: a throwaway entry keeps push/pop balanced and
+          // soaks up its English; in `entries` it is only a window barrier.
+          const foreign: MilestoneEntry = { content, words: [], foreign: true };
+          if (entries[entries.length - 1]?.foreign !== true) entries.push(foreign);
+          stack.push(foreign);
+          const children = o["children"];
+          if (Array.isArray(children)) {
+            walk(children);
+            stack.pop();
+          }
+          continue;
+        }
         // The milestone's own x-occurrence identifies the source instance. When
         // absent (older/hand-built data) fall back to one entry per milestone,
         // which is the pre-fix behaviour.
@@ -209,11 +236,13 @@ export function buildUltSequenceMap(
   // be miscounted as occurrence #1 instead of #2.
   const phraseOccurrenceCount = new Map<string, number>();
   for (let i = 0; i < entries.length; i++) {
+    if (entries[i].foreign) continue;
     let phrase = entries[i].content;
     let windowWords = entries[i].words;
     for (let len = 1; i + len <= entries.length; len++) {
       if (len > 1) {
         const entry = entries[i + len - 1];
+        if (entry.foreign) break;
         phrase += ` ${entry.content}`;
         windowWords = mergeWordRefs(windowWords, entry.words);
       }
@@ -296,7 +325,9 @@ export function twlSortPosition(
 // input. Callers pass the ULT verse's verseObjects (or null when unavailable, in
 // which case every row is "unresolved" and order falls back to sort_order), and
 // the tw_link → article-title map (or null, which drops every row to tier 2/3 —
-// the order this produced before headword anchoring).
+// the order this produced before headword anchoring). `sourceRef` ("9:11") is
+// the verse being ordered when the ULT row is a bridge, undefined otherwise
+// (see buildUltSequenceMap, #1437).
 export function canonicalTwlOrder<
   T extends {
     orig_words: string | null;
@@ -308,8 +339,9 @@ export function canonicalTwlOrder<
   rows: T[],
   verseObjects: unknown[] | null | undefined,
   twTitles?: Map<string, string> | null,
+  sourceRef?: string,
 ): T[] {
-  const sequenceMap = buildUltSequenceMap(verseObjects);
+  const sequenceMap = buildUltSequenceMap(verseObjects, sourceRef);
   // Resolve each row's position ONCE (decorate-sort), not inside the comparator:
   // headword matching runs morphological variants, so paying for it O(n log n)
   // times per verse instead of O(n) would be wasteful.
@@ -368,6 +400,7 @@ export function twlDisplayOrder<
   verseObjects: unknown[] | null | undefined,
   twTitles?: Map<string, string> | null,
   locked?: boolean,
+  sourceRef?: string,
 ): T[] {
-  return locked ? manualTwlOrder(rows) : canonicalTwlOrder(rows, verseObjects, twTitles);
+  return locked ? manualTwlOrder(rows) : canonicalTwlOrder(rows, verseObjects, twTitles, sourceRef);
 }
