@@ -4109,9 +4109,10 @@ async function reconstructTsvBases(
   // may sit on either side. It keeps the old fold. Such a boundary means the
   // export has been frozen for 180+ days: a locked book (whose Door43 side is
   // authoritative and which the locked mirror, #1418, reconciles nightly) or a
-  // stuck export. raiseEditLogSweepBoundaryAlerts warns about a stuck
-  // boundary only for ult/ust, not tq, so on a tq export stuck 180+ days this
-  // shape keeps the pre-#1461 behavior (a stale create can still be folded).
+  // stuck export. On a tq export stuck 180+ days this shape keeps the
+  // pre-#1461 behavior (a stale create can still be folded), so
+  // raiseEditLogSweepBoundaryAlerts warns about a stuck tq/twl boundary on an
+  // unlocked book two weeks before it gets there (#1467).
   // Counting those gaps would flag every such row merge_no_base once its
   // post-boundary history aged out.
   //

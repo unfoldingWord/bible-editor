@@ -486,16 +486,33 @@ function alarmSource(book: string, resource: string): string {
 // master_confirmed_at is older than this. Bound once by the caller as
 // `now - (EDIT_LOG_RETENTION_SECONDS - EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS)`
 // — i.e. EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS of runway before the boundary's
-// own age would reach EDIT_LOG_RETENTION_SECONDS. Scoped to 'ult'/'ust' —
-// the only resources the verse merge (and therefore human_edit_after_export
-// / latest_source) ever reads; tn/tq/twl watermark rows are irrelevant here.
+// own age would reach EDIT_LOG_RETENTION_SECONDS.
+// ?2 — publishedGuard.ts's PUBLISHED_BOOKS as a JSON array, bound by the
+// caller for the same import-cycle reason EDIT_LOG_SWEEP_SQL's ?2 gives.
+//
+// 'ult'/'ust' alarm on every book, locked or not (the verse merge reads
+// their edit_log ancestors). 'tq'/'twl' alarm too (issue #1467): the nightly
+// sync's stale-ancestor check for tq (#1461) only trusts a swept gap under a
+// boundary younger than the retention window, so a tq/twl boundary stuck
+// 180+ days silently keeps the old hazard. They alarm only on UNLOCKED
+// books, though: a locked book's boundary is expected to stay frozen (the
+// locked mirror, #1418, reconciles it). Unlocked is the inverse of
+// effectiveBookLock's rule, as EDIT_LOG_SWEEP_SQL branch (9) applies it: an
+// explicit book_locks.locked = 0 row, or no row and the book not in
+// PUBLISHED_BOOKS. Written in that positive form because negating the locked
+// test yields NULL when there is no lock row. tn is never swept, so it
+// never alarms.
 export const EDIT_LOG_SWEEP_ALARM_QUERY_SQL = `
-  SELECT book, resource, master_confirmed_at
-    FROM book_resource_syncs
-   WHERE resource IN ('ult', 'ust')
-     AND master_confirmed_at IS NOT NULL
-     AND master_confirmed_at < ?1
-   ORDER BY master_confirmed_at ASC`;
+  SELECT brs.book, brs.resource, brs.master_confirmed_at
+    FROM book_resource_syncs brs
+    LEFT JOIN book_locks bl ON bl.book = brs.book
+   WHERE brs.master_confirmed_at IS NOT NULL
+     AND brs.master_confirmed_at < ?1
+     AND (brs.resource IN ('ult', 'ust')
+       OR (brs.resource IN ('tq', 'twl')
+           AND (bl.locked = 0
+             OR (bl.book IS NULL AND brs.book NOT IN (SELECT value FROM json_each(?2))))))
+   ORDER BY brs.master_confirmed_at ASC`;
 
 export interface StaleSweepBoundary {
   book: string;
@@ -521,10 +538,17 @@ export function toStaleSweepBoundary(
   };
 }
 
-export async function findStaleSweepBoundaries(env: Env, now: number): Promise<StaleSweepBoundary[]> {
+// `publishedBooks` is PUBLISHED_BOOKS (the caller passes it; see ?2 above).
+// Required, not defaulted: an empty list would read every published book
+// without a lock row as unlocked and raise a tq/twl alert for each one.
+export async function findStaleSweepBoundaries(
+  env: Env,
+  now: number,
+  publishedBooks: Iterable<string>,
+): Promise<StaleSweepBoundary[]> {
   const threshold = now - (EDIT_LOG_RETENTION_SECONDS - EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS);
   const rs = await env.DB.prepare(EDIT_LOG_SWEEP_ALARM_QUERY_SQL)
-    .bind(threshold)
+    .bind(threshold, JSON.stringify([...publishedBooks]))
     .all<{ book: string; resource: string; master_confirmed_at: number }>();
   return (rs.results ?? []).map((r) => toStaleSweepBoundary(r, now));
 }
@@ -544,9 +568,35 @@ export async function findStaleSweepBoundaries(env: Env, now: number): Promise<S
 // staleness condition), so both dates hold still across runs. No information is
 // lost: an absolute deadline is what the reader acts on anyway, and elapsed
 // days are the difference between the stated date and today.
+//
+// tq/twl get their own wording (issue #1467): they alarm only on unlocked
+// books, so a lock or a published book is never the cause, and their hazard is
+// not the verse merge's. The ult/ust text below must stay byte-identical, or
+// every dismissed ult/ust alert comes back.
 function boundaryMessage(s: StaleSweepBoundary): string {
   const res = s.resource.toUpperCase();
   const day = (epochSeconds: number) => new Date(epochSeconds * 1000).toISOString().slice(0, 10);
+  const since = day(s.masterConfirmedAt);
+  const passes = day(s.masterConfirmedAt + EDIT_LOG_RETENTION_SECONDS);
+  if (s.resource === "tq") {
+    return (
+      `Benjamin — ${s.book} TQ's export to Door43 hasn't been confirmed since ${since}. ` +
+      `The edit history cleanup (180 days) will start removing ${s.book} TQ history behind that point on ${passes}. ` +
+      `After that, the nightly Door43 sync can lose track of where a TQ row started, and Door43's older text ` +
+      `could replace a newer edit made in Bible Editor without any warning (see issues #1461 and #1467). ` +
+      `Nothing has been lost yet — this is early warning. Find out why ${s.book} TQ's export stopped ` +
+      `(for example a stuck -be- branch or a failing export) and unblock it.`
+    );
+  }
+  if (s.resource === "twl") {
+    return (
+      `Benjamin — ${s.book} TWL's export to Door43 hasn't been confirmed since ${since}, so the export may be stuck. ` +
+      `The edit history cleanup (180 days) will start removing ${s.book} TWL history behind that point on ${passes}, ` +
+      `after which the nightly Door43 sync has less history to protect newer edits made in Bible Editor (see issue #1467). ` +
+      `Nothing has been lost yet — this is early warning. Find out why ${s.book} TWL's export stopped ` +
+      `(for example a stuck -be- branch or a failing export) and unblock it.`
+    );
+  }
   return (
     `Benjamin — ${s.book} ${res}'s master-confirmed export watermark hasn't advanced since ` +
     `${day(s.masterConfirmedAt)}. ` +
@@ -588,9 +638,13 @@ function boundaryMessage(s: StaleSweepBoundary): string {
 //
 // Best-effort, like every other alert helper in this codebase: a failure
 // here must never break the caller's cron tick.
-export async function raiseEditLogSweepBoundaryAlerts(env: Env, now: number = Math.floor(Date.now() / 1000)): Promise<void> {
+export async function raiseEditLogSweepBoundaryAlerts(
+  env: Env,
+  now: number = Math.floor(Date.now() / 1000),
+  publishedBooks: Iterable<string>,
+): Promise<void> {
   try {
-    const stale = await findStaleSweepBoundaries(env, now);
+    const stale = await findStaleSweepBoundaries(env, now, publishedBooks);
     const desired = new Map<string, string>(stale.map((s) => [alarmSource(s.book, s.resource), boundaryMessage(s)]));
 
     const existingRs = await env.DB.prepare(
@@ -690,7 +744,7 @@ export async function raiseEditLogSweepBoundaryAlerts(env: Env, now: number = Ma
       );
       bySource.set(source, group);
     }
-    // Small by construction (bounded by book x {ult,ust}, well under 200
+    // Small by construction (bounded by book x {ult,ust,tq,twl}, a few hundred
     // possible sources total, and only the changed subset lands here), but pack
     // into <=90-statement batches anyway — never splitting a source's group —
     // so a partial failure leaves each not-yet-committed source's existing alert
