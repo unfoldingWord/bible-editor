@@ -619,6 +619,12 @@ Highlights that bite repeatedly:
     row, so comparing D1 to it reads as "we changed it" and the next export reverts it.
     D1's render is stored beside the pushed one (`<r2Key>.d1-render`, R2 metadata ties
     it to the pushed sha).
+    The marker's id lists say which rows are off the branch only until a later commit
+    of the same instance replaces it: `droppedids` are the drops of the push named by
+    `pushedsha`, `committedids` the drops of the instance's last commit. Every commit
+    must rewrite them (one that wrote no marker shipped D1's whole render, so it clears
+    both). A retry trusts `droppedids` only when `pushedsha` is the recorded push, and
+    otherwise `committedids` on the same base push (#1452, #1455, #1463).
     ULT/UST verses follow the same rule since #1412 (`planKeepMasterVerses`). A verse is
     swapped by splicing master's own bytes from its `\v` to the next `\v`/`\c`, not by
     re-rendering through usfm-js: a re-render rewrites the 16-19% of verses that do not
