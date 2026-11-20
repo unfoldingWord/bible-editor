@@ -262,6 +262,9 @@ export interface SourceAncestor {
   content: string;     // raw, for display in tooltips
   occurrence: number;
   key: HighlightKey;   // matchNorm-normalized, for selection set lookups
+  // The milestone's x-ref ("9:12") inside a bridged target row, when tCore
+  // named the source verse. Absent on ordinary rows and older bridges (#1432).
+  ref?: string;
 }
 
 // Per-token shape returned by collectTargetTokens. Outer-to-inner ancestor
@@ -287,6 +290,7 @@ interface MilestoneRecord {
   content: string;
   clamped: number;
   occurrence: number;
+  ref?: string;
 }
 
 // Walk a ULT/UST verseObjects tree. For each \w token, capture its
@@ -366,6 +370,7 @@ export function collectTargetTokens(
         const clamped = Math.min(Math.max(rawOcc, 1), Math.max(total, 1));
         // `occurrence` is a placeholder until the resolve pass below.
         const record: MilestoneRecord = { content, clamped, occurrence: clamped };
+        if (ref !== undefined) record.ref = ref;
         milestones.push(record);
         // Skip ancestors with no content — defensive: a malformed milestone
         // without x-content would otherwise insert empty selection keys. It
@@ -435,6 +440,7 @@ export function collectTargetTokens(
       content: m.content,
       occurrence: m.occurrence,
       key: tokenKey(m.content, m.occurrence),
+      ...(m.ref !== undefined ? { ref: m.ref } : {}),
     })),
   }));
 }

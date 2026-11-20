@@ -246,6 +246,9 @@ interface Props {
   // Article ids the unlinked deny-list blocks for a suggestion's resolved quote
   // — pruned from its picker; the whole suggestion hides when all are blocked.
   twlBlockedArticleIds?: (suggestion: TwlSuggestion, verse: number, candidateIds?: string[]) => Set<string>;
+  // Moves each fetched suggestion to the verse its English is aligned in, for a
+  // bridged ULT row with x-ref (#1432). Stable identity.
+  regroupTwlSuggestions?: (groups: TwlVerseSuggestions[]) => TwlVerseSuggestions[];
   // Whether the TWL deny-lists have settled (loaded or failed). Suggestions hold
   // off rendering until then so a blocked link can't show before filters arrive.
   twlFiltersReady?: boolean;
@@ -440,6 +443,7 @@ export function ResourceColumn({
   onTwlSuggestions,
   twlRowAlternatives,
   twlBlockedArticleIds,
+  regroupTwlSuggestions,
   twlFiltersReady,
   quoteBuildAppliedTo,
   panelMode = "resources",
@@ -1160,6 +1164,7 @@ export function ResourceColumn({
                   isExcluded={isTwlSuggestionExcluded}
                   onSuggestions={onTwlSuggestions}
                   blockedArticleIds={twlBlockedArticleIds}
+                  regroup={regroupTwlSuggestions}
                   filtersReady={twlFiltersReady}
                   paused={!!checkoff && checkoff.applicable("tw") && checkoff.shade("tw") !== "open"}
                 />

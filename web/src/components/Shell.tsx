@@ -80,7 +80,7 @@ import {
   verseScopedKey,
   type QuoteBuildSegment,
 } from "../lib/quoteBuilder";
-import { resolveSpanToSource } from "../lib/twlResolve";
+import { regroupTwlSuggestionsByXref, resolveSpanToSource } from "../lib/twlResolve";
 import { canonicalTwlOrder, manualTwlOrder } from "../lib/twlCanonicalOrder";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { nfc } from "../lib/hebrew";
@@ -2906,6 +2906,21 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     [data, verseIndexByVersion, twlFilters],
   );
 
+  // The suggest route reads a bridged ULT row only under its start verse, so
+  // all of a bridge's suggestions arrive there. Move each to the verse its
+  // English is aligned in (x-ref), so it shows, resolves and is added there
+  // (#1432). Bridges without x-ref and ordinary verses come back unchanged.
+  const regroupTwlSuggestions = useCallback(
+    (groups: TwlVerseSuggestions[]): TwlVerseSuggestions[] =>
+      regroupTwlSuggestionsByXref(groups, chapter, (verse) => {
+        const dto = verseIndexByVersion["ULT"]?.[verse];
+        if (!dto || !isRangeRow(dto)) return undefined;
+        const vo = (dto.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+        return Array.isArray(vo) ? vo : undefined;
+      }),
+    [chapter, verseIndexByVersion],
+  );
+
   // Routes any verse / version / aligner-target change through the dirty
   // gate when the alignment panel has unsaved drags. Plain wrapper around
   // setState if the gate is clear; otherwise queues for the popup.
@@ -5577,6 +5592,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           onTwlSuggestions={setVerseTwlSuggestions}
           twlRowAlternatives={twlRowAlternatives}
           twlBlockedArticleIds={twlBlockedArticleIds}
+          regroupTwlSuggestions={regroupTwlSuggestions}
           twlFiltersReady={twlFilters.settled}
           panelMode={panelMode}
           onSetPanelMode={handleSetPanelMode}

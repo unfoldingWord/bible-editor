@@ -4,7 +4,7 @@
 // union, unaligned words, and unmatched spans.
 
 import assert from "node:assert/strict";
-import { resolveSpanToSource } from "./twlResolve.ts";
+import { regroupTwlSuggestionsByXref, resolveSpanToSource } from "./twlResolve.ts";
 import { nfc } from "./hebrew.ts";
 import usfm from "usfm-js";
 import { readFileSync } from "node:fs";
@@ -184,6 +184,98 @@ const ult = [
     JSON.stringify(scoped) === JSON.stringify(unscoped) && scoped !== null,
     `no x-ref: sourceRef changes nothing (got ${JSON.stringify(scoped)} vs ${JSON.stringify(unscoped)})`,
   );
+}
+
+// --- suggestions for a bridged ULT row land on their own verse (#1432) ------
+// The suggest route stores a bridge once, under its start verse, so every
+// suggestion for 9:10-12 arrives in the 9:10 group (9:11 and 9:12 get none).
+// With x-ref, each one moves to the verse its English is aligned in, and then
+// resolves against that verse's Hebrew. glOccurrence stays counted over the
+// whole row. Bridges without x-ref and ordinary verses stay as fetched.
+{
+  console.log("\n[x-ref] bridged suggestions regrouped per verse");
+  const here = dirname(fileURLToPath(import.meta.url));
+  const samples = resolve(here, "../../../docs/samples");
+  const ustRaw = readFileSync(resolve(samples, "en_ust_14-2CH-9_10-12.usfm"), "utf8");
+  const uhbJson = usfm.toJSON(readFileSync(resolve(samples, "hbo_uhb_14-2CH-9_10-12.usfm"), "utf8"));
+  const uhbOf = (v) => uhbJson.chapters["9"][String(v)].verseObjects;
+  const bridge = usfm.toJSON(ustRaw).chapters["9"]["10-12"].verseObjects;
+
+  const sug = (matchedText, glOccurrence) => ({ matchedText, glOccurrence, articleId: "x/y" });
+  // What the route returns today: everything under 9:10, nothing for 11/12.
+  const fetched = () => [
+    {
+      verse: 10,
+      suggestions: [
+        sug("Jerusalem", 1),
+        sug("King Solomon", 1),
+        sug("gold", 1),
+        sug("King Solomon", 2),
+        sug("sandalwood", 1),
+        sug("King Solomon", 3),
+        sug("temple", 1),
+        sug("sandalwood", 2),
+        sug("not in this verse", 1),
+      ],
+    },
+    { verse: 11, suggestions: [] },
+    { verse: 12, suggestions: [] },
+  ];
+  const names = (g) => g.suggestions.map((s) => `${s.matchedText}#${s.glOccurrence}`);
+  const byVerse = (groups) => Object.fromEntries(groups.map((g) => [g.verse, names(g)]));
+
+  const moved = regroupTwlSuggestionsByXref(fetched(), 9, (v) => (v >= 10 && v <= 12 ? bridge : undefined));
+  check(
+    JSON.stringify(moved.map((g) => g.verse)) === "[10,11,12]",
+    `groups keep their verses in order (got ${JSON.stringify(moved.map((g) => g.verse))})`,
+  );
+  check(
+    JSON.stringify(byVerse(moved)) ===
+      JSON.stringify({
+        10: ["gold#1", "King Solomon#2", "sandalwood#1", "not in this verse#1"],
+        11: ["King Solomon#3", "temple#1", "sandalwood#2"],
+        12: ["Jerusalem#1", "King Solomon#1"],
+      }),
+    `each suggestion sits under its x-ref verse (got ${JSON.stringify(byVerse(moved))})`,
+  );
+
+  // Every moved suggestion resolves against its new verse's Hebrew.
+  const resolvedIn = (verse, text, occ) => {
+    const g = moved.find((x) => x.verse === verse);
+    const s = g.suggestions.find((x) => x.matchedText === text && x.glOccurrence === occ);
+    return s ? resolveSpanToSource(bridge, uhbOf(verse), s.matchedText, s.glOccurrence, `9:${verse}`) : null;
+  };
+  const jer = resolvedIn(12, "Jerusalem", 1);
+  check(
+    jer && jer.orig_words && jer.confident,
+    `9:12's "Jerusalem" resolves to 9:12's Hebrew (got ${JSON.stringify(jer)})`,
+  );
+  const ks12 = resolvedIn(12, "King Solomon", 1);
+  const ks10 = resolvedIn(10, "King Solomon", 2);
+  const ks11 = resolvedIn(11, "King Solomon", 3);
+  check(
+    ks12?.confident && ks10?.confident && ks11?.confident,
+    `"King Solomon" 1/2/3 each resolve in 9:12/9:10/9:11 (got ${JSON.stringify([ks12, ks10, ks11])})`,
+  );
+  const gold = resolvedIn(10, "gold", 1);
+  check(
+    gold && nfc(gold.orig_words) === nfc("זָהָ֖ב") && gold.confident,
+    `9:10's "gold" still resolves to 9:10's זָהָב (got ${JSON.stringify(gold)})`,
+  );
+  const temple = resolvedIn(11, "temple", 1);
+  check(temple && temple.confident, `9:11's "temple" resolves in 9:11 (got ${JSON.stringify(temple)})`);
+
+  // No x-ref: nothing can say which verse a word is, so the list is unchanged.
+  const legacy = usfm.toJSON(ustRaw.replace(/ x-ref="[^"]*"/g, "")).chapters["9"]["10-12"].verseObjects;
+  const kept = regroupTwlSuggestionsByXref(fetched(), 9, (v) => (v >= 10 && v <= 12 ? legacy : undefined));
+  check(
+    JSON.stringify(kept) === JSON.stringify(fetched()),
+    `no x-ref: groups unchanged (got ${JSON.stringify(byVerse(kept))})`,
+  );
+  // Not a bridge: the caller has no bridged ULT for the verse, so nothing moves.
+  const plain = fetched();
+  const same = regroupTwlSuggestionsByXref(plain, 9, () => undefined);
+  check(same === plain, "ordinary verses: the same groups come back untouched");
 }
 
 console.log(`twlResolve: ${passed} assertions passed`);
