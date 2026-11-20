@@ -594,6 +594,16 @@ console.log("\n[15c. the same loss when the Door43 commit fails → the step fai
     !align.some((a) => /shipped|is on Door43/.test(a.message)),
     `no alert says the book shipped (${align.map((a) => a.message).join(" | ")})`,
   );
+
+  console.log("\n[15d. the step.do retry of that night, with Door43 back, ships and records the shipped banner]");
+  d.commitFails = false;
+  const r = await t.exportOne("export-night-1");
+  ok(d.writes.length === 1 && r.dcsSkippedReason == null, `the retry ships (got ${r.dcsSkippedReason}, writes ${d.writes.length})`);
+  const after = t.live(`export_align_shrink:${BOOK}:ult`);
+  ok(
+    after.length === 1 && after[0].message.includes("shipped to Door43, but with alignment to fix"),
+    `the alert says it shipped with alignment to fix (${after[0]?.message})`,
+  );
 }
 
 if (failed > 0) {
