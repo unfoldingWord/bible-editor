@@ -115,6 +115,19 @@ export function tsvMergeFields(kind: TsvMergeKind): TsvMergeField[] {
   return FIELDS_BY_KIND[kind];
 }
 
+// The edit_log 'create' payload for a row the app's POST creates (#1458). The
+// INSERT writes only the columns the client sent, so every other merged field
+// lands as the column default NULL. Logging just the client's keys left those
+// fields out of the ancestor foldTsvBase rebuilds, so a field first set after
+// the export read as no_base even with master unchanged (a spurious
+// merge_no_base flag). Naming each merged field with an explicit null records
+// what the INSERT actually wrote; supplied values (snake_case, as the create
+// schema parses them) win.
+export function createLogPayload(kind: TsvMergeKind, data: Record<string, unknown>): Record<string, unknown> {
+  const nulls = Object.fromEntries(FIELDS_BY_KIND[kind].map((f) => [f, null]));
+  return { ...nulls, ...data };
+}
+
 // Did a Door43 maintainer re-anchor this row to a different Reference on master
 // (same id, new ref_raw)? Identity/reference columns are deliberately EXCLUDED
 // from computeTsvMerge (see FIELDS_BY_KIND above), so a pure move is INVISIBLE

@@ -14,6 +14,7 @@ import {
   advanceTsvBaseThroughSyncWrites,
   classifyTsvRefMove,
   computeTsvMerge,
+  createLogPayload,
   detectTornTsvRef,
   foldTsvBase,
   foldTsvRefBase,
@@ -1118,6 +1119,55 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
   ]);
   eq(ref.ref_raw, "1:3", "#1255: foldTsvRefBase reads the same repair shape (ref_raw)");
   eq(ref.verse, 3, "#1255: …and verse");
+}
+
+// #1458: the app's create edit_log payload names every merged field, with an
+// explicit null for one the client did not send (the INSERT leaves it NULL).
+// Without that, a field first set after the export has no ancestor, and an
+// unchanged master reads as no_base (a spurious merge_no_base flag).
+{
+  for (const kind of ["tn", "tq", "twl"]) {
+    const p = createLogPayload(kind, { book: "EZK", chapter: 1, verse: 2, ref_raw: "1:2" });
+    for (const f of tsvMergeFields(kind)) {
+      eq(f in p && p[f] === null, true, `#1458: ${kind} create payload carries ${f} as explicit null`);
+    }
+    eq(p.book, "EZK", `#1458: ${kind} create payload keeps the supplied keys`);
+  }
+  const supplied = createLogPayload("tn", { book: "EZK", chapter: 1, verse: 2, ref_raw: "1:2", note: "n", quote: null, tags: "t" });
+  eq(supplied.note, "n", "#1458: a supplied value wins over the null default");
+  eq(supplied.quote, null, "#1458: a supplied explicit null stays null");
+  eq(supplied.tags, "t", "#1458: a non-merged supplied field is still logged");
+  eq("supportReference" in supplied, false, "#1458: only the snake_case spelling is logged");
+  deep(Object.keys(createLogPayload("tq", { book: "EZK", question: "q" })).sort(), ["book", "question", "quote", "response"], "#1458: no keys beyond the supplied ones and the merged fields");
+
+  // The issue's scenario: created in-app with only note + quote, exported (master
+  // has a blank SupportReference), then support_reference set in-app. Master
+  // never moved, so the ancestor must attribute the difference to us.
+  const sent = { book: "EZK", chapter: 1, verse: 2, ref_raw: "1:2", note: "n", quote: "q" };
+  const ours = { quote: "q", note: "n", support_reference: "rc://*/ta/man/translate/figs-metaphor" };
+  const theirs = { quote: "q", note: "n", support_reference: "" };
+  const oldBase = foldTsvBase("tn", [{ action: "create", payload: sent, bookKnown: true }]);
+  eq(computeTsvMerge("tn", oldBase, ours, theirs).reason, "no_base", "#1458 baseline: the old create shape leaves support_reference without an ancestor");
+  const newBase = foldTsvBase("tn", [{ action: "create", payload: createLogPayload("tn", sent), bookKnown: true }]);
+  eq(computeTsvMerge("tn", newBase, ours, theirs).action, "keep_master_unchanged", "#1458: explicit-null create payload -> keep_master_unchanged");
+  eq(computeTsvMerge("tn", newBase, ours, { ...theirs, support_reference: null }).action, "keep_master_unchanged", "#1458: …also when master's blank reads as null");
+  // Master did move the field (a maintainer set it) while D1 never did -> adopt.
+  const r = computeTsvMerge("tn", newBase, { quote: "q", note: "n", support_reference: null }, { ...theirs, support_reference: "rc://*/ta/man/translate/figs-simile" });
+  eq(r.adopt, true, "#1458: a master-only set of a field the create left null is adopted");
+
+  // The logged null ancestor behaves exactly like the "" the app's tq/twl
+  // creates already send for their other fields (Shell.tsx), across every fate.
+  const tqSent = { book: "EZK", chapter: 1, verse: 2, ref_raw: "1:2", question: "", response: "" };
+  const nullBase = foldTsvBase("tq", [{ action: "create", payload: createLogPayload("tq", tqSent), bookKnown: true }]);
+  const blankBase = foldTsvBase("tq", [{ action: "create", payload: { ...tqSent, quote: "" }, bookKnown: true }]);
+  for (const [o, t] of [["a", ""], ["", "b"], ["a", "b"], ["a", "a"]]) {
+    const side = (quote) => ({ quote, question: "q", response: "r" });
+    eq(
+      JSON.stringify(computeTsvMerge("tq", nullBase, side(o), side(t))),
+      JSON.stringify(computeTsvMerge("tq", blankBase, side(o), side(t))),
+      `#1458: tq quote null ancestor == "" ancestor (ours ${JSON.stringify(o)}, master ${JSON.stringify(t)})`,
+    );
+  }
 }
 
 if (failed) {

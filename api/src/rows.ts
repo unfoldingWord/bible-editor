@@ -25,6 +25,7 @@ import { isValidChapterZeroRef } from "./chapterZeroGuard";
 import { normalizeBookCode, CHAPTER_EXISTS_SQL } from "./rowsCreateGuard";
 import { isValidTwlRefRaw } from "./twlRefGuard";
 import { boundHistoryToLastCreate } from "./rowHistoryBoundary";
+import { createLogPayload } from "./tsvMerge";
 import {
   PROVENANCE_COLUMNS,
   provenanceSet,
@@ -425,7 +426,7 @@ rows.post("/:kind", requireEditor, async (c) => {
           .prepare(
             `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json) VALUES (?1, ?2, ?3, ?4, NULL, 1, 'create', ?5)`,
           )
-          .bind(kind, id, data.book, userId, JSON.stringify(data)),
+          .bind(kind, id, data.book, userId, JSON.stringify(createLogPayload(kind, data))),
       ]);
       created = (insertRes.results?.[0] as Record<string, unknown> | undefined) ?? null;
       lastErr = null;
