@@ -37,7 +37,7 @@ registerHooks({
   },
 });
 
-const { ExportWorkflow } = await import("./exportWorkflow.ts");
+const { ExportWorkflow, stepFailureSummary } = await import("./exportWorkflow.ts");
 const { extractVersesForRange } = await import("./importParsers.ts");
 const EXPORT_ALERT_USERNAME = "deferredreward"; // module-private in exportWorkflow.ts
 
@@ -177,7 +177,41 @@ function freshEnv(door43File = DOOR43_OBA) {
       .prepare(`UPDATE verses SET content_json = ?, version = version + 1 WHERE book = ? AND chapter = 1 AND verse = ?`)
       .run(next, BOOK, verse);
   };
-  return { sqlite, env, r2, exportOne, live, reverts, render, editD1 };
+  // The export as the Workflow runs it: one retried step per (book, resource),
+  // whose failure after the retries is caught and recorded (#1450).
+  const exportStep = (step, instanceId, dcsAllowed = true) =>
+    wf.runExportStep(step, BOOK, "ult", () => exportOne(instanceId, dcsAllowed));
+  // Nights are hours apart, but these runs fall in the same second, and the
+  // export_step_failed clear removes only rows from a second strictly before
+  // its start (#1450). Back-dating the alerts by a minute stands in for the
+  // time between two nights.
+  const nightPasses = () => sqlite.prepare(`UPDATE system_alerts SET created_at = created_at - 60`).run();
+  return { sqlite, env, r2, wf, exportOne, exportStep, nightPasses, live, reverts, render, editD1 };
+}
+
+// A WorkflowStep stand-in that honours `retries.limit` the way Cloudflare
+// does (1 + limit attempts, then the last error is thrown), without sleeping
+// the retry delay. `attempts` counts calls per step name.
+function retryingStep() {
+  const attempts = {};
+  return {
+    attempts,
+    async do(name, optsOrFn, maybeFn) {
+      const fn = typeof optsOrFn === "function" ? optsOrFn : maybeFn;
+      const limit = typeof optsOrFn === "function" ? 0 : (optsOrFn?.retries?.limit ?? 0);
+      let last;
+      for (let i = 0; i <= limit; i++) {
+        attempts[name] = (attempts[name] ?? 0) + 1;
+        try {
+          const out = await fn();
+          return out === undefined ? out : JSON.parse(JSON.stringify(out));
+        } catch (e) {
+          last = e;
+        }
+      }
+      throw last;
+    },
+  };
 }
 
 // The text of one verse in a USFM file: its `\v` marker to the next `\v`/`\c`.
@@ -604,6 +638,184 @@ console.log("\n[15c. the same loss when the Door43 commit fails → the step fai
     after.length === 1 && after[0].message.includes("shipped to Door43, but with alignment to fix"),
     `the alert says it shipped with alignment to fix (${after[0]?.message})`,
   );
+}
+
+console.log("\n[16. Door43 rejects every write → after the retries an export_step_failed alert names the error (#1450)]");
+{
+  const d = door43();
+  const t = freshEnv();
+  d.master = DOOR43_OBA;
+  d.commitFails = true;
+  const failSource = `export_step_failed:${BOOK}:ult`;
+  const step = retryingStep();
+  const r = await t.exportStep(step, "export-night-1");
+  ok(step.attempts[`export-${BOOK}-ult`] === 4, `the step ran 1 + 3 retries (got ${step.attempts[`export-${BOOK}-ult`]})`);
+  ok(String(r.dcsSkippedReason).startsWith("error:dcs_commit_failed"), `the result is the recorded error (got ${r.dcsSkippedReason})`);
+  ok(d.writes.length === 0, "nothing committed");
+  const failed1 = t.live(failSource);
+  ok(
+    failed1.length === 1 && failed1[0].message.includes("dcs_commit_failed: POST 500."),
+    `one export_step_failed alert carries the error code and status (${failed1.map((a) => a.message).join(" | ")})`,
+  );
+  ok(!failed1[0]?.message.includes("boom"), "the alert leaves out Door43's response body");
+  ok(!/night/.test(failed1[0]?.message ?? ""), "the wording names no night (it fires on manual runs too)");
+
+  console.log("\n[16b. a dry run the next night does not reach Door43 → the alert stays]");
+  const dry = await t.exportStep(retryingStep(), "dry-night-2", false);
+  ok(dry.dcsSkippedReason === "dry_run", `(setup: a dry run, got ${dry.dcsSkippedReason})`);
+  ok(t.live(failSource).length === 1, "the alert is still up");
+
+  console.log("\n[16c. the next night Door43 accepts the write → the alert clears]");
+  d.commitFails = false;
+  t.nightPasses();
+  const r2 = await t.exportStep(retryingStep(), "export-night-3");
+  ok(d.writes.length === 1 && r2.dcsSkippedReason == null, `the export ships (got ${r2.dcsSkippedReason}, writes ${d.writes.length})`);
+  ok(t.live(failSource).length === 0, "the export_step_failed alert is gone");
+}
+
+console.log("\n[16e. after a failed night, Door43 already matching D1's render (`unchanged`) also clears the alert]");
+{
+  const d = door43();
+  const t = freshEnv();
+  d.master = DOOR43_OBA;
+  d.commitFails = true;
+  await t.exportStep(retryingStep(), "export-night-1");
+  ok(t.live(`export_step_failed:${BOOK}:ult`).length === 1, "(setup: the failed night raised the alert)");
+  d.commitFails = false;
+  d.master = await t.render("n2");
+  t.nightPasses();
+  const r = await t.exportStep(retryingStep(), "export-night-2");
+  ok(r.dcsSkippedReason === "unchanged", `(setup: unchanged, got ${r.dcsSkippedReason})`);
+  ok(t.live(`export_step_failed:${BOOK}:ult`).length === 0, "the export_step_failed alert is gone");
+}
+
+console.log("\n[16f. a dismissed failure, a clean night, then the same failure again → a live alert]");
+{
+  const d = door43();
+  const t = freshEnv();
+  const failSource = `export_step_failed:${BOOK}:ult`;
+  const dismiss = () =>
+    t.sqlite.prepare(`UPDATE system_alerts SET dismissed_at = unixepoch() WHERE source = ? AND dismissed_at IS NULL`).run(failSource);
+  d.master = DOOR43_OBA;
+  d.commitFails = true;
+  const dismissedReason = (await t.exportStep(retryingStep(), "export-night-1")).dcsSkippedReason;
+  dismiss();
+  ok(t.live(failSource).length === 0, "(setup: dismissed)");
+
+  console.log("\n[16g. still failing with the same error → it stays dismissed (#458)]");
+  await t.exportStep(retryingStep(), "export-night-2");
+  ok(t.live(failSource).length === 0, "the dismissed alert does not come back");
+
+  // A clean night that writes nothing (`unchanged`), so the next failure
+  // makes the same create call and carries the identical message.
+  d.commitFails = false;
+  d.master = await t.render("n3");
+  t.nightPasses();
+  const clean = await t.exportStep(retryingStep(), "export-night-3");
+  ok(clean.dcsSkippedReason === "unchanged", `(setup: a clean night, got ${clean.dcsSkippedReason})`);
+  t.editD1(3, "pride", "arrogance");
+  d.commitFails = true;
+  const again = await t.exportStep(retryingStep(), "export-night-4");
+  ok(again.dcsSkippedReason === dismissedReason, `(setup: the same error again, got ${again.dcsSkippedReason})`);
+  ok(t.live(failSource).length === 1, `the new failure is a live alert (got ${t.live(failSource).length})`);
+}
+
+console.log("\n[16h. a locked book does not clear the alert; a branchName override run that reaches Door43 does]");
+{
+  const d = door43();
+  const t = freshEnv();
+  const failSource = `export_step_failed:${BOOK}:ult`;
+  d.master = DOOR43_OBA;
+  d.commitFails = true;
+  await t.exportStep(retryingStep(), "export-night-1");
+  d.commitFails = false;
+  const locked = await t.wf.runExportStep(retryingStep(), BOOK, "ult", () =>
+    t.wf.exportOne(BOOK, "ult", "export-night-2", true, false, new Set([BOOK]), false),
+  );
+  ok(locked.dcsSkippedReason != null && d.writes.length === 0, `(setup: the lock skips, got ${locked.dcsSkippedReason})`);
+  ok(t.live(failSource).length === 1, "the lock skip leaves the alert up");
+  t.nightPasses();
+  const override = await t.wf.runExportStep(retryingStep(), BOOK, "ult", () =>
+    t.wf.exportOne(BOOK, "ult", "export-night-3", true, false, new Set(), false, "admin-fix"),
+  );
+  ok(
+    override.dcsSkippedReason == null && d.writes.length === 1 && override.branch === "admin-fix",
+    `(setup: the override run ships to its branch, got ${override.dcsSkippedReason} on ${override.branch})`,
+  );
+  ok(t.live(failSource).length === 0, "the override run that reached Door43 clears the alert");
+}
+
+console.log("\n[16i. a failure an overlapping run writes after a clean run started survives that run's clear]");
+{
+  const d = door43();
+  const t = freshEnv();
+  const failSource = `export_step_failed:${BOOK}:ult`;
+  const insertFailure = (createdAt, message) =>
+    t.sqlite
+      .prepare(`INSERT INTO system_alerts (username, severity, source, message, link_url, created_at) VALUES (?, 'error', ?, ?, '', ?)`)
+      .run(EXPORT_ALERT_USERNAME, failSource, message, createdAt);
+  const now = () => Math.floor(Date.now() / 1000);
+  insertFailure(now() - 60, "older failure");
+  d.master = DOOR43_OBA;
+  // runExportStep reads Date.now() first thing in the step attempt; record
+  // that reading so the same-second row below matches its start exactly.
+  const realNow = Date.now;
+  let startedAt = null;
+  Date.now = () => {
+    const v = realNow();
+    if (startedAt == null) startedAt = Math.floor(v / 1000);
+    return v;
+  };
+  let r;
+  try {
+    r = await t.wf.runExportStep(retryingStep(), BOOK, "ult", async () => {
+      const out = await t.exportOne("export-night-1");
+      // The other run's failures land while this one is still in its step:
+      // one in the very second this attempt started, one a minute later.
+      insertFailure(startedAt, "same-second failure");
+      insertFailure(startedAt + 60, "newer failure");
+      return out;
+    });
+  } finally {
+    Date.now = realNow;
+  }
+  ok(r.dcsSkippedReason == null, `(setup: the clean run ships, got ${r.dcsSkippedReason})`);
+  const left = t.live(failSource).map((a) => a.message).sort();
+  ok(
+    left.length === 2 && left[0] === "newer failure" && left[1] === "same-second failure",
+    `the older failure is gone; the same-second and newer failures stay (${left.join(" | ")})`,
+  );
+}
+
+console.log("\n[16j. stepFailureSummary keeps the stable code and status, not the body]");
+{
+  ok(stepFailureSummary("dcs_commit_failed: POST 500 <html>oops</html>") === "dcs_commit_failed: POST 500", "commit error → code + method + status");
+  ok(stepFailureSummary("dcs_branch_get_failed: 404 not found") === "dcs_branch_get_failed: 404", "status-only error → code + status");
+  ok(stepFailureSummary("dcs_commit_failed: POST 500.") === "dcs_commit_failed: POST 500", "trailing punctuation after the status");
+  ok(stepFailureSummary("dcs_commit_failed: POST 5001 x") === "dcs_commit_failed: POST 5001 x", "a longer number is not read as a status");
+  ok(stepFailureSummary("dcs_branch_not_visible: OBA-be-x") === "dcs_branch_not_visible: OBA-be-x", "uncoded error keeps its first line");
+  ok(stepFailureSummary("x".repeat(500) + "\nmore").length === 160, "an uncoded error is capped at 160 characters, first line only");
+}
+
+console.log("\n[16d. Door43 fails once, then the step's own retry ships → no alert]");
+{
+  const d = door43();
+  const t = freshEnv();
+  d.master = DOOR43_OBA;
+  const realFetch = globalThis.fetch;
+  let failOnce = true;
+  globalThis.fetch = async (input, init = {}) => {
+    if ((init.method ?? "GET").toUpperCase() !== "GET" && String(input).includes(`/contents/${FILE}`) && failOnce) {
+      failOnce = false;
+      return new Response("boom", { status: 500 });
+    }
+    return realFetch(input, init);
+  };
+  const step = retryingStep();
+  const r = await t.exportStep(step, "export-night-1");
+  ok(step.attempts[`export-${BOOK}-ult`] === 2, `(setup: one retry, got ${step.attempts[`export-${BOOK}-ult`]})`);
+  ok(d.writes.length === 1 && r.dcsSkippedReason == null, `the retry ships (got ${r.dcsSkippedReason})`);
+  ok(t.live(`export_step_failed:${BOOK}:ult`).length === 0, "no export_step_failed alert");
 }
 
 if (failed > 0) {

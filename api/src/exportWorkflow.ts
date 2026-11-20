@@ -302,6 +302,18 @@ export interface StepResult {
   prReason: string | null;
 }
 
+// #1450: the stable part of an export step error, for the alert message. The
+// DCS helpers throw `code: [METHOD ]status <response body>`; the body is
+// Gitea's raw text (sometimes HTML) and can change from night to night, which
+// would defeat writeAlert's "a dismissed identical message stays dismissed"
+// rule (#458). So a `code: [METHOD ]status` prefix is kept alone; any other
+// error keeps its first line, capped.
+export function stepFailureSummary(reason: string): string {
+  const coded = /^([a-z][a-z0-9_]*): ((?:[A-Z]+ )?\d{3})\b/.exec(reason);
+  if (coded) return `${coded[1]}: ${coded[2]}`;
+  return reason.split("\n")[0].slice(0, 160);
+}
+
 const isResource = (s: string): s is Resource => (ALL_RESOURCES as string[]).includes(s);
 
 export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
@@ -374,6 +386,82 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         }),
       );
       throw error;
+    }
+  }
+
+  // One (book, resource) export as its own retried step. A failure after the
+  // retries never throws out of here: it is recorded and returned as an
+  // `error:` result so the run goes on to the next pair.
+  //
+  // #1450: that failure also raises an `export_step_failed:{book}:{resource}`
+  // alert, so a Door43 commit failure shows in the app and not only in logs
+  // and snapshots. It clears only when a later step reached Door43 and came
+  // back clean: it shipped (no skip reason) or found Door43 already matching
+  // (`unchanged`, decided after the commit call). A guard skip, a lock skip
+  // or a dry run returns before the Door43 write, so it did not re-measure the
+  // failure and leaves the alert up. The alert is about Door43 writes
+  // failing, not about which branch they went to, so a branchName override
+  // run that reaches Door43 cleanly clears it too. The clear removes only rows
+  // written in a whole second before this attempt started: a failure an
+  // overlapping run wrote after that, or in that same second (created_at has
+  // one-second resolution, so the order is unknown), stays until the next
+  // clean run.
+  // Both the clear and the write sit inside steps that already exist, so the
+  // run spends no extra steps.
+  private async runExportStep(
+    step: WorkflowStep,
+    book: string,
+    resource: Resource,
+    exportPair: () => Promise<StepResult>,
+  ): Promise<StepResult> {
+    const stepName = `export-${book}-${resource}`;
+    const failSource = `export_step_failed:${book}:${resource}`;
+    try {
+      return await step.do(
+        stepName,
+        { retries: { limit: 3, delay: "5 seconds", backoff: "exponential" } },
+        async () => {
+          // system_alerts.created_at is unixepoch() seconds.
+          const startedAt = Math.floor(Date.now() / 1000);
+          const result = await exportPair();
+          const reachedDoor43 = result.dcsSkippedReason == null || result.dcsSkippedReason === "unchanged";
+          if (reachedDoor43) await this.endStepFailureEpisode(failSource, startedAt);
+          return result;
+        },
+      );
+    } catch (e) {
+      // A single (book, resource) failure — most commonly a corrupt/dangling
+      // DCS branch ref that ensureBranchVisible can't heal — must not abort
+      // the whole instance and starve every other book (the resource-major
+      // loop means one bad branch on the first book would otherwise block
+      // all later books AND all later resources). Log, record the failure as
+      // a snapshot for observability, and continue. Same isolation shape as
+      // the pre-export reimport loop above.
+      const reason = e instanceof Error ? e.message : String(e);
+      console.error("export step failed", { book, resource, error: reason });
+      try {
+        await step.do(`${stepName}-record-fail`, async () => {
+          // writeAlert never throws, so it goes first: a snapshot failure
+          // must not cost the alert.
+          await this.recordStepFailureAlert(book, resource, reason);
+          return this.recordSnapshot(book, resource, null, null, 0, `error:${reason.slice(0, 180)}`);
+        });
+      } catch {
+        /* recording the failure is best-effort; never let it abort the run */
+      }
+      return {
+        book,
+        resource,
+        rowCount: 0,
+        bytes: 0,
+        r2Key: null,
+        branch: null,
+        dcsCommitSha: null,
+        dcsChanged: false,
+        dcsSkippedReason: `error:${reason.slice(0, 180)}`,
+        prNumber: null,
+        prReason: null,
+      };
     }
   }
 
@@ -730,58 +818,20 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     for (const resource of resources) {
       for (const book of books) {
         const stepName = `export-${book}-${resource}`;
-        let itemResult: StepResult;
-        try {
-          const result = await step.do(
-            stepName,
-            { retries: { limit: 3, delay: "5 seconds", backoff: "exponential" } },
-            async () =>
-              this.exportOne(
-                book,
-                resource,
-                instanceId,
-                dcsAllowed,
-                shrinkOverride,
-                lockedBooks,
-                lockOverride,
-                branchOverride,
-                alertObservedAt,
-              ),
-          );
-          results.push(result);
-          itemResult = result;
-        } catch (e) {
-          // A single (book, resource) failure — most commonly a corrupt/dangling
-          // DCS branch ref that ensureBranchVisible can't heal — must not abort
-          // the whole instance and starve every other book (the resource-major
-          // loop means one bad branch on the first book would otherwise block
-          // all later books AND all later resources). Log, record the failure as
-          // a snapshot for observability, and continue. Same isolation shape as
-          // the pre-export reimport loop above.
-          const reason = e instanceof Error ? e.message : String(e);
-          console.error("export step failed", { book, resource, error: reason });
-          try {
-            await step.do(`${stepName}-record-fail`, async () =>
-              this.recordSnapshot(book, resource, null, null, 0, `error:${reason.slice(0, 180)}`),
-            );
-          } catch {
-            /* recording the failure is best-effort; never let it abort the run */
-          }
-          itemResult = {
+        const itemResult = await this.runExportStep(step, book, resource, () =>
+          this.exportOne(
             book,
             resource,
-            rowCount: 0,
-            bytes: 0,
-            r2Key: null,
-            branch: null,
-            dcsCommitSha: null,
-            dcsChanged: false,
-            dcsSkippedReason: `error:${reason.slice(0, 180)}`,
-            prNumber: null,
-            prReason: null,
-          };
-          results.push(itemResult);
-        }
+            instanceId,
+            dcsAllowed,
+            shrinkOverride,
+            lockedBooks,
+            lockOverride,
+            branchOverride,
+            alertObservedAt,
+          ),
+        );
+        results.push(itemResult);
         // Ledger item_terminal is recorded OUTSIDE the export try/catch above:
         // a telemetry failure here must not re-enter the catch (which would
         // fabricate a second, error-flagged result for an export that actually
@@ -4318,6 +4368,38 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     const source = `export_hard_reject:${book}:${resource}`;
     const message = buildHardRejectAlertMessage(book, resource, rejects);
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
+  }
+
+  // #1450: a clean Door43 night ends the failure, so its rows go, dismissed
+  // ones too. clearExportAlert keeps dismissed rows, and writeAlert keeps a
+  // condition dismissed while its newest row is dismissed with the same
+  // message: a later failure with the same error would then raise nothing.
+  // Only rows created strictly before `startedAt` (seconds) go; see
+  // runExportStep. Best-effort, like clearExportAlert.
+  private async endStepFailureEpisode(source: string, startedAt: number): Promise<void> {
+    try {
+      await this.env.DB.prepare(
+        `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND created_at < ?3`,
+      )
+        .bind(EXPORT_ALERT_USERNAME, source, startedAt)
+        .run();
+    } catch (err) {
+      console.error(`export alert clear failed for ${source}:`, err);
+    }
+  }
+
+  // #1450: a (book, resource) export step failed after its retries. The
+  // message states only what was measured: the step threw this error. A throw
+  // can come after the Door43 write landed, so it does not say whether
+  // anything reached Door43. It fires on any run (nightly, manual, dry), so
+  // the wording names no night. The error is cut to its stable part (see
+  // stepFailureSummary); the full text is in the "export step failed" log.
+  private async recordStepFailureAlert(book: string, resource: Resource, reason: string): Promise<void> {
+    const message =
+      `The export step for ${book} ${resource.toUpperCase()} failed after its retries: ${stepFailureSummary(reason)}. ` +
+      `A later export tries again; this clears when one reaches Door43 cleanly. ` +
+      `The full error is in the logs; check them and the export snapshot for whether the push landed.`;
+    await this.writeAlert(`export_step_failed:${book}:${resource}`, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 
   // Banner alert when the pre-export sync for a book failed outright (e.g. the
