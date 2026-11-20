@@ -2283,7 +2283,13 @@ export async function applyTsvRows(
     // BEFORE the aiOnly re-seed, so the reorder is preserved (the reorder-revert
     // fix). Only a reordered AI row whose CONTENT also drifted on master takes
     // master wholesale (content + file order) — the re-seed we want.
-    const fate = classifyReimportRow(contentMatches, sortMatches, reimportable, preserveLocalOrder, aiOnly);
+    let fate = classifyReimportRow(contentMatches, sortMatches, reimportable, preserveLocalOrder, aiOnly);
+    // #1411: an AI-only row whose content already equals master's and whose
+    // only difference is order (a tq row, or a tn row with a NULL number) is
+    // not re-seeded: that is a version bump, an edit_log row and a 409 for an
+    // open editor over an order change. The whole-verse plan's sort-only
+    // batch at the end of this function moves it instead.
+    if (fate === "update_ai" && contentMatches && orderPlan != null) fate = "noop";
     if (fate === "noop") {
       counts.skipped_noop++;
       // A resolved reference-move flag has to be cleared HERE, on the no-op path,
@@ -11960,6 +11966,15 @@ async function runLockedMirrors(
         break;
       }
       if (!res) {
+        incomplete = true;
+        break;
+      }
+      // #1411: the book was locked when this run staged the file, so the
+      // chapter gate left Door43's order to the mirror. Unlocked since (or
+      // the lock read failed), the mirror did nothing and an order-only
+      // chapter went unapplied: withhold the watermark so the next night
+      // re-stages the file through the ordinary path and its order gate.
+      if (res.skipped === "not_locked") {
         incomplete = true;
         break;
       }

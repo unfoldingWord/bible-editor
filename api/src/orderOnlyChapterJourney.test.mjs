@@ -185,6 +185,22 @@ const rowState = (sqlite, table, ids) =>
     .prepare(`SELECT id, sort_order, version, updated_at FROM ${table} WHERE book = ? AND id IN (${ids.map(() => "?").join(", ")}) ORDER BY id`)
     .all(BOOK, ...ids)
     .map((r) => ({ ...r }));
+// A tq row someone wrote before the push: updated_by set, plus its edit_log
+// row (source 'ai_pipeline' = AI-only, NULL = a person).
+function owned(sqlite, id, action, source, at) {
+  sqlite.prepare(`UPDATE tq_rows SET updated_by = 42, version = 2 WHERE id = ?`).run(id);
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, source, created_at)
+       VALUES ('tq', ?, ?, 42, 1, 2, ?, ?, ?)`,
+    )
+    .run(id, BOOK, action, source, at);
+}
+const tqOwnership = (sqlite) =>
+  sqlite
+    .prepare(`SELECT id, version, updated_by, review_kind FROM tq_rows WHERE id IN ('qc01', 'qc02') ORDER BY id`)
+    .all()
+    .map((r) => ({ ...r }));
 const editLogCount = (sqlite) => sqlite.prepare(`SELECT COUNT(*) AS n FROM edit_log`).get().n;
 
 // Night 0 was a confirmed push of exactly these rows, in this order.
@@ -208,6 +224,16 @@ function seed({ locked }) {
   // tq: 1:1 reordered on Door43 (tq has no in-app reorder); chapter 2 unchanged.
   tq(s, { id: "qa01", ref: "1:1", q: "Q1", a: "A1", sort: 100 });
   tq(s, { id: "qa02", ref: "1:1", q: "Q2", a: "A2", sort: 200 });
+  // tq 1:2 — Door43 swaps an AI-written row and a translator-edited row
+  // (both edited before the push, content unchanged since): order only.
+  // Unlocked seed only: a non-pristine row makes the content gate flag its
+  // chapter on any book, which would blur the locked case's "mirror only".
+  if (!locked) {
+    tq(s, { id: "qc01", ref: "1:2", q: "Q5 by AI", a: "A5", sort: 100 });
+    tq(s, { id: "qc02", ref: "1:2", q: "Q6 edited", a: "A6", sort: 200 });
+    owned(s, "qc01", "create", "ai_pipeline", T0 - 200);
+    owned(s, "qc02", "update", null, T0 - 100);
+  }
   tq(s, { id: "qb01", ref: "2:1", q: "Q3", a: "A3", sort: 150 });
   tq(s, { id: "qb02", ref: "2:1", q: "Q4", a: "A4", sort: 170 });
   confirmPush(s, "tn", T0);
@@ -234,9 +260,13 @@ const MASTER_TQ = [
   TQ_HEADER,
   tqLine("1:1", "qa02", "Q2", "A2"),
   tqLine("1:1", "qa01", "Q1", "A1"),
+  tqLine("1:2", "qc02", "Q6 edited", "A6"),
+  tqLine("1:2", "qc01", "Q5 by AI", "A5"),
   tqLine("2:1", "qb01", "Q3", "A3"),
   tqLine("2:1", "qb02", "Q4", "A4"),
 ].join("\n");
+// The locked seed has no tq 1:2 rows (see seed), so its master has none.
+const MASTER_TQ_LOCKED = MASTER_TQ.split("\n").filter((l) => !l.startsWith("1:2\t")).join("\n");
 
 async function night(t, state) {
   const restore = stubDoor43(state);
@@ -273,6 +303,7 @@ console.log("\n[#1411 — the nightly sync applies Door43's order-only change on
   const ch2Before = rowState(t.sqlite, "tn_rows", ["hhhh", "iiii"]);
   const tq2Before = rowState(t.sqlite, "tq_rows", ["qb01", "qb02"]);
   const logBefore = editLogCount(t.sqlite);
+  const tqOwnershipBefore = tqOwnership(t.sqlite);
   const res = await night(t, { sha: SHA_1, files: { tn: MASTER_TN, tq: MASTER_TQ } });
   eq(
     order(t.sqlite, "tn_rows"),
@@ -284,7 +315,16 @@ console.log("\n[#1411 — the nightly sync applies Door43's order-only change on
     ],
     "tn: master's order lands in 1:1; in-app reorders in 1:2 and 1:3 are kept",
   );
-  eq(order(t.sqlite, "tq_rows"), ["1:1|qa02", "1:1|qa01", "2:1|qb01", "2:1|qb02"], "tq: master's order lands in 1:1");
+  eq(
+    order(t.sqlite, "tq_rows"),
+    ["1:1|qa02", "1:1|qa01", "1:2|qc02", "1:2|qc01", "2:1|qb01", "2:1|qb02"],
+    "tq: master's order lands in 1:1 and 1:2",
+  );
+  eq(
+    tqOwnership(t.sqlite),
+    tqOwnershipBefore,
+    "tq: an order-only change re-seeds no AI row and merges no edited row (no version bump, updated_by kept, no flag)",
+  );
   eq(rowState(t.sqlite, "tn_rows", ["hhhh", "iiii"]), ch2Before, "tn chapter 2 (no order change) is not rewritten");
   eq(rowState(t.sqlite, "tq_rows", ["qb01", "qb02"]), tq2Before, "tq chapter 2 (no order change) is not rewritten");
   eq(
@@ -323,12 +363,44 @@ console.log("\n[#1411 — the nightly sync applies Door43's order-only change on
 console.log("\n[#1411 — a locked book's order-only change goes through the mirror only]");
 {
   const t = seed({ locked: true });
-  const res = await night(t, { sha: SHA_1, files: { tn: MASTER_TN, tq: MASTER_TQ } });
+  const res = await night(t, { sha: SHA_1, files: { tn: MASTER_TN, tq: MASTER_TQ_LOCKED } });
   eq(res.perResource.tn.reordered, 0, "tn: the ordinary apply path reorders nothing on a locked book");
   eq(res.perResource.tq.reordered, 0, "tq: the ordinary apply path reorders nothing on a locked book");
   eq((res.perResource.tn.mirrored ?? 0) > 0, true, "tn: the mirror carried the order change");
   eq(order(t.sqlite, "tq_rows").slice(0, 2), ["1:1|qa02", "1:1|qa01"], "tq: master's order via the mirror");
   eq(order(t.sqlite, "tn_rows").slice(0, 2), ["1:1|bbbb", "1:1|aaaa"], "tn: master's order via the mirror");
+}
+
+console.log("\n[#1411 review A1 — locked at staging, unlocked before the mirror: the watermark is withheld, the next night applies the order]");
+{
+  const t = seed({ locked: true });
+  // Unlock right after staging: the plan already marked tn/tq for the mirror,
+  // so the gate leaves order out, and the mirror finds the book unlocked.
+  const unlockingStep = {
+    async do(name, optsOrFn, maybeFn) {
+      if (name.startsWith("reimport-tsvgate-")) {
+        t.sqlite.prepare(`UPDATE book_locks SET locked = 0 WHERE book = ?`).run(BOOK);
+      }
+      return step.do(name, optsOrFn, maybeFn);
+    },
+  };
+  const restore = stubDoor43({ sha: SHA_1, files: { tn: MASTER_TN, tq: MASTER_TQ_LOCKED } });
+  try {
+    await runChunkedReimport(t.env, unlockingStep, BOOK, "inst-unlock", ["tn", "tq"]);
+  } finally {
+    restore();
+  }
+  const sha = (resource) =>
+    t.sqlite.prepare(`SELECT source_sha FROM book_resource_syncs WHERE book = ? AND resource = ?`).get(BOOK, resource).source_sha;
+  eq(order(t.sqlite, "tn_rows").slice(0, 2), ["1:1|aaaa", "1:1|bbbb"], "night 1: neither the mirror nor the apply moved 1:1");
+  eq(sha("tn") !== SHA_1 && sha("tq") !== SHA_1, true, "night 1: the watermark is not advanced to master's SHA");
+
+  // Night 2, same master, book still unlocked: the ordinary path and its
+  // order gate apply Door43's order.
+  await night(t, { sha: SHA_1, files: { tn: MASTER_TN, tq: MASTER_TQ_LOCKED } });
+  eq(order(t.sqlite, "tn_rows").slice(0, 2), ["1:1|bbbb", "1:1|aaaa"], "night 2: tn 1:1 takes Door43's order");
+  eq(order(t.sqlite, "tq_rows").slice(0, 2), ["1:1|qa02", "1:1|qa01"], "night 2: tq 1:1 takes Door43's order");
+  eq(sha("tn"), SHA_1, "night 2: the watermark advances");
 }
 
 if (failed > 0) {
