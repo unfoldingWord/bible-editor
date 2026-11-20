@@ -1388,21 +1388,27 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             ...(droppedIds.length > 0 && droppedIds.length <= 1024 ? { droppedids: droppedIds } : {}),
           };
           // A retry must not erase an earlier attempt's committed=1 (#1455)
-          // before its own commit runs: when that attempt's committed drops
-          // on the same base cover this attempt's, the flag carries over.
-          if (markerMeta.droppedids) {
-            const prev = (await this.env.BLOBS.head(d1RenderKey(r2Key)))?.customMetadata;
-            if (prev?.committed === "1" && prev.basesha === markerMeta.basesha && prev.droppedids) {
-              const shipped = new Set(prev.droppedids.split(","));
-              if (markerMeta.droppedids.split(",").every((id) => shipped.has(id))) markerMeta.committed = "1";
-            }
+          // before its own commit runs. On the same base, the marker keeps
+          // the flag and lists the union of both attempts' drops: each id is
+          // already off the branch or was measured missing from master on
+          // this base, and planKeepMasterRows still drops one only while ours
+          // is unchanged from base and master lacks it. A union over the 1024
+          // cap keeps the committed ids alone until this attempt commits, then
+          // this attempt's own (what its commit left off the branch).
+          let committedIds = markerMeta.droppedids;
+          const prev = (await this.env.BLOBS.head(d1RenderKey(r2Key)))?.customMetadata;
+          if (prev?.committed === "1" && prev.basesha === markerMeta.basesha && prev.droppedids) {
+            const union = [...new Set([...prev.droppedids.split(","), ...(markerMeta.droppedids?.split(",") ?? [])])].join(",");
+            if (union.length <= 1024) committedIds = union;
+            markerMeta.droppedids = union.length <= 1024 ? union : prev.droppedids;
+            markerMeta.committed = "1";
           }
           await this.env.BLOBS.put(d1RenderKey(r2Key), d1Render, {
             httpMetadata: { contentType: "text/tab-separated-values" },
             // Lowercase keys: R2 metadata travels as HTTP headers in some paths.
             customMetadata: markerMeta,
           });
-          if (markerMeta.droppedids) droppedMarker = { body: d1Render, meta: markerMeta };
+          if (committedIds) droppedMarker = { body: d1Render, meta: { ...markerMeta, droppedids: committedIds } };
           // The R2 copy at r2Key must hold the bytes that ship: it is the
           // pushed render the next export and the sync read back by hash.
           await this.env.BLOBS.put(r2Key, built.content, {
@@ -1723,7 +1729,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // recordPushedRender, pushed_r2_key still names an older push, so a
       // retry is not seen as one; committed=1 on the marker tells it the drops
       // shipped (#1455). Best-effort: when this put fails, recordPushedRender
-      // below still lets a retry find them (#1452).
+      // below still lets a retry find them (#1452). Also written when the
+      // commit changed nothing: master then already equals this render, so
+      // the dropped rows are off master too.
       if (droppedMarker != null) {
         try {
           await this.env.BLOBS.put(d1RenderKey(r2Key), droppedMarker.body, {
