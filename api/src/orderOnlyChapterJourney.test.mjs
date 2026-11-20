@@ -360,6 +360,26 @@ console.log("\n[#1411 — the nightly sync applies Door43's order-only change on
   eq(t.sqlite.prepare(`SELECT note FROM tn_rows WHERE id = 'iiii'`).get().note, "I changed on Door43", "night 2: the content change landed");
 }
 
+console.log("\n[#1456 — an in-app reorder stamped in the same second as the confirmed push is kept on an unlocked book]");
+{
+  const t = seed({ locked: false });
+  // Re-stamp both drags at exactly master_confirmed_at (the locked mirror's
+  // `>=` already treats this as pending; the unlocked path must agree).
+  drag(t.sqlite, "dddd", 50, T0);
+  drag(t.sqlite, "gggg", 50, T0);
+  eq(
+    [...(await changedTsvChapters(t.env, BOOK, "tn", MASTER_TN.replace(tnLine("1:1", "bbbb", "B") + "\n" + tnLine("1:1", "aaaa", "A"), tnLine("1:1", "aaaa", "A") + "\n" + tnLine("1:1", "bbbb", "B")), { confirmedAt: T0 }))].sort(),
+    [],
+    "gate: with 1:1 unchanged, the same-second drags in 1:2 and 1:3 do not flag chapter 1",
+  );
+  await night(t, { sha: SHA_1, files: { tn: MASTER_TN, tq: MASTER_TQ } });
+  eq(
+    order(t.sqlite, "tn_rows").slice(0, 7),
+    ["1:1|bbbb", "1:1|aaaa", "1:2|dddd", "1:2|cccc", "1:3|gggg", "1:3|eeee", "1:3|ffff"],
+    "tn: Door43's order lands in 1:1; the same-second in-app reorders in 1:2 and 1:3 stand",
+  );
+}
+
 console.log("\n[#1411 — a locked book's order-only change goes through the mirror only]");
 {
   const t = seed({ locked: true });
