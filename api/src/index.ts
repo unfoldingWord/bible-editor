@@ -516,7 +516,7 @@ export default {
       // wrapped again here for defense in depth, same as the sweeps above.
       if (minuteOfHour < 5 && new Date(controller.scheduledTime).getUTCHours() === 4) {
         try {
-          await raiseEditLogSweepBoundaryAlerts(env);
+          await raiseEditLogSweepBoundaryAlerts(env, undefined, PUBLISHED_BOOKS);
         } catch (e) {
           console.error("edit_log sweep boundary alarm failed", e instanceof Error ? e.message : String(e));
         }
