@@ -385,19 +385,30 @@ export function orderTwlRows(
       continue;
     }
 
+    // The ULT row for this verse: its own row, else a bridge that covers it. D1
+    // stores a bridge once under its start verse (verse=10, verse_end=12), so a
+    // 9:11 bucket finds it only through the range (#1442), as the web client's
+    // verse index does. The exact match goes first so a verse with a row of its
+    // own reads that row, as it always has.
+    const chapterNum = bucket[0].row.chapter;
+    const verseNum = bucket[0].row.verse;
     const verse =
+      ultVerses.find(
+        (v) => v.bible_version === "ULT" && v.chapter === chapterNum && v.verse === verseNum,
+      ) ??
       ultVerses.find(
         (v) =>
           v.bible_version === "ULT" &&
-          v.chapter === bucket[0].row.chapter &&
-          v.verse === bucket[0].row.verse,
-      ) ?? null;
+          v.chapter === chapterNum &&
+          v.verse_end != null &&
+          v.verse < verseNum &&
+          v.verse_end >= verseNum,
+      ) ??
+      null;
 
-    // A bridged ULT row (verse_end set) holds several verses' words; order this
-    // bucket by its own verse's copies (#1437). The exact-verse match above finds
-    // a bridge only for its start verse, so only that bucket gets here.
-    const sourceRef =
-      verse && verse.verse_end != null && verse.verse_end !== verse.verse ? key : undefined;
+    // A bridged ULT row holds several verses' words; order this bucket by its
+    // own verse's copies (#1437). Same bridge test as the web's isRangeRow.
+    const sourceRef = verse && verse.verse_end != null && verse.verse_end > verse.verse ? key : undefined;
     const sequenceMap = buildUltSequenceMap(verse, sourceRef);
 
     // Resolve each row's position ONCE (decorate-sort), not inside the
