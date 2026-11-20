@@ -2730,7 +2730,7 @@ export function buildAlignmentShrinkAlertMessage(args: {
   const head = blocking
     ? `Benjamin fix this — nightly export BLOCKED ${label}: `
     : notPushed
-      ? `${label} was not pushed to Door43 tonight for another reason (see its own alert), and also has alignment to fix: `
+      ? `${label} was not pushed to Door43 by the export that found this, for another reason (see its own alert), and also has alignment to fix: `
       : `${label} shipped to Door43, but with alignment to fix: `;
 
   if (classification.kind === "none") {

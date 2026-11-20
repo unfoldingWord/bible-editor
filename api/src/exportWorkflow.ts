@@ -1489,7 +1489,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             prReason: null,
           };
         }
-        await this.clearExportAlert(`export_master_moved:${book}:${resource}`);
+        // Not from an operator's override branch: the refusal alert is about
+        // the nightly branch, which tonight's run does not touch (#1434 A1).
+        if (branchOverride == null) await this.clearExportAlert(`export_master_moved:${book}:${resource}`);
         if (plan.unspliced.length > 0) {
           console.log(
             `export: found ${plan.unspliced.length} ${book} ${resource} verse(s) Door43 changed and Bible Editor did not ` +
@@ -1621,8 +1623,17 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       dcsChanged = commit.changed;
       // The push went through, so an earlier night's keep-master refusal no
       // longer holds, even on a night the verse guard could not measure and
-      // so never cleared it above (#1434).
-      if (resource === "ult" || resource === "ust") {
+      // so never cleared it above (#1434). Only on proof: tonight's commit
+      // wrote the branch (changed), or master already equals the render
+      // (!branchTouched). A no-op against a stale, unmerged branch that
+      // already held this render proves neither, and that branch could still
+      // merge over Door43's change. Never from an operator's override branch:
+      // the refusal is about the nightly branch (review A1).
+      if (
+        (resource === "ult" || resource === "ust") &&
+        branchOverride == null &&
+        (commit.changed || !commit.branchTouched)
+      ) {
         await this.clearExportAlert(`export_master_moved:${book}:${resource}`);
       }
 
@@ -3087,6 +3098,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // `guard.ok`) excludes "no_file" (the book has no ult/ust file at
       // all, so nothing was actually checked) from counting as clean.
       await this.clearAlignmentAttention(book, resource);
+      // The banner too: it was only ever replaced by the next night that
+      // found loss again, so an old one outlived the loss it named (#1434 A2).
+      await this.clearExportAlert(`export_align_shrink:${book}:${resource}`);
     }
     if (guard.ok) return null;
     const severity = classifyAlignmentLossSeverity(guard.offenders ?? []);

@@ -462,6 +462,11 @@ console.log("\n[13. a refused night with translator-scale alignment loss does no
   ok(align[0] && !/shipped|is on Door43/.test(align[0].message), `the alert does not say the book shipped (${align[0]?.message})`);
   ok(align[0] && align[0].message.includes("not pushed"), `the alert says it was not pushed (${align[0]?.message})`);
   ok(!logs.some((l) => l.includes("shipping")), `no "shipping" log line (${logs.filter((l) => l.includes("shipping")).join(" | ")})`);
+
+  console.log("\n[13b. the next export that measures alignment clean clears that banner (#1434 A2)]");
+  d.master = await t.render("n3pre"); // Door43 takes Bible Editor's text: nothing lost, nothing moved
+  await t.exportOne("export-night-3");
+  ok(t.live(`export_align_shrink:${BOOK}:ult`).length === 0, "the lost-alignment banner is cleared");
 }
 
 console.log("\n[14. refused night N, guard not measured on night N+1 that ships → the refusal alert is cleared (#1434)]");
@@ -493,6 +498,25 @@ console.log("\n[14. refused night N, guard not measured on night N+1 that ships 
   ok(logs3.some((l) => l.includes("keep-master guard not measured")), "(setup: night N+1's verse guard did not measure)");
   ok(d.writes.length === 1 && n3.dcsSkippedReason == null, `night N+1 ships (got ${n3.dcsSkippedReason}, writes ${d.writes.length})`);
   ok(t.live(`export_master_moved:${BOOK}:ult`).length === 0, "the refusal alert is cleared");
+}
+
+console.log("\n[15. refused night N, night N+1 a no-op against a stale branch that already holds the render → the refusal alert stays (#1434 A1)]");
+{
+  const d = door43();
+  const t = freshEnv();
+  await confirmedNight1(t, d);
+  const s3 = verseSpan(d.master, 3);
+  d.master = (d.master.slice(0, s3.start) + d.master.slice(s3.start).replace(/^\\v 3\s*/, "")).replace(/\\v 2(?=\s)/, "\\v 2-3");
+  const n2 = await t.exportOne("export-night-2");
+  ok(String(n2.dcsSkippedReason).startsWith("master_moved_guard:"), `night N refused (got ${n2.dcsSkippedReason})`);
+  ok(t.r2.delete(`exports/export-night-1/${BOOK}/ult/${FILE}`), "(setup: base render removed, so night N+1 does not measure)");
+  t.editD1(4, "eagle", "hawk");
+  // An unmerged branch from earlier already holds exactly tonight's render;
+  // the stand-in's branch reset leaves it in place.
+  d.branch = await t.render("n3pre");
+  await t.exportOne("export-night-3");
+  ok(d.writes.length === 0, `nothing was written (writes ${d.writes.length})`);
+  ok(t.live(`export_master_moved:${BOOK}:ult`).length === 1, "the refusal alert stays");
 }
 
 if (failed > 0) {
