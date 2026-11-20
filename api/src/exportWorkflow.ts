@@ -150,7 +150,7 @@ import {
 } from "./bookReimport";
 import { noteLockedPushOnVerseMergeAlert, retireVerseKeptAiMasterFlags } from "./verseMergeConflicts.ts";
 import { dcsResourceFile, fetchDcsMasterTextVerified, fileBlobShaAtCommit, fileHeadCommit, repoHeadCommitSha, type ReimportResource } from "./dcsSources";
-import { loadOpenVerseConflictRefs, loadPreImportVerses, masterVersesAsImported, partitionUsfmRevertEntriesByImport } from "./revertImportVerses.ts";
+import { loadPreImportVerses, loadVerseConflictRefs, masterVersesAsImported, partitionUsfmRevertEntriesByImport } from "./revertImportVerses.ts";
 import { readLedgerMasterLineage, type LedgerLineageResult } from "./masterLineageLedger.ts";
 import { DCS_POLL_FETCH_TIMEOUT_MS } from "./dcsCommitPoll.ts";
 import { gitBlobSha, gitBlobShaOrNull, findOurMergeForPr, judgeOwnPublishDecline } from "./ownPublish";
@@ -1960,12 +1960,21 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
                 refs,
                 importedSync!.syncedAt as number,
               );
-              const openConflicts = await loadOpenVerseConflictRefs(this.env.DB, book, resource, refs);
+              // Review B1: a conflict row the import recorded stays loud even
+              // after an app save resolved it. No column names the run, so
+              // the window reaches back to whichever is earlier: a day before
+              // synced_at (the run's `now` stamped last_recorded_at before it
+              // stamped synced_at; a day covers a nightly Workflow with its
+              // retries), or the last confirmed push (every merge decision
+              // since master last held our export). Unknown confirm: every row.
+              const syncedAt = importedSync!.syncedAt as number;
+              const recordedSince = priorConfirmed.at == null ? 0 : Math.min(priorConfirmed.at, syncedAt - 86400);
+              const conflicts = await loadVerseConflictRefs(this.env.DB, book, resource, refs, recordedSince);
               const split = partitionUsfmRevertEntriesByImport(
                 attention,
                 masterVersesAsImported(usfmMasterContentForRevertReport as string),
                 preImport,
-                openConflicts,
+                conflicts,
               );
               console.log("export: revert report import partition", {
                 book,

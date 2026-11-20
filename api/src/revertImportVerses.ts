@@ -21,8 +21,8 @@
 //      reproduced (review A1): canonize can fold a Door43 person's
 //      x-lemma / x-content fix back to D1's stale UHB bytes, so such a verse
 //      stays loud unless canonize changed nothing.
-//   3. No unresolved verse_merge_conflicts row for the verse, of any action
-//      (review A2, loadOpenVerseConflictRefs).
+//   3. No verse_merge_conflicts row for the verse, of any action, that is
+//      unresolved or was recorded around this import (reviews A2, B1: loadVerseConflictRefs).
 // Together: D1 held master's verse as imported and master has not moved
 // since, so whatever the render now changes there was edited in Bible Editor
 // after the import. The verse is labelled probably ours (still recorded in
@@ -128,7 +128,7 @@ export function partitionUsfmRevertEntriesByImport<E extends { ref: string }>(
   entries: E[],
   masterAsImported: ReadonlyMap<string, string> | null,
   preImport: ReadonlyMap<string, string | null>,
-  // Refs with an unresolved verse_merge_conflicts row (loadOpenVerseConflictRefs).
+  // Refs with a verse_merge_conflicts row from this import or still unresolved (loadVerseConflictRefs).
   openConflicts: ReadonlySet<string>,
 ): { attention: E[]; probablyOurs: E[] } {
   if (masterAsImported === null) return { attention: entries, probablyOurs: [] };
@@ -193,35 +193,47 @@ export async function loadPreImportVerses(
   return out;
 }
 
-// The plain refs among `refs` that have an unresolved verse_merge_conflicts row
-// for this book and resource, of ANY action (review A2). Such a verse stays
-// loud: after an adopt_conflict, a translator restoring or re-typing their
-// overwritten text reverts the Door43 author's commit, and the payload test
-// alone would call that ours; a kept source_attr_divergent /
+// The plain refs among `refs` that have a verse_merge_conflicts row for this
+// book and resource, of ANY action, that is either still unresolved or was
+// recorded at or after `recordedSince`, resolved or not (reviews A2, B1). Such
+// a verse stays loud: after an adopt_conflict, a translator restoring or
+// re-typing their overwritten text reverts the Door43 author's commit, and the
+// payload test alone would call that ours; a kept source_attr_divergent /
 // keep_alignment_refused / keep_local_structure verse means D1 did not take
-// master's verse. A clean 'adopt' row is included too (stay loud when in
-// doubt), so only verses the import wrote with no recorded merge decision (a
-// pristine write or a create) can go quiet. Read per chapter, chunked under
-// D1's 100-parameter limit; a failed read throws, and the caller then keeps
-// every verse in attention.
-export async function loadOpenVerseConflictRefs(
+// master's verse. A clean 'adopt' row counts too (stay loud when in doubt), so
+// only verses the import wrote with no recorded merge decision (a pristine
+// write or a create) can go quiet.
+//
+// Why resolved rows count (B1): any app save of a verse resolves its row in
+// the same batch (verses.ts, RESOLVE_VERSE_MERGE_CONFLICT_SQL), so by export
+// time the very edit that reverts the Door43 commit has resolved the flag.
+// No column names the run that wrote a row; `last_recorded_at` is the time of
+// the latest reimport write to it (detected_at for rows from before migration
+// 0049), and a save's resolve does not touch it. The caller passes a bound no
+// later than the import (see exportWorkflow.ts).
+//
+// Read per chapter, chunked under D1's 100-parameter limit; a failed read
+// throws, and the caller then keeps every verse in attention.
+export async function loadVerseConflictRefs(
   db: D1Database,
   book: string,
   resource: "ult" | "ust",
   refs: string[],
+  recordedSince: number,
 ): Promise<Set<string>> {
   const chapters = [...new Set(refs.flatMap((r) => (PLAIN_REF.test(r) ? [Number(r.split(":")[0])] : [])))];
   const wanted = new Set(refs);
   const out = new Set<string>();
   for (let i = 0; i < chapters.length; i += PRE_IMPORT_CHUNK) {
     const chunk = chapters.slice(i, i + PRE_IMPORT_CHUNK);
-    const marks = chunk.map((_, j) => `?${j + 3}`).join(", ");
+    const marks = chunk.map((_, j) => `?${j + 4}`).join(", ");
     const { results } = await db
       .prepare(
         `SELECT chapter, verse FROM verse_merge_conflicts
-          WHERE book = ?1 AND resource = ?2 AND resolved_at IS NULL AND chapter IN (${marks})`,
+          WHERE book = ?1 AND resource = ?2 AND chapter IN (${marks})
+            AND (resolved_at IS NULL OR COALESCE(last_recorded_at, detected_at) >= ?3)`,
       )
-      .bind(book, resource, ...chunk)
+      .bind(book, resource, recordedSince, ...chunk)
       .all<{ chapter: number; verse: number }>();
     for (const r of results ?? []) {
       const ref = `${r.chapter}:${r.verse}`;

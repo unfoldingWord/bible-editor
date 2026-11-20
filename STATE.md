@@ -995,9 +995,12 @@ Highlights that bite repeatedly:
   (ZEC; OBA 0%: quotes and dashes moved out of `\w`, a leading `\q1`), and no comparison mask recovers those; a
   looser lens here only moves verses toward quiet. (2) The adoption's `canonizeAlignmentSource` output is NOT
   accepted: canonize can fold a Door43 person's x-lemma / x-content fix back to D1's stale UHB bytes, so a verse it
-  changed stays loud (with Door43's own UHB it changes 0 of 21 OBA and 31-32 of 211 ZEC sample verses). (3) Any
-  unresolved `verse_merge_conflicts` row keeps the verse loud, so after an `adopt_conflict` a translator re-typing
-  their overwritten text still alerts; in practice only pristine writes and creates go quiet. A source-attribute
+  changed stays loud (with Door43's own UHB it changes 0 of 21 OBA and 31-32 of 211 ZEC sample verses). (3) A
+  `verse_merge_conflicts` row keeps the verse loud when it is unresolved OR was recorded (`last_recorded_at`) since
+  the earlier of the last confirmed push and a day before `synced_at`, resolved or not: any app save of a verse
+  resolves its row in the same batch (`verses.ts`), so the very save that re-types text an `adopt_conflict`
+  overwrote would otherwise have cleared the evidence by export time. No column names the run that wrote a row.
+  In practice only pristine writes and creates go quiet. A source-attribute
   reconcile logs a `dcs_reimport` 'update' with the adoption's payload keys, so only the content tells it apart
   (`revertImportVersePayloadShape.test.mjs` pins all of this).
 

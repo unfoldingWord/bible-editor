@@ -42,7 +42,7 @@ const { applyVerseRowsForTest } = await import("./bookReimport.ts");
 const { extractVersesForRange } = await import("./importParsers.ts");
 const { verseTextByRef } = await import("./export.ts");
 const { EDIT_LOG_RETENTION_SECONDS } = await import("./editLogSweep.ts");
-const { loadOpenVerseConflictRefs, loadPreImportVerses, masterVersesAsImported, partitionUsfmRevertEntriesByImport, preImportVerseMatchesMaster } =
+const { loadPreImportVerses, loadVerseConflictRefs, masterVersesAsImported, partitionUsfmRevertEntriesByImport, preImportVerseMatchesMaster } =
   await import("./revertImportVerses.ts");
 
 let failed = 0;
@@ -255,7 +255,7 @@ console.log("\n[3. the real loader + matcher read those payloads: D1 held master
   ok(!verdict["1:2"] && !verdict["1:3"], "adoptions whose canonize step changed bytes do not match (review A1: canonize is not reproduced)");
   ok(!verdict["1:4"], "source-attr reconcile does not match (translator's wording)");
   ok(!verdict["1:5"], "kept verse does not match (translator's own row)");
-  const open = await loadOpenVerseConflictRefs(env.DB, BOOK, "ult", refs);
+  const open = await loadVerseConflictRefs(env.DB, BOOK, "ult", refs, syncedAt - 86400);
   ok(JSON.stringify([...open].sort()) === JSON.stringify(["1:2", "1:3"]), `the adoptions left unresolved verse_merge_conflicts rows (got ${JSON.stringify([...open])})`);
   const parts = partitionUsfmRevertEntriesByImport(refs.map((ref) => ({ ref, class: "substantive" })), asImported, pre, open);
   ok(JSON.stringify([parts.attention.map((e) => e.ref), parts.probablyOurs.map((e) => e.ref)]) === JSON.stringify([["1:2", "1:3", "1:4", "1:5"], ["1:1", "1:6"]]), "partition: only the pristine write and the create are probably ours");
@@ -266,6 +266,12 @@ console.log("\n[3. the real loader + matcher read those payloads: D1 held master
   ok(p2.probablyOurs.length === 0, "an exact payload match with an unresolved conflict row still needs attention");
   const p3 = partitionUsfmRevertEntriesByImport([{ ref: "1:3", class: "substantive" }], asImported, forced, new Set());
   ok(p3.probablyOurs.length === 1, "(control: the same verse with no conflict row is probably ours)");
+  // Review B1: an app save resolves the row; a row this import recorded still counts.
+  sqlite.prepare(`UPDATE verse_merge_conflicts SET resolved_at = ?, resolved_by = 1 WHERE book = ?`).run(syncedAt + 100, BOOK);
+  const afterSave = await loadVerseConflictRefs(env.DB, BOOK, "ult", refs, syncedAt - 86400);
+  ok(JSON.stringify([...afterSave].sort()) === JSON.stringify(["1:2", "1:3"]), "resolved rows recorded at or after the bound still count");
+  const older = await loadVerseConflictRefs(env.DB, BOOK, "ult", refs, syncedAt + 1);
+  ok(older.size === 0, "a resolved row recorded before the bound does not count (an earlier import's settled flag)");
   // The sweep floor: the same rows, read as if the import were ~179 days old.
   const late = await loadPreImportVerses(env.DB, BOOK, "ULT", refs, syncedAt, syncedAt + EDIT_LOG_RETENTION_SECONDS - 86400 + 1);
   ok(refs.every((r) => late.get(r) === null), "a picked row within a day of the retention cutoff is no evidence");

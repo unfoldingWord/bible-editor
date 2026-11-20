@@ -49,6 +49,7 @@ const { ExportWorkflow } = await import("./exportWorkflow.ts");
 const { applyVerseRowsForTest } = await import("./bookReimport.ts");
 const { extractVersesForRange } = await import("./importParsers.ts");
 const { splitRevertRefs } = await import("../../scripts/watchdog/exportRevertCheck.mjs");
+const { RESOLVE_VERSE_MERGE_CONFLICT_SQL } = await import("./verseMergeConflictSql.ts");
 const EXPORT_ALERT_USERNAME = "deferredreward"; // module-private in exportWorkflow.ts
 
 let failed = 0;
@@ -416,7 +417,7 @@ console.log("\n[6. review A1: a person fixes an x-lemma on Door43, D1's UHB is s
   ok(t.live(`export_revert:${BOOK}:ult`).length === 1, "export_revert alert raised");
 }
 
-console.log("\n[7. review A2: adopt_conflict took the person's verse over a translator's edit, the translator re-types their text → loud]");
+console.log("\n[7. reviews A2, B1: adopt_conflict took the person's verse over a translator's edit, the translator re-types their text (the save resolves the flag) → loud]");
 {
   const d = door43();
   const t = freshEnv();
@@ -429,6 +430,12 @@ console.log("\n[7. review A2: adopt_conflict took the person's verse over a tran
   ok(counts.merge_adopted === 1 && conflict?.action === "adopt_conflict" && conflict.resolved_at == null, `(setup: an unresolved adopt_conflict on 1:3: ${JSON.stringify(conflict)})`);
   ok(t.contentOf(3).includes(`"text":"fooled"`) && t.contentOf(3).includes(`"text":"pride"`), "(setup: D1 holds master's verse, as extracted: no UHB rows, so no canonize)");
   t.editD1(3, "pride", "arrogance", syncedAt + 100);
+  // The app's verse PATCH resolves the verse's flag in the same batch as the
+  // save (verses.ts), with this exact statement; its changes() guard reads the
+  // save's own write, which editD1 just made on this connection.
+  t.sqlite.prepare(RESOLVE_VERSE_MERGE_CONFLICT_SQL).run(syncedAt + 100, 1, BOOK, "ult", 1, 3);
+  const after = t.sqlite.prepare(`SELECT resolved_at FROM verse_merge_conflicts WHERE book = ? AND verse = 3`).get(BOOK);
+  ok(after?.resolved_at === syncedAt + 100, `(setup: the save resolved the flag: ${JSON.stringify(after)})`);
   await t.exportOne("export-night-2");
   ok(t.reverts().some((r) => r.ref === "1:3" && r.probably_ours === 0), `1:3 needs attention (got ${JSON.stringify(t.reverts())})`);
   ok(t.live(`export_revert:${BOOK}:ult`).length === 1, "export_revert alert raised");
