@@ -146,16 +146,17 @@ const refs = (l) => l.map((e) => e.ref);
 // 6. The record's wording, and that the watchdog still parses it.
 {
   const sub = (ref) => ({ ref, class: "substantive" });
+  const rowsA = [sub("1:2"), sub("2:intro")];
   const plan = planRevertReportAlerts({
     book: "2CH",
     resource: "tn",
     kind: "tsv",
     attention: [],
-    probablyOurs: [sub("1:2"), sub("2:intro")],
+    probablyOurs: rowsA,
     mechanical: true,
     branch: "2CH-tn-be-1",
     generation: "g9",
-    probablyOursBasis: { kind: "imported_head", importedSha: SHA },
+    importedHead: { importedSha: SHA, rows: rowsA },
   });
   eq(plan.map((a) => a.source), ["revert_probably_ours:2CH:tn"], "imported head: only the quiet record, no export_revert / mechanical_overwrite");
   eq(plan[0].severity, "info", "imported head: record is info");
@@ -166,9 +167,10 @@ const refs = (l) => l.map((e) => e.ref);
   const split = splitRevertRefs(["1:2", "2:intro"], group);
   eq([split.probablyOursRefs, split.exportRevertRefs, split.split], [["1:2", "2:intro"], [], "exact"], "watchdog parses the imported-head record's ref list");
   // Two rows at one Reference: the record counts rows, lists the ref once.
+  const rowsB = [sub("3:1"), sub("3:1"), sub("3:2")];
   const shared = planRevertReportAlerts({
-    book: "2CH", resource: "tn", kind: "tsv", attention: [], probablyOurs: [sub("3:1"), sub("3:1"), sub("3:2")],
-    mechanical: false, branch: "b", generation: "g9", probablyOursBasis: { kind: "imported_head", importedSha: SHA },
+    book: "2CH", resource: "tn", kind: "tsv", attention: [], probablyOurs: rowsB,
+    mechanical: false, branch: "b", generation: "g9", importedHead: { importedSha: SHA, rows: rowsB },
   });
   eq(shared[0].message.includes("on 3 row(s)") && shared[0].message.includes("hand-edit: 3:1, 3:2."), true, "shared Reference: 3 rows counted, ref listed once");
   const s2 = splitRevertRefs(["3:1", "3:2"], { book: "2CH", resource: "tn", exportRevert: null, probablyOurs: { id: 9, message: shared[0].message } });
@@ -178,6 +180,23 @@ const refs = (l) => l.map((e) => e.ref);
     book: "EZK", resource: "ust", kind: "usfm", attention: [], probablyOurs: [sub("10:1")], mechanical: false, branch: "b", generation: "g1",
   });
   eq(/on 1 verse\(s\).*no person touched these verses/s.test(lineage[0].message), true, "lineage wording unchanged");
+
+  // Review A1: one report with both kinds of probably-ours rows. Each group
+  // is named with its own reason; neither reason is claimed for the other.
+  const byLineage = [sub("4:1"), sub("4:2")];
+  const byImport = [sub("5:1")];
+  const mixed = planRevertReportAlerts({
+    book: "2CH", resource: "tn", kind: "tsv", attention: [], probablyOurs: [...byLineage, ...byImport],
+    mechanical: false, branch: "b", generation: "g9", importedHead: { importedSha: SHA, rows: byImport },
+  });
+  const m = mixed[0].message;
+  eq(mixed.map((a) => a.source), ["revert_probably_ours:2CH:tn"], "mixed: one quiet record");
+  eq(m.includes("on 3 row(s)") && m.includes("hand-edit: 4:1, 4:2, 5:1."), true, "mixed: counts and lists every row");
+  eq(/No person touched 4:1, 4:2 since master last held our export\./.test(m), true, "mixed: the lineage rows get the lineage reason");
+  eq(/For 5:1, the sync record shows Bible Editor imported master's current file \(Door43 commit e1997bc45e/.test(m), true, "mixed: the imported rows get the import reason");
+  eq(/held each of these rows/.test(m) || /No person touched [^.]*5:1/.test(m), false, "mixed: neither reason is stretched over the other group");
+  const s3 = splitRevertRefs(["4:1", "4:2", "5:1"], { book: "2CH", resource: "tn", exportRevert: null, probablyOurs: { id: 9, message: m } });
+  eq([s3.probablyOursRefs, s3.split], [["4:1", "4:2", "5:1"], "exact"], "mixed: the watchdog parses the full ref list");
 }
 
 if (failed > 0) {

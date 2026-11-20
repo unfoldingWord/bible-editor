@@ -1841,14 +1841,14 @@ export function planRevertReportAlerts(p: {
   branch: string;
   generation: string;
   /**
-   * Why `probablyOurs` rows are ours: the persisted master lineage (#1231,
-   * the default) or D1 having imported master's current file (#1419,
-   * partitionTsvRevertEntriesByImport), whose Door43 commit is `importedSha`.
+   * #1419: the subset of `probablyOurs` labelled by the imported-head evidence
+   * (partitionTsvRevertEntriesByImport), with the Door43 commit D1 imported.
+   * Every other probablyOurs row is ours by the persisted master lineage
+   * (#1231). The record names each group with its own reason.
    */
-  probablyOursBasis?: { kind: "lineage" } | { kind: "imported_head"; importedSha: string };
+  importedHead?: { importedSha: string; rows: ReadonlyArray<UsfmRevertEntry | TsvRevertEntry> };
 }): RevertReportAlert[] {
   const { book, resource, kind, attention, probablyOurs, mechanical, branch, generation } = p;
-  const basis = p.probablyOursBasis ?? { kind: "lineage" as const };
   const label = `${book} ${resource.toUpperCase()}`;
   const sample = (list: Array<{ ref: string }>, n = 10) =>
     `${list.slice(0, n).map((e) => e.ref).join(", ")}${list.length > n ? ` (+${list.length - n} more)` : ""}`;
@@ -1891,27 +1891,34 @@ export function planRevertReportAlerts(p: {
     }
   }
   if (probablyOurs.length > 0) {
-    // Both wordings keep the anchors scripts/watchdog/exportRevertCheck.mjs
+    // Every wording keeps the anchors scripts/watchdog/exportRevertCheck.mjs
     // (probablyOursList) parses: "on N verse(s)|row(s) that … not a lost
     // hand-edit: <refs>. The stored Door43 edit history ".
+    // Each Reference once: several TSV rows can share one, and the watchdog's
+    // fallback parser matches listed refs against export_reverts, which holds
+    // one row per ref.
+    const uniqueRefs = (list: ReadonlyArray<{ ref: string }>) => [...new Map(list.map((e) => [e.ref, e])).values()];
+    const importedSet = new Set<unknown>(p.importedHead?.rows ?? []);
+    const imported = probablyOurs.filter((e) => importedSet.has(e));
+    const byLineage = probablyOurs.filter((e) => !importedSet.has(e));
+    const importReason = (subject: string) =>
+      `Bible Editor imported master's current file (Door43 commit ${(p.importedHead?.importedSha ?? "").slice(0, 10)}, ` +
+      `which master still held at export) and held ${subject} exactly as master has it, so every difference is an edit ` +
+      `made in Bible Editor after that import.`;
     const why =
-      basis.kind === "imported_head"
-        ? `The stored Door43 edit history and sync record show Bible Editor imported master's current file ` +
-          `(Door43 commit ${basis.importedSha.slice(0, 10)}, which master still held at export) and held each of these ` +
-          `rows exactly as master has it, so every difference is an edit made in Bible Editor after that import.`
-        : `The stored Door43 edit history shows no person touched these verses since master last held our export.`;
-    const unit = basis.kind === "imported_head" ? "row(s)" : "verse(s)";
+      imported.length === 0
+        ? `The stored Door43 edit history shows no person touched these verses since master last held our export.`
+        : byLineage.length === 0
+          ? `The stored Door43 edit history and sync record show ${importReason("each of these rows")}`
+          : `The stored Door43 edit history gives two reasons. No person touched ` +
+            `${sample(uniqueRefs(byLineage), PROBABLY_OURS_LISTED_REFS)} since master last held our export. ` +
+            `For ${sample(uniqueRefs(imported), PROBABLY_OURS_LISTED_REFS)}, the sync record shows ${importReason("each row")}`;
+    const unit = imported.length > 0 ? "row(s)" : "verse(s)";
     out.push({
       source: `revert_probably_ours:${book}:${resource}`,
       message:
         `${label}: tonight's export replaced master's text on ${probablyOurs.length} ${unit} that are most likely ` +
-        // Each Reference once: several TSV rows can share one, and the
-        // watchdog's fallback parser matches listed refs against
-        // export_reverts, which holds one row per ref.
-        `our translators' own work, not a lost hand-edit: ${sample(
-          [...new Map(probablyOurs.map((e) => [e.ref, e])).values()],
-          PROBABLY_OURS_LISTED_REFS,
-        )}. ${why} ` +
+        `our translators' own work, not a lost hand-edit: ${sample(uniqueRefs(probablyOurs), PROBABLY_OURS_LISTED_REFS)}. ${why} ` +
         `They are included in tonight's ` +
         `export-revert records for ${label}; nothing to do unless you expected a hand-edit at one of them.`,
       severity: "info",
@@ -2046,9 +2053,10 @@ export function partitionTsvRevertEntriesByImport<E extends { ref: string; id?: 
 // The hourly edit_log sweep (editLogSweep.ts) deletes tq/twl entries older
 // than EDIT_LOG_RETENTION_SECONDS but keeps each live row's 'create' forever,
 // so for those kinds an aged entry may be the survivor of a swept later edit:
-// "latest surviving" is then not "latest". A tq/twl entry older than the
-// retention window (plus a day of slack for the sweep's own clock) is no
-// evidence. tn history is never swept.
+// "latest surviving" is then not "latest". A tq/twl entry within a day of the
+// retention cutoff, or older, is no evidence: the day of slack covers the
+// sweep's own clock, so anything the sweep may already have reached counts
+// as aged. tn history is never swept.
 const PRE_IMPORT_ID_CHUNK = 90;
 export async function loadPreImportTsvRows(
   db: D1Database,
@@ -2058,7 +2066,7 @@ export async function loadPreImportTsvRows(
   syncedAt: number,
   nowS: number = Math.floor(Date.now() / 1000),
 ): Promise<Map<string, Record<string, unknown> | null>> {
-  const sweepFloor = kind === "tn" ? null : nowS - EDIT_LOG_RETENTION_SECONDS - 86400;
+  const sweepFloor = kind === "tn" ? null : nowS - EDIT_LOG_RETENTION_SECONDS + 86400;
   const out = new Map<string, Record<string, unknown> | null>();
   const unique = [...new Set(ids)];
   for (let i = 0; i < unique.length; i += PRE_IMPORT_ID_CHUNK) {

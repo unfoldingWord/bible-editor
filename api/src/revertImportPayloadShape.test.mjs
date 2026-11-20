@@ -31,6 +31,7 @@ registerHooks({
 const { applyTsvRows, parseTsvRowForTest } = await import("./bookReimport.ts");
 const { parseTsv } = await import("./importParsers.ts");
 const { loadPreImportTsvRows, parseTsvRowsById, preImportRowMatchesMaster } = await import("./export.ts");
+const { EDIT_LOG_RETENTION_SECONDS } = await import("./editLogSweep.ts");
 
 let failed = 0;
 function ok(cond, msg) {
@@ -119,6 +120,24 @@ for (const kind of ["tn", "tq", "twl"]) {
   ok(
     ids.every((id) => (kind === "tn" ? aged.get(id) != null : aged.get(id) === null)),
     `${kind}: an entry older than the edit_log retention window ${kind === "tn" ? "still counts (tn is never swept)" : "is no evidence"}`,
+  );
+  // Boundary (review A2): the day of slack makes entries NEAR the cutoff no
+  // evidence, never older ones evidence. Entries were written at `writtenAt`.
+  const writtenAt = Number(
+    (await env.DB.prepare(`SELECT MAX(created_at) AS t FROM edit_log WHERE kind = ?1`).bind(kind).first()).t,
+  );
+  const atAge = async (ageS) => loadPreImportTsvRows(env.DB, kind, BOOK, ids, syncedAt, writtenAt + ageS);
+  const twoDaysInside = await atAge(EDIT_LOG_RETENTION_SECONDS - 2 * 86400);
+  ok(ids.every((id) => twoDaysInside.get(id) != null), `${kind}: an entry two days inside the retention window is evidence`);
+  const halfDayInside = await atAge(EDIT_LOG_RETENTION_SECONDS - 43200);
+  ok(
+    ids.every((id) => (kind === "tn" ? halfDayInside.get(id) != null : halfDayInside.get(id) === null)),
+    `${kind}: an entry half a day from the sweep cutoff ${kind === "tn" ? "still counts (tn)" : "is no evidence (within the day of slack)"}`,
+  );
+  const halfDayPast = await atAge(EDIT_LOG_RETENTION_SECONDS + 43200);
+  ok(
+    ids.every((id) => (kind === "tn" ? halfDayPast.get(id) != null : halfDayPast.get(id) === null)),
+    `${kind}: an entry half a day past the sweep cutoff ${kind === "tn" ? "still counts (tn)" : "is no evidence"}`,
   );
 }
 

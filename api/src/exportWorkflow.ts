@@ -2002,7 +2002,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         let report: {
           attention: Array<UsfmRevertEntry | TsvRevertEntry>;
           probablyOurs: Array<UsfmRevertEntry | TsvRevertEntry>;
-          probablyOursBasis?: { kind: "imported_head"; importedSha: string };
+          importedHead?: { importedSha: string; rows: ReadonlyArray<UsfmRevertEntry | TsvRevertEntry> };
         } = lineageReport;
         const importReason = importedHeadUnusableReason(importedSync, fresh.masterSha);
         if (lineageReport.attention.length > 0) {
@@ -2034,7 +2034,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
                 report = {
                   attention: split.attention,
                   probablyOurs: [...lineageReport.probablyOurs, ...split.probablyOurs],
-                  probablyOursBasis: { kind: "imported_head", importedSha: importedSync!.sourceSha as string },
+                  // Only these rows are worded with the import evidence; any
+                  // lineage-labelled rows keep their own reason in the record.
+                  importedHead: { importedSha: importedSync!.sourceSha as string, rows: split.probablyOurs },
                 };
               }
             } catch (e) {
@@ -3577,9 +3579,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     report: {
       attention: Array<UsfmRevertEntry | TsvRevertEntry>;
       probablyOurs: Array<UsfmRevertEntry | TsvRevertEntry>;
-      // #1419: set when the probablyOurs rows come from the imported-head
-      // partition rather than the master lineage (the record's wording).
-      probablyOursBasis?: { kind: "imported_head"; importedSha: string };
+      // #1419: the probablyOurs rows the imported-head partition labelled
+      // (the rest are lineage-labelled); planRevertReportAlerts words each
+      // group with its own reason.
+      importedHead?: { importedSha: string; rows: ReadonlyArray<UsfmRevertEntry | TsvRevertEntry> };
     },
     mechanical: boolean,
     branch: string,
@@ -3637,7 +3640,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       mechanical,
       branch,
       generation,
-      probablyOursBasis: report.probablyOursBasis,
+      importedHead: report.importedHead,
     });
     for (const a of alerts) {
       await this.writeAlert(
