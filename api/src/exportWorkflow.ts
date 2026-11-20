@@ -4040,7 +4040,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // the retry does not put them back. An attempt that committed but died
   // before recordPushedRender left the rows that commit dropped in the
   // marker's committedids instead, and an unverified retry keeps them out
-  // too (#1455).
+  // too (#1455), also when that attempt was itself a retry (#1463).
   private async masterMovedGuard(
     book: string,
     resource: "tn" | "tq" | "twl",
@@ -4161,11 +4161,20 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       let ownDropped: string[] = [];
       if (retry) {
         const marker = await this.env.BLOBS.head(d1RenderKey(r2Key));
-        if (marker?.customMetadata?.basesha === pointer.blobSha) {
-          mode = marker.customMetadata?.basemode === "carry" ? "carry" : "full";
-          const ids = marker.customMetadata?.droppedids;
-          if (ids && prior.pushed_blob_sha != null && marker.customMetadata?.pushedsha === prior.pushed_blob_sha) {
-            ownDropped = ids.split(",").map((id) => decodeURIComponent(id));
+        const meta = marker?.customMetadata;
+        if (meta?.basesha === pointer.blobSha) {
+          mode = meta.basemode === "carry" ? "carry" : "full";
+          const recorded = prior.pushed_blob_sha != null && meta.pushedsha === prior.pushed_blob_sha;
+          if (recorded && meta.droppedids) {
+            ownDropped = meta.droppedids.split(",").map((id) => decodeURIComponent(id));
+          } else if (!recorded && meta.committedids && meta.basekey != null && meta.basekey === pointer.r2Key) {
+            // A later attempt rewrote the marker after the recorded push
+            // (#1463). Its droppedids may be planned only, but committedids
+            // are the drops of this instance's last commit. Every attempt
+            // measured against the same base (pointer is prev_*, which a
+            // same-key recordPushedRender leaves alone), so the base check is
+            // the non-retry one (#1455).
+            ownDropped = meta.committedids.split(",").map((id) => decodeURIComponent(id));
           }
         }
       } else if (prior.pushed_read_at != null && prior.master_confirmed_at === prior.pushed_read_at) {
