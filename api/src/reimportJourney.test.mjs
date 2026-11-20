@@ -2568,6 +2568,112 @@ console.log("\n[#1461: a tq row whose updates the sweep removed has no ancestor,
     eq(row.review_kind, null, "…no flag");
     eq(row.response, "her edit", "…and her edit stands");
   }
+
+  // 6. A RECENT UN-VERSIONED ENTRY does not hide the gap. A sync_clear_review
+  //    (prev NULL, new 0) lands after the swept update. It moves no version, so
+  //    the gap still follows the old create, in both the mid and tail shapes.
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite, "sw06", { version: 3, response: "r2" });
+    log(sqlite, { id: 10, rowKey: "sw06", action: "create", prev: null, next: 1, payload: CREATE, at: OLD });
+    log(sqlite, { id: 20, rowKey: "sw06", action: "update", prev: 1, next: 2, payload: { response: "r" }, at: OLD + 86400 });
+    log(sqlite, { id: 35, rowKey: "sw06", action: "sync_clear_review", prev: null, next: 0, payload: { review_kind: "merge_no_base" }, at: RECENT - 2 * 86400, source: "dcs_reimport" });
+    log(sqlite, { id: 40, rowKey: "sw06", action: "update", prev: 2, next: 3, payload: { response: "r2" }, at: RECENT });
+    runSweep(sqlite);
+    eq(surviving(sqlite, "sw06"), [10, 35, 40], "mid gap: the clear survives beside the create");
+    const counts = await applyTsvRows(env, BOOK, "tq", masterRow("sw06", "r"), null, {
+      confirmedAt: RECENT - 86400, editId: BOUNDARY,
+    });
+    const row = sqlite.prepare(`SELECT response FROM tq_rows WHERE id = 'sw06'`).all()[0];
+    eq(row.response, "r2", "mid gap behind a clear: the translator's edit is not overwritten");
+    eq(counts.merge_no_base, 1, "…keep_no_base");
+  }
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite, "sw07", { version: 2, response: "r" });
+    log(sqlite, { id: 10, rowKey: "sw07", action: "create", prev: null, next: 1, payload: CREATE, at: OLD });
+    log(sqlite, { id: 20, rowKey: "sw07", action: "update", prev: 1, next: 2, payload: { response: "r" }, at: OLD + 86400 });
+    log(sqlite, { id: 35, rowKey: "sw07", action: "sync_clear_review", prev: null, next: 0, payload: { review_kind: "merge_no_base" }, at: RECENT - 2 * 86400, source: "dcs_reimport" });
+    runSweep(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", masterRow("sw07", ""), null, {
+      confirmedAt: RECENT - 86400, editId: BOUNDARY,
+    });
+    eq(counts.merge_no_base, 1, "tail gap behind a clear: still no ancestor");
+  }
+
+  // 7. A #653 PROVISIONAL base is the create itself, above a frozen boundary.
+  //    If an update after it was swept, that base is stale too, and its one
+  //    allowed outcome (a clean `keep` when master equals it) would read a
+  //    Door43 revert to the create's value as "master never moved".
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite, "sw08", { version: 2, response: "r" });
+    log(sqlite, { id: 10, rowKey: "sw08", action: "create", prev: null, next: 1, payload: CREATE, at: OLD });
+    log(sqlite, { id: 20, rowKey: "sw08", action: "update", prev: 1, next: 2, payload: { response: "r" }, at: OLD + 86400 });
+    runSweep(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", masterRow("sw08", ""), null, {
+      confirmedAt: OLD - 86400, editId: 5, // frozen before the row existed: the create is above it
+    });
+    const row = sqlite.prepare(`SELECT response, review_kind FROM tq_rows WHERE id = 'sw08'`).all()[0];
+    eq(counts.merge_no_base, 1, "a provisional create followed by a swept update is no ancestor");
+    eq(row.review_kind, "merge_no_base", "…so the difference is flagged");
+  }
+
+  // 8. A REAL FLAG MINT bumps the version: the keep_no_base flag goes through
+  //    buildTsvEditedWriteStmt, which bumps `version` and logs an `update`
+  //    carrying only the review fields. While that entry survives it is part of
+  //    the chain, so the next run still folds the create. (Once it is swept it
+  //    reads as a gap: a known false merge_no_base, never a wrong ancestor.)
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite, "sw09", { version: 2, response: "her edit" });
+    // A pre-#1462 create that never carried `question`.
+    const { question: _q, ...createNoQuestion } = CREATE;
+    log(sqlite, { id: 10, rowKey: "sw09", action: "create", prev: null, next: 1, payload: createNoQuestion, at: OLD });
+    log(sqlite, { id: 40, rowKey: "sw09", action: "update", prev: 1, next: 2, payload: { response: "her edit" }, at: RECENT });
+    runSweep(sqlite);
+    // Night 1: master moved only `question`, which the create never carried
+    // -> no_base -> a flag-only write.
+    const night1 = masterRow("sw09", "her edit");
+    night1[0].question = "a Door43 question";
+    const c1 = await applyTsvRows(env, BOOK, "tq", night1, null, { confirmedAt: RECENT - 86400, editId: BOUNDARY });
+    eq(c1.merge_no_base, 1, "night 1 mints a merge_no_base flag");
+    const mint = sqlite
+      .prepare(`SELECT prev_version, new_version, action FROM edit_log WHERE row_key = 'sw09' AND id > 40`)
+      .all()
+      .map((r) => [r.action, r.prev_version, r.new_version]);
+    eq(mint, [["update", 2, 3]], "…as a version-bumping update entry");
+    // Night 2: master holds the create's response; the translator's edit
+    // differs. Only a surviving ancestor can call that a clean keep.
+    const c2 = await applyTsvRows(env, BOOK, "tq", masterRow("sw09", ""), null, { confirmedAt: RECENT - 86400, editId: BOUNDARY });
+    eq(c2.merge_no_base, 0, "night 2 still folds the create: the mint continued the chain");
+    eq(sqlite.prepare(`SELECT response FROM tq_rows WHERE id = 'sw09'`).all()[0].response, "her edit", "…her edit stands");
+  }
+
+  // 9. The REFERENCE fold drops the stale create too. A swept update moved the
+  //    row to 9:10; Door43 has moved it back to 9:9. Against the create's 9:9
+  //    that reads as "ours moved", the one outcome that writes D1's location
+  //    over master's; with no ancestor it must hold instead.
+  {
+    const { sqlite, env } = freshEnv();
+    sqlite.prepare(`INSERT OR IGNORE INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, quote, question, response, version, updated_by)
+         VALUES ('sw10', ?, 9, 10, '9:10', NULL, '', 'her edit', 3, 1)`,
+      )
+      .run(BOOK);
+    log(sqlite, { id: 10, rowKey: "sw10", action: "create", prev: null, next: 1, payload: CREATE, at: OLD });
+    log(sqlite, { id: 20, rowKey: "sw10", action: "update", prev: 1, next: 2, payload: { ref_raw: "9:10", chapter: 9, verse: 10 }, at: OLD + 86400 });
+    log(sqlite, { id: 40, rowKey: "sw10", action: "update", prev: 2, next: 3, payload: { response: "her edit" }, at: RECENT });
+    runSweep(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", masterRow("sw10", ""), null, {
+      confirmedAt: RECENT - 86400, editId: BOUNDARY,
+    });
+    eq(counts.ref_moved_ours, 0, "a stale create never attributes the reference move to us");
+    const row = sqlite.prepare(`SELECT chapter, verse, ref_raw FROM tq_rows WHERE id = 'sw10'`).all()[0];
+    eq([row.chapter, row.verse, row.ref_raw], [9, 10, "9:10"], "…and D1's location is left as it was");
+  }
 }
 
 console.log("\n[#653: with NO ancestor at all, the mint is gated on the measured lineage]");
