@@ -84,6 +84,8 @@ function door43() {
         const size = d.noSize ? undefined : Buffer.byteLength(text);
         return json({ sha: "blob-" + text.length, size, content: b64(text), encoding: "base64" });
       }
+      // d.commitFails: Door43 rejects the write, so commitToDcs throws.
+      if (d.commitFails) return new Response("boom", { status: 500 });
       const body = JSON.parse(init.body);
       d.branch = unb64(body.content);
       d.writes.push(d.branch);
@@ -519,6 +521,89 @@ console.log("\n[14b. refused night N, guard measures and does not refuse on nigh
   const n3 = await t.exportOne("export-night-3");
   ok(n3.dcsSkippedReason === "unchanged", `night N+1 ships (got ${n3.dcsSkippedReason})`);
   ok(t.live(`export_master_moved:${BOOK}:ult`).length === 0, "the refusal alert is cleared");
+}
+
+// D1 holds 1:5 with ONE word unaligned: translator-scale loss, which ships
+// with a warning banner and does not block on its own. `badLayout` also puts
+// a mixed \p/\m pair before 1:4, which the render does not self-heal, so the
+// USFM validity gate holds the push. Master is Door43's real file with no
+// proven base, so the keep-master verse guard does not measure.
+function alignLossNight(badLayout) {
+  const s5 = verseSpan(DOOR43_OBA, 5);
+  const v5 = DOOR43_OBA.slice(s5.start, s5.end);
+  const oneOff = v5.replace(/\\zaln-s \|[^\\]*\\\*/, "").replace(/\\zaln-e\\\*/, "");
+  let file = DOOR43_OBA.slice(0, s5.start) + oneOff + DOOR43_OBA.slice(s5.end);
+  if (badLayout) file = file.replace("\\q1 \\v 4 ", "\\p\n\\m\n\\q1 \\v 4 ");
+  const d = door43();
+  const t = freshEnv(file);
+  d.master = DOOR43_OBA;
+  return { d, t };
+}
+
+console.log("\n[15. translator-scale alignment loss, then held by the USFM validity gate → no \"shipped\" wording (#1448)]");
+{
+  const { d, t } = alignLossNight(true);
+  const logs = [];
+  const origLog = console.log;
+  console.log = (...a) => {
+    logs.push(a.join(" "));
+    origLog(...a);
+  };
+  let r;
+  try {
+    r = await t.exportOne("export-night-1");
+  } finally {
+    console.log = origLog;
+  }
+  ok(String(r.dcsSkippedReason).startsWith("usfm_invalid_guard:"), `held by the USFM gate (got ${r.dcsSkippedReason})`);
+  ok(d.writes.length === 0, "nothing committed");
+  const align = t.live(`export_align_shrink:${BOOK}:ult`);
+  ok(align.length === 1, `the lost-alignment alert is recorded (${align.length})`);
+  ok(align[0] && !align[0].message.includes("BLOCKED"), `(setup: the loss is translator-scale, not blocking: ${align[0]?.message})`);
+  ok(align[0] && !/shipped|is on Door43/.test(align[0].message), `the alert does not say the book shipped (${align[0]?.message})`);
+  ok(align[0] && align[0].message.includes("not pushed"), `the alert says it was not pushed (${align[0]?.message})`);
+  ok(!logs.some((l) => l.includes("shipping")), `no "shipping" log line (${logs.filter((l) => l.includes("shipping")).join(" | ")})`);
+}
+
+console.log("\n[15b. the same loss on a night that ships → the \"shipped … but with alignment to fix\" banner, as before]");
+{
+  const { d, t } = alignLossNight(false);
+  const r = await t.exportOne("export-night-1");
+  ok(d.writes.length === 1 && r.dcsSkippedReason == null, `ships (got ${r.dcsSkippedReason}, writes ${d.writes.length})`);
+  const align = t.live(`export_align_shrink:${BOOK}:ult`);
+  ok(
+    align.length === 1 && align[0].message.includes("shipped to Door43, but with alignment to fix"),
+    `the alert says it shipped with alignment to fix (${align[0]?.message})`,
+  );
+}
+
+console.log("\n[15c. the same loss when the Door43 commit fails → the step fails and no \"shipped\" wording (#1448)]");
+{
+  const { d, t } = alignLossNight(false);
+  d.commitFails = true;
+  let error = null;
+  try {
+    await t.exportOne("export-night-1");
+  } catch (e) {
+    error = e;
+  }
+  ok(error && String(error.message).startsWith("dcs_commit_failed"), `the commit throws (got ${error?.message})`);
+  ok(d.writes.length === 0, "nothing committed");
+  const align = t.live(`export_align_shrink:${BOOK}:ult`);
+  ok(
+    !align.some((a) => /shipped|is on Door43/.test(a.message)),
+    `no alert says the book shipped (${align.map((a) => a.message).join(" | ")})`,
+  );
+
+  console.log("\n[15d. the step.do retry of that night, with Door43 back, ships and records the shipped banner]");
+  d.commitFails = false;
+  const r = await t.exportOne("export-night-1");
+  ok(d.writes.length === 1 && r.dcsSkippedReason == null, `the retry ships (got ${r.dcsSkippedReason}, writes ${d.writes.length})`);
+  const after = t.live(`export_align_shrink:${BOOK}:ult`);
+  ok(
+    after.length === 1 && after[0].message.includes("shipped to Door43, but with alignment to fix"),
+    `the alert says it shipped with alignment to fix (${after[0]?.message})`,
+  );
 }
 
 if (failed > 0) {
