@@ -90,6 +90,12 @@ export function d1RenderKey(r2Key: string): string {
   return `${r2Key}.d1-render`;
 }
 
+// Longest id list the d1-render marker stores, per key (droppedids,
+// committedids). Two lists plus the shas stay under R2's 2 KB of custom
+// metadata. A longer list is left off, never cut: the marker then protects
+// nothing, as before #1452. At most MASTER_MOVED_REFUSE_THRESHOLD ids reach it.
+const MARKER_IDS_CAP = 768;
+
 // IDs whose line differs between D1's render and the bytes pushed for it:
 // the rows that push kept from master (#1403 carry mode), plus the rows it
 // left out because Door43 had deleted them (#1415).
@@ -1198,9 +1204,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     let tsvMasterContentForRevertReport: string | null = null;
     let tsvMasterVerified = false;
     let keepMaster: Awaited<ReturnType<ExportWorkflow["masterMovedGuard"]>> | null = null;
-    // The d1-render marker this attempt wrote with droppedids, put again with
-    // committed=1 once commitToDcs returns (#1455).
-    let droppedMarker: { body: string; meta: Record<string, string> } | null = null;
+    // The d1-render marker this attempt wrote, put again with committedids
+    // once commitToDcs returns (#1455).
+    let tsvMarker: { body: string; meta: Record<string, string> } | null = null;
     let shrinkRows = built.rowCount;
     if (dcsAllowed && (resource === "tn" || resource === "tq" || resource === "twl")) {
       const master = await this.fetchTsvMaster(book, resource, fresh.masterSha);
@@ -1385,30 +1391,20 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             pushedsha: pushedSha,
             basesha: guard.baseBlobSha,
             basemode: guard.mode,
-            ...(droppedIds.length > 0 && droppedIds.length <= 1024 ? { droppedids: droppedIds } : {}),
+            ...(droppedIds.length > 0 && droppedIds.length <= MARKER_IDS_CAP ? { droppedids: droppedIds } : {}),
           };
-          // A retry must not erase an earlier attempt's committed=1 (#1455)
-          // before its own commit runs. On the same base, the marker keeps
-          // the flag and lists the union of both attempts' drops: each id is
-          // already off the branch or was measured missing from master on
-          // this base, and planKeepMasterRows still drops one only while ours
-          // is unchanged from base and master lacks it. A union over the 1024
-          // cap keeps the committed ids alone until this attempt commits, then
-          // this attempt's own (what its commit left off the branch).
-          let committedIds = markerMeta.droppedids;
+          // committedids: the rows this instance's last successful commit
+          // left off the branch (#1455), set only after commitToDcs returns.
+          // The branch has not changed yet, so a retry carries the previous
+          // marker's list over unchanged, on the same base only.
           const prev = (await this.env.BLOBS.head(d1RenderKey(r2Key)))?.customMetadata;
-          if (prev?.committed === "1" && prev.basesha === markerMeta.basesha && prev.droppedids) {
-            const union = [...new Set([...prev.droppedids.split(","), ...(markerMeta.droppedids?.split(",") ?? [])])].join(",");
-            if (union.length <= 1024) committedIds = union;
-            markerMeta.droppedids = union.length <= 1024 ? union : prev.droppedids;
-            markerMeta.committed = "1";
-          }
+          if (prev?.committedids && prev.basesha === markerMeta.basesha) markerMeta.committedids = prev.committedids;
           await this.env.BLOBS.put(d1RenderKey(r2Key), d1Render, {
             httpMetadata: { contentType: "text/tab-separated-values" },
             // Lowercase keys: R2 metadata travels as HTTP headers in some paths.
             customMetadata: markerMeta,
           });
-          if (committedIds) droppedMarker = { body: d1Render, meta: { ...markerMeta, droppedids: committedIds } };
+          tsvMarker = { body: d1Render, meta: markerMeta };
           // The R2 copy at r2Key must hold the bytes that ship: it is the
           // pushed render the next export and the sync read back by hash.
           await this.env.BLOBS.put(r2Key, built.content, {
@@ -1725,19 +1721,35 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       };
       const message = `bible-editor export: ${book} ${resource} → ${branch} (${instanceId})`;
       const commit = await commitToDcs(dcsCfg, filename, built.content, message);
-      // The branch now holds this attempt's drops. If the step dies before
+      // The branch now holds this render. If the step dies before
       // recordPushedRender, pushed_r2_key still names an older push, so a
-      // retry is not seen as one; committed=1 on the marker tells it the drops
-      // shipped (#1455). Best-effort: when this put fails, recordPushedRender
-      // below still lets a retry find them (#1452). Also written when the
-      // commit changed nothing: master then already equals this render, so
-      // the dropped rows are off master too.
-      if (droppedMarker != null) {
+      // retry is not seen as one; the marker's committedids tell it which
+      // rows this commit left off (#1455). Exactly this attempt's drops: none
+      // when it dropped nothing, so a commit that shipped a row back clears
+      // it. Also when the commit changed nothing: master then equals this
+      // render, so those rows are off master too. Best-effort: when this
+      // fails, recordPushedRender below still makes the next attempt a
+      // retry, which reads droppedids instead (#1452).
+      if (resource === "tn" || resource === "tq" || resource === "twl") {
         try {
-          await this.env.BLOBS.put(d1RenderKey(r2Key), droppedMarker.body, {
-            httpMetadata: { contentType: "text/tab-separated-values" },
-            customMetadata: { ...droppedMarker.meta, committed: "1" },
-          });
+          let marker = tsvMarker;
+          if (marker == null) {
+            // No marker written this attempt: only an earlier attempt's
+            // committedids need clearing, and the body is needed to put it.
+            const prev = await this.env.BLOBS.head(d1RenderKey(r2Key));
+            if (prev?.customMetadata?.committedids) {
+              const obj = await this.env.BLOBS.get(d1RenderKey(r2Key));
+              if (obj != null) marker = { body: await obj.text(), meta: { ...(obj.customMetadata ?? {}) } };
+            }
+          }
+          if (marker != null && (marker.meta.committedids ?? "") !== (tsvMarker?.meta.droppedids ?? "")) {
+            const { committedids: _old, ...meta } = marker.meta;
+            const shipped = tsvMarker?.meta.droppedids;
+            await this.env.BLOBS.put(d1RenderKey(r2Key), marker.body, {
+              httpMetadata: { contentType: "text/tab-separated-values" },
+              customMetadata: shipped ? { ...meta, committedids: shipped } : meta,
+            });
+          }
         } catch (e) {
           console.error("export: committed marker write failed", {
             book,
@@ -4019,8 +4031,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // attempt's push is the one recorded, the retry also keeps out the rows it
   // dropped (the marker's droppedids, #1452), so an unverified master read on
   // the retry does not put them back. An attempt that committed but died
-  // before recordPushedRender left committed=1 on the marker instead, and an
-  // unverified retry keeps those drops out too (#1455).
+  // before recordPushedRender left the rows that commit dropped in the
+  // marker's committedids instead, and an unverified retry keeps them out
+  // too (#1455).
   private async masterMovedGuard(
     book: string,
     resource: "tn" | "tq" | "twl",
@@ -4171,13 +4184,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       }
       // An earlier attempt of this instance that committed but died before
       // recordPushedRender (#1455): pushed_* still names the base it measured
-      // against, so the base and mode here are its own; only its drops need
-      // carrying. Read only when it matters: a verified master read drops
+      // against, so the base and mode here are its own; only the rows its
+      // last commit left off (committedids) need carrying. Read only when it
+      // matters: a verified master read drops
       // them again on its own, and ULT/UST drop nothing.
       if (!retry && !masterVerified && resource !== "ult" && resource !== "ust") {
         const meta = (await this.env.BLOBS.head(d1RenderKey(r2Key)))?.customMetadata;
-        if (meta?.committed === "1" && meta.basesha === pointer.blobSha && meta.droppedids) {
-          ownDropped = meta.droppedids.split(",").map((id) => decodeURIComponent(id));
+        if (meta?.committedids && meta.basesha === pointer.blobSha) {
+          ownDropped = meta.committedids.split(",").map((id) => decodeURIComponent(id));
         }
       }
       // D1's render for the base push, when that push kept rows.
