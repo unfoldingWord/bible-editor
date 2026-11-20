@@ -91,9 +91,11 @@ export function d1RenderKey(r2Key: string): string {
 }
 
 // Longest id list the d1-render marker stores, per key (droppedids,
-// committedids). Two lists plus the shas stay under R2's 2 KB of custom
-// metadata. A longer list is left off, never cut: the marker then protects
-// nothing, as before #1452. At most MASTER_MOVED_REFUSE_THRESHOLD ids reach it.
+// committedids). Two lists plus the shas, the mode and basekey (an r2Key,
+// under 100 characters) stay under R2's 2 KB of custom metadata. A longer
+// list is left off, never cut: the marker then protects nothing, as before
+// #1452. At most MASTER_MOVED_REFUSE_THRESHOLD (20) ids of 4 characters reach
+// it, so a list is at most 99 characters in practice.
 const MARKER_IDS_CAP = 768;
 
 // IDs whose line differs between D1's render and the bytes pushed for it:
@@ -1391,14 +1393,19 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             pushedsha: pushedSha,
             basesha: guard.baseBlobSha,
             basemode: guard.mode,
+            // Which push the base is, not just its bytes: an overlapping
+            // instance can record a push with the same sha (#1455).
+            ...(guard.baseR2Key ? { basekey: guard.baseR2Key } : {}),
             ...(droppedIds.length > 0 && droppedIds.length <= MARKER_IDS_CAP ? { droppedids: droppedIds } : {}),
           };
           // committedids: the rows this instance's last successful commit
           // left off the branch (#1455), set only after commitToDcs returns.
           // The branch has not changed yet, so a retry carries the previous
-          // marker's list over unchanged, on the same base only.
+          // marker's list over unchanged, on the same base push only.
           const prev = (await this.env.BLOBS.head(d1RenderKey(r2Key)))?.customMetadata;
-          if (prev?.committedids && prev.basesha === markerMeta.basesha) markerMeta.committedids = prev.committedids;
+          if (prev?.committedids && prev.basesha === markerMeta.basesha && prev.basekey === markerMeta.basekey) {
+            markerMeta.committedids = prev.committedids;
+          }
           await this.env.BLOBS.put(d1RenderKey(r2Key), d1Render, {
             httpMetadata: { contentType: "text/tab-separated-values" },
             // Lowercase keys: R2 metadata travels as HTTP headers in some paths.
@@ -4045,7 +4052,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // push already left out (#1424; keepMasterBase's droppedKeys).
     masterVerified: boolean,
   ): Promise<
-    | { measured: true; plan: KeepMasterPlan; baseBlobSha: string; mode: "full" | "carry" }
+    | { measured: true; plan: KeepMasterPlan; baseBlobSha: string; baseR2Key: string | null; mode: "full" | "carry" }
     | { measured: false; reason: string }
   > {
     const base = await this.keepMasterBase(book, resource, r2Key, masterVerified);
@@ -4061,7 +4068,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         base.droppedKeys,
       );
       if (plan == null) return this.keepMasterNotMeasured(book, resource, "unparseable");
-      return { measured: true, plan, baseBlobSha: base.baseBlobSha, mode: base.mode };
+      return { measured: true, plan, baseBlobSha: base.baseBlobSha, baseR2Key: base.baseR2Key, mode: base.mode };
     } catch (e) {
       return this.keepMasterFailed(book, resource, e);
     }
@@ -4121,6 +4128,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         // null when it dropped none or its pushed bytes could not be read.
         droppedKeys: Set<string> | null;
         baseBlobSha: string;
+        baseR2Key: string | null;
         mode: "full" | "carry";
       }
     | { ok: false; reason: string }
@@ -4193,7 +4201,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       if (!retry && !masterVerified && resource !== "ult" && resource !== "ust") {
         try {
           const meta = (await this.env.BLOBS.head(d1RenderKey(r2Key)))?.customMetadata;
-          if (meta?.committedids && meta.basesha === pointer.blobSha) {
+          if (meta?.committedids && meta.basesha === pointer.blobSha && meta.basekey != null && meta.basekey === pointer.r2Key) {
             ownDropped = meta.committedids.split(",").map((id) => decodeURIComponent(id));
           }
         } catch (e) {
@@ -4239,7 +4247,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // base and master still lacks it.
       if (ownDropped.length > 0 && !isVerse) droppedKeys = new Set([...(droppedKeys ?? []), ...ownDropped]);
       if (baseText == null) return notMeasured("base_unreadable");
-      return { ok: true, baseText, onlyKeys, droppedKeys, baseBlobSha: pointer.blobSha, mode };
+      return { ok: true, baseText, onlyKeys, droppedKeys, baseBlobSha: pointer.blobSha, baseR2Key: pointer.r2Key, mode };
     } catch (e) {
       return { ok: false, ...this.keepMasterFailed(book, resource, e) };
     }
