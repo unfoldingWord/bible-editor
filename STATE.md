@@ -992,7 +992,7 @@ Highlights that bite repeatedly:
   above. ULT/UST follow since #1439 (`revertImportVerses.ts`), with one difference: a verse is matched against
   master's file run through `extractVersesForRange` (and, for an adoption over an edited verse, through
   `canonizeAlignmentSource` with D1's UHB/UGNT words), exactly, never against `verseTextByRef(master)`. The import
-  stores the extract, which differs from master's raw parse on 3-11% of verses of the sample files (quotes and
+  stores the extract, which differs from master's raw parse on up to 11% of verses of the sample files (ZEC; OBA 0%) (quotes and
   dashes moved out of `\w`, a leading `\q1`), and no comparison mask recovers those; a looser lens here only moves
   verses toward quiet. A source-attribute reconcile logs a `dcs_reimport` 'update' with the adoption's payload
   keys, so only the content tells it apart (`revertImportVersePayloadShape.test.mjs` pins all of this).

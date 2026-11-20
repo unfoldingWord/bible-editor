@@ -203,16 +203,19 @@ export async function loadSourceWordsForRefs(
   const out = new Map<string, SourceWord[]>();
   if (chapters.length === 0) return out;
   const wanted = new Set(refs);
-  const marks = chapters.map((_, i) => `?${i + 3}`).join(", ");
-  const { results } = await db
-    .prepare(`SELECT chapter, verse, content_json FROM verses WHERE book = ?1 AND bible_version = ?2 AND chapter IN (${marks})`)
-    .bind(book, sourceVersion, ...chapters)
-    .all<{ chapter: number; verse: number; content_json: string }>();
-  for (const r of results ?? []) {
-    const ref = `${r.chapter}:${r.verse}`;
-    if (!wanted.has(ref)) continue;
-    const vo = verseObjectsJson(r.content_json);
-    if (vo !== null) out.set(ref, collectSourceWords(JSON.parse(vo) as unknown[]));
+  for (let i = 0; i < chapters.length; i += PRE_IMPORT_CHUNK) {
+    const chunk = chapters.slice(i, i + PRE_IMPORT_CHUNK);
+    const marks = chunk.map((_, j) => `?${j + 3}`).join(", ");
+    const { results } = await db
+      .prepare(`SELECT chapter, verse, content_json FROM verses WHERE book = ?1 AND bible_version = ?2 AND chapter IN (${marks})`)
+      .bind(book, sourceVersion, ...chunk)
+      .all<{ chapter: number; verse: number; content_json: string }>();
+    for (const r of results ?? []) {
+      const ref = `${r.chapter}:${r.verse}`;
+      if (!wanted.has(ref)) continue;
+      const vo = verseObjectsJson(r.content_json);
+      if (vo !== null) out.set(ref, collectSourceWords(JSON.parse(vo) as unknown[]));
+    }
   }
   return out;
 }
