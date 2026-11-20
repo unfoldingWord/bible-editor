@@ -181,7 +181,7 @@ function freshEnv(door43File = DOOR43_OBA) {
   // whose failure after the retries is caught and recorded (#1450).
   const exportStep = (step, instanceId, dcsAllowed = true) =>
     wf.runExportStep(step, BOOK, "ult", null, () => exportOne(instanceId, dcsAllowed));
-  return { sqlite, env, r2, exportOne, exportStep, live, reverts, render, editD1 };
+  return { sqlite, env, r2, wf, exportOne, exportStep, live, reverts, render, editD1 };
 }
 
 // A WorkflowStep stand-in that honours `retries.limit` the way Cloudflare
@@ -678,6 +678,57 @@ console.log("\n[16e. after a failed night, Door43 already matching D1's render (
   const r = await t.exportStep(retryingStep(), "export-night-2");
   ok(r.dcsSkippedReason === "unchanged", `(setup: unchanged, got ${r.dcsSkippedReason})`);
   ok(t.live(`export_step_failed:${BOOK}:ult`).length === 0, "the export_step_failed alert is gone");
+}
+
+console.log("\n[16f. a dismissed failure, a clean night, then the same failure again → a live alert]");
+{
+  const d = door43();
+  const t = freshEnv();
+  const failSource = `export_step_failed:${BOOK}:ult`;
+  const dismiss = () =>
+    t.sqlite.prepare(`UPDATE system_alerts SET dismissed_at = unixepoch() WHERE source = ? AND dismissed_at IS NULL`).run(failSource);
+  d.master = DOOR43_OBA;
+  d.commitFails = true;
+  const dismissedReason = (await t.exportStep(retryingStep(), "export-night-1")).dcsSkippedReason;
+  dismiss();
+  ok(t.live(failSource).length === 0, "(setup: dismissed)");
+
+  console.log("\n[16g. still failing with the same error → it stays dismissed (#458)]");
+  await t.exportStep(retryingStep(), "export-night-2");
+  ok(t.live(failSource).length === 0, "the dismissed alert does not come back");
+
+  // A clean night that writes nothing (`unchanged`), so the next failure
+  // makes the same create call and carries the identical message.
+  d.commitFails = false;
+  d.master = await t.render("n3");
+  const clean = await t.exportStep(retryingStep(), "export-night-3");
+  ok(clean.dcsSkippedReason === "unchanged", `(setup: a clean night, got ${clean.dcsSkippedReason})`);
+  t.editD1(3, "pride", "arrogance");
+  d.commitFails = true;
+  const again = await t.exportStep(retryingStep(), "export-night-4");
+  ok(again.dcsSkippedReason === dismissedReason, `(setup: the same error again, got ${again.dcsSkippedReason})`);
+  ok(t.live(failSource).length === 1, `the new failure is a live alert (got ${t.live(failSource).length})`);
+}
+
+console.log("\n[16h. a locked book, and a branchName override run, do not clear the alert]");
+{
+  const d = door43();
+  const t = freshEnv();
+  const failSource = `export_step_failed:${BOOK}:ult`;
+  d.master = DOOR43_OBA;
+  d.commitFails = true;
+  await t.exportStep(retryingStep(), "export-night-1");
+  d.commitFails = false;
+  const locked = await t.wf.runExportStep(retryingStep(), BOOK, "ult", null, () =>
+    t.wf.exportOne(BOOK, "ult", "export-night-2", true, false, new Set([BOOK]), false),
+  );
+  ok(locked.dcsSkippedReason != null && d.writes.length === 0, `(setup: the lock skips, got ${locked.dcsSkippedReason})`);
+  ok(t.live(failSource).length === 1, "the lock skip leaves the alert up");
+  const override = await t.wf.runExportStep(retryingStep(), BOOK, "ult", "custom-branch", () =>
+    t.exportOne("export-night-3"),
+  );
+  ok(override.dcsSkippedReason == null && d.writes.length === 1, `(setup: the override run ships, got ${override.dcsSkippedReason})`);
+  ok(t.live(failSource).length === 1, "the branchName override run leaves the alert up");
 }
 
 console.log("\n[16d. Door43 fails once, then the step's own retry ships → no alert]");
