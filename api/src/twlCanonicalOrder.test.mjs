@@ -13,6 +13,7 @@ import {
   twlAnchorContext,
   twlSortPosition,
 } from "./twlCanonicalOrder.ts";
+import { canonicalTwlOrder as webCanonicalTwlOrder } from "../../web/src/lib/twlCanonicalOrder.ts";
 import usfm from "usfm-js";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -957,11 +958,76 @@ function ultVerseOccSpans(chapter, verse, spans) {
     "no x-ref: 9:10 bucket keeps the whole-bridge order (asher, hiram)",
   );
 
-  // Known gap, unchanged here: the bridge row is found only for its START verse
-  // (exact verse match), so 9:11 / 9:12 buckets get no ULT and keep stored order.
-  const rows11 = [twl("et", 9, 11, et, 1, 100), twl("x", 9, 11, hiram, 1, 200)];
-  const later = orderTwlRows(rows11, [bridge]);
-  assert(later.sortOrderUpdates.length === 0, "later bridge verses: no ULT found, stored order kept");
+  // The bridge's LATER verses (#1442): D1 stores the bridge once under its start
+  // verse, so a 9:11 / 9:12 bucket must find the row that COVERS it and order by
+  // that verse's copies, exactly as the web client does (Shell's verse index
+  // maps every covered verse to the bridge row, with sourceRef "9:11").
+  const king11 = contentsOver(bridgeVo, "9:11", "King")[0];
+  const king12 = contentsOver(bridgeVo, "9:12", "him")[0];
+  const takeLink = "rc://en/tw/dict/bible/other/take";
+  const titles = new Map([[takeLink, "take"]]);
+  const webIds = (rows, vo, ref, t = null) => webCanonicalTwlOrder(rows, vo, t, ref).map((r) => r.id);
+  const apiIds = (o) => [...o.versePositions].sort((x, y) => x[1] - y[1]).map(([id]) => id);
+
+  const rows11 = [twl("et", 9, 11, et, 1, 100), twl("king", 9, 11, king11, 1, 200)];
+  const later11 = orderTwlRows(rows11, [bridge], titles);
+  assert(
+    apiIds(later11).join(",") === "king,et" &&
+      apiIds(later11).join(",") === webIds(rows11, bridgeVo, "9:11", titles).join(","),
+    `9:11 bucket follows 9:11's English like the web: king, et (api ${apiIds(later11)}, web ${webIds(rows11, bridgeVo, "9:11", titles)})`,
+  );
+  const updates11 = toMap(later11.sortOrderUpdates);
+  assert(
+    updates11.king === 100 && updates11.et === 200,
+    `9:11 bucket writes king 100, et 200 (got ${JSON.stringify(updates11)})`,
+  );
+
+  const rows12 = [
+    twl("king", 9, 12, king12, 1, 100),
+    { ...twl("asher", 9, 12, asher, 1, 200), tw_link: takeLink },
+  ];
+  const later12 = orderTwlRows(rows12, [bridge], titles);
+  assert(
+    apiIds(later12).join(",") === "asher,king" &&
+      apiIds(later12).join(",") === webIds(rows12, bridgeVo, "9:12", titles).join(","),
+    `9:12 bucket sorts by its own "gave", not 9:10's "took", like the web: asher, king (api ${apiIds(later12)}, web ${webIds(rows12, bridgeVo, "9:12", titles)})`,
+  );
+
+  // A bridge WITHOUT x-ref: the client still orders a later verse by the whole
+  // bridge (the verse argument changes nothing there), so the export must too.
+  // Stored order is the reverse of the whole-bridge order (et 5, Hiram 46).
+  const legacyRows11 = [twl("hiram", 9, 11, hiram, 1, 100), twl("et", 9, 11, et, 1, 200)];
+  const legacy11 = orderTwlRows(legacyRows11, [legacy], titles);
+  assert(
+    apiIds(legacy11).join(",") === "et,hiram" &&
+      apiIds(legacy11).join(",") === webIds(legacyRows11, legacyVo, "9:11", titles).join(","),
+    `no x-ref: 9:11 bucket follows the whole bridge like the web: et, hiram (api ${apiIds(legacy11)}, web ${webIds(legacyRows11, legacyVo, "9:11", titles)})`,
+  );
+  const legacyUpdates11 = toMap(legacy11.sortOrderUpdates);
+  assert(
+    legacyUpdates11.et === 100 && legacyUpdates11.hiram === 200,
+    `no x-ref: 9:11 bucket writes et 100, hiram 200 (got ${JSON.stringify(legacyUpdates11)})`,
+  );
+
+  // A locked later verse keeps the human's order and writes nothing.
+  const locked11 = orderTwlRows(rows11, [bridge], titles, new Set(["9:11"]));
+  assert(
+    apiIds(locked11).join(",") === "et,king" && locked11.sortOrderUpdates.length === 0,
+    "locked 9:11 keeps stored order and writes nothing",
+  );
+
+  // A verse right after the bridge is not captured by it: its own row orders it,
+  // and with no row of its own it keeps stored order.
+  const v13 = { ...ultVerse(9, 13, [{ content: "ב", text: "beta" }, { content: "א", text: "alpha" }]), book: "2CH" };
+  const rows13 = [twl("a", 9, 13, "א", 1, 100), twl("b", 9, 13, "ב", 1, 200)];
+  assert(
+    apiIds(orderTwlRows(rows13, [bridge, v13])).join(",") === "b,a",
+    "9:13 after the bridge orders by its own ULT row",
+  );
+  assert(
+    orderTwlRows(rows13, [bridge]).sortOrderUpdates.length === 0,
+    "9:13 with no ULT row of its own is not ordered by the 9:10-12 bridge",
+  );
 }
 
 {
