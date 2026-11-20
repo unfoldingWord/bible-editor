@@ -54,7 +54,6 @@ function makeDb(sqlite, calls) {
   return {
     prepare: (sql) => mk(sql, []),
     async batch(stmts) {
-      calls.batches++;
       return stmts.map((s) => exec(s.sql, s.args));
     },
   };
@@ -108,6 +107,7 @@ const BOOK = "OBA";
 const T0 = 1_700_000_000; // the last confirmed push
 const OLD_SHA = "0".repeat(40);
 const SHA_1 = "1".repeat(40);
+const SHA_2 = "2".repeat(40);
 
 const TN_HEADER = "Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote";
 const tnLine = (ref, id, note) => `${ref}\t${id}\t\t\t\t\t${note}`;
@@ -130,7 +130,7 @@ function freshEnv({ locked }) {
       )
       .run(BOOK, ch);
   }
-  const calls = { singleRowWrites: 0, batches: 0 };
+  const calls = { singleRowWrites: 0 };
   return { sqlite, calls, env: { DB: makeDb(sqlite, calls), BLOBS: makeBlobs() } };
 }
 
@@ -171,7 +171,7 @@ function confirmPush(sqlite, resource, at) {
     .run(BOOK, resource, OLD_SHA, at, at);
 }
 
-function order(sqlite, table, text) {
+function order(sqlite, table) {
   return sqlite
     .prepare(
       `SELECT id, ref_raw FROM ${table} WHERE book = ? AND deleted_at IS NULL
@@ -301,10 +301,23 @@ console.log("\n[#1411 — the nightly sync applies Door43's order-only change on
     "the watermark advances (nothing withheld)",
   );
 
-  // Night 2, master unchanged: nothing moves (the drag is still unexported).
-  const before = order(t.sqlite, "tn_rows");
-  await night(t, { sha: SHA_1, files: { tn: MASTER_TN, tq: MASTER_TQ } });
-  eq(order(t.sqlite, "tn_rows"), before, "night 2: stable");
+  // Night 2: master moves again (a note text in chapter 2) while the drags
+  // are still unexported. Chapter 1's remaining differences all sit in
+  // verses a person reordered, so the gate leaves chapter 1 alone and the
+  // drags survive.
+  const masterTn2 = MASTER_TN.replace(tnLine("2:1", "iiii", "I"), tnLine("2:1", "iiii", "I changed on Door43"));
+  eq(
+    [...(await changedTsvChapters(t.env, BOOK, "tn", masterTn2, { confirmedAt: T0 }))].sort(),
+    [2],
+    "night 2 gate: only chapter 2 (content); the pending reorders do not flag chapter 1",
+  );
+  await night(t, { sha: SHA_2, files: { tn: masterTn2, tq: MASTER_TQ } });
+  eq(
+    order(t.sqlite, "tn_rows").slice(0, 7),
+    ["1:1|bbbb", "1:1|aaaa", "1:2|dddd", "1:2|cccc", "1:3|gggg", "1:3|eeee", "1:3|ffff"],
+    "night 2: chapter 1 unchanged, the in-app reorders still stand",
+  );
+  eq(t.sqlite.prepare(`SELECT note FROM tn_rows WHERE id = 'iiii'`).get().note, "I changed on Door43", "night 2: the content change landed");
 }
 
 console.log("\n[#1411 — a locked book's order-only change goes through the mirror only]");
