@@ -407,7 +407,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         async () => {
           const result = await exportPair();
           const reachedDoor43 = result.dcsSkippedReason == null || result.dcsSkippedReason === "unchanged";
-          if (reachedDoor43 && branchOverride == null) await this.clearExportAlert(failSource);
+          if (reachedDoor43 && branchOverride == null) await this.endStepFailureEpisode(failSource);
           return result;
         },
       );
@@ -4350,6 +4350,21 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     const source = `export_hard_reject:${book}:${resource}`;
     const message = buildHardRejectAlertMessage(book, resource, rejects);
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
+  }
+
+  // #1450: a clean Door43 night ends the failure, so its rows go, dismissed
+  // ones too. clearExportAlert keeps dismissed rows, and writeAlert keeps a
+  // condition dismissed while its newest row is dismissed with the same
+  // message: a later failure with the same error would then raise nothing.
+  // Best-effort, like clearExportAlert.
+  private async endStepFailureEpisode(source: string): Promise<void> {
+    try {
+      await this.env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2`)
+        .bind(EXPORT_ALERT_USERNAME, source)
+        .run();
+    } catch (err) {
+      console.error(`export alert clear failed for ${source}:`, err);
+    }
   }
 
   // #1450: a (book, resource) export step failed after its retries. The
