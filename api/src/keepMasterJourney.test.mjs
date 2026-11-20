@@ -173,7 +173,7 @@ function freshEnv(rows) {
     await exportOne(`dry-${tag}`, false);
     return r2.get(`exports/dry-${tag}/${BOOK}/tn/${FILE}`).body;
   };
-  return { sqlite, env, r2, exportOne, live, reverts, render };
+  return { sqlite, env, r2, wf, exportOne, live, reverts, render };
 }
 
 // Replace one row's Note in a rendered TSV (a person editing Door43).
@@ -581,6 +581,46 @@ console.log("\n[15. a step.do retry whose master read is unverified keeps its fi
   ok(!hasRow(d.branch, "bb22"), "the third attempt does not add bb22 back");
 
   console.log("\n[15b. a translator edits bb22 before the retry → it ships]");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator restored it.' WHERE id = 'bb22'`).run();
+  await t.exportOne("export-night-2");
+  ok(noteOf(d.branch, "bb22") === "Translator restored it.", "the edited row is committed on the retry");
+}
+
+console.log("\n[16. an attempt that committed but died before recording its push: the unverified retry keeps its drop (#1455)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  d.master = deleteRow(d.master, "bb22");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  // Attempt 1 (verified): drops bb22 and commits, then the step dies before
+  // recordPushedRender, so pushed_r2_key still names night 1's push.
+  const record = t.wf.recordPushedRender;
+  t.wf.recordPushedRender = async () => {
+    throw new Error("simulated: the step died after the commit");
+  };
+  let threw = false;
+  try {
+    await t.exportOne("export-night-2");
+  } catch {
+    threw = true;
+  }
+  t.wf.recordPushedRender = record;
+  ok(
+    threw && !hasRow(d.branch, "bb22") && noteOf(d.branch, "aa11") === "Translator edit.",
+    "(setup: attempt 1 committed without bb22, then threw before recording its push)",
+  );
+  d.noSize = true; // the retry's master read cannot be proven complete
+  await t.exportOne("export-night-2");
+  ok(!hasRow(d.branch, "bb22"), "the unverified retry does not add bb22 back");
+  ok(!hasRow(t.r2.get(`exports/export-night-2/${BOOK}/tn/${FILE}`).body, "bb22"), "the retry's R2 render leaves bb22 out");
+  ok(noteOf(d.branch, "aa11") === "Translator edit.", "…and the translator's edit still ships");
+
+  console.log("\n[16a. a further unverified retry (the push now recorded) still leaves it out]");
+  await t.exportOne("export-night-2");
+  ok(!hasRow(d.branch, "bb22"), "the third attempt does not add bb22 back");
+
+  console.log("\n[16b. a translator edits bb22 before another retry → it ships]");
   t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator restored it.' WHERE id = 'bb22'`).run();
   await t.exportOne("export-night-2");
   ok(noteOf(d.branch, "bb22") === "Translator restored it.", "the edited row is committed on the retry");
