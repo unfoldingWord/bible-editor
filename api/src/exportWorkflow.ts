@@ -1198,6 +1198,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     let tsvMasterContentForRevertReport: string | null = null;
     let tsvMasterVerified = false;
     let keepMaster: Awaited<ReturnType<ExportWorkflow["masterMovedGuard"]>> | null = null;
+    // The d1-render marker this attempt wrote with droppedids, put again with
+    // committed=1 once commitToDcs returns (#1455).
+    let droppedMarker: { body: string; meta: Record<string, string> } | null = null;
     let shrinkRows = built.rowCount;
     if (dcsAllowed && (resource === "tn" || resource === "tq" || resource === "twl")) {
       const master = await this.fetchTsvMaster(book, resource, fresh.masterSha);
@@ -1378,16 +1381,18 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           // At most MASTER_MOVED_REFUSE_THRESHOLD ids reach this line.
           const pushedSha = await gitBlobSha(built.content);
           const droppedIds = plan.dropped.map((r) => encodeURIComponent(r.id)).join(",");
+          const markerMeta: Record<string, string> = {
+            pushedsha: pushedSha,
+            basesha: guard.baseBlobSha,
+            basemode: guard.mode,
+            ...(droppedIds.length > 0 && droppedIds.length <= 1024 ? { droppedids: droppedIds } : {}),
+          };
           await this.env.BLOBS.put(d1RenderKey(r2Key), d1Render, {
             httpMetadata: { contentType: "text/tab-separated-values" },
             // Lowercase keys: R2 metadata travels as HTTP headers in some paths.
-            customMetadata: {
-              pushedsha: pushedSha,
-              basesha: guard.baseBlobSha,
-              basemode: guard.mode,
-              ...(droppedIds.length > 0 && droppedIds.length <= 1024 ? { droppedids: droppedIds } : {}),
-            },
+            customMetadata: markerMeta,
           });
+          if (markerMeta.droppedids) droppedMarker = { body: d1Render, meta: markerMeta };
           // The R2 copy at r2Key must hold the bytes that ship: it is the
           // pushed render the next export and the sync read back by hash.
           await this.env.BLOBS.put(r2Key, built.content, {
@@ -1704,6 +1709,25 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       };
       const message = `bible-editor export: ${book} ${resource} → ${branch} (${instanceId})`;
       const commit = await commitToDcs(dcsCfg, filename, built.content, message);
+      // The branch now holds this attempt's drops. If the step dies before
+      // recordPushedRender, pushed_r2_key still names an older push, so a
+      // retry is not seen as one; committed=1 on the marker tells it the drops
+      // shipped (#1455). Best-effort: when this put fails, recordPushedRender
+      // below still lets a retry find them (#1452).
+      if (droppedMarker != null) {
+        try {
+          await this.env.BLOBS.put(d1RenderKey(r2Key), droppedMarker.body, {
+            httpMetadata: { contentType: "text/tab-separated-values" },
+            customMetadata: { ...droppedMarker.meta, committed: "1" },
+          });
+        } catch (e) {
+          console.error("export: committed marker write failed", {
+            book,
+            resource,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
       if (alignLossToReport) await this.reportAlignmentVerdict(book, resource, alignLossToReport);
       if (!commit.branchTouched) {
         // Rendered content matches master — nothing to merge. Close any open PR
@@ -3991,7 +4015,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     | { measured: true; plan: KeepMasterPlan; baseBlobSha: string; mode: "full" | "carry" }
     | { measured: false; reason: string }
   > {
-    const base = await this.keepMasterBase(book, resource, r2Key);
+    const base = await this.keepMasterBase(book, resource, r2Key, masterVerified);
     if (!base.ok) return { measured: false, reason: base.reason };
     try {
       const plan = planKeepMasterRows(
@@ -4022,7 +4046,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     | { measured: true; plan: KeepMasterVersePlan; baseBlobSha: string; mode: "full" | "carry" }
     | { measured: false; reason: string }
   > {
-    const base = await this.keepMasterBase(book, resource, r2Key);
+    const base = await this.keepMasterBase(book, resource, r2Key, masterVerified);
     if (!base.ok) return { measured: false, reason: base.reason };
     try {
       const plan = planKeepMasterVerses(rendered, base.baseText, masterUsfm, base.onlyKeys, masterVerified);
@@ -4054,6 +4078,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     book: string,
     resource: Resource,
     r2Key: string,
+    masterVerified: boolean,
   ): Promise<
     | {
         ok: true;
@@ -4123,6 +4148,17 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           .bind(RESOURCE_TARGETS[resource].repo, `(#${prior.pushed_pr_number})`, prior.pushed_read_at - 3600)
           .first<{ hit: number }>();
         if (hit != null) mode = "full";
+      }
+      // An earlier attempt of this instance that committed but died before
+      // recordPushedRender (#1455): pushed_* still names the base it measured
+      // against, so the base and mode here are its own; only its drops need
+      // carrying. Read only when it matters: a verified master read drops
+      // them again on its own, and ULT/UST drop nothing.
+      if (!retry && !masterVerified && resource !== "ult" && resource !== "ust") {
+        const meta = (await this.env.BLOBS.head(d1RenderKey(r2Key)))?.customMetadata;
+        if (meta?.committed === "1" && meta.basesha === pointer.blobSha && meta.droppedids) {
+          ownDropped = meta.droppedids.split(",").map((id) => decodeURIComponent(id));
+        }
       }
       // D1's render for the base push, when that push kept rows.
       let d1Base: string | null = null;
