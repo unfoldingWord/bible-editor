@@ -4088,8 +4088,9 @@ async function reconstructTsvBases(
   // entry whose prev_version skips past the version the chain had reached, or
   // a row version the chain never reaches, means a version-bumping entry is
   // missing. sweptHistoryCut drops every entry before such a gap, from both
-  // folds, so the fields only the missing entries could vouch for come out
-  // absent (no_base, D1 kept and flagged).
+  // folds, so every field no surviving entry after the gap carries comes out
+  // absent (no_base, D1 kept and flagged), and stays absent: the create is
+  // never swept, so later nights cut at the same place.
   //
   // NOT EVERY BUMP IS CONTENT. review_clear and reorder write no version and
   // dismiss_review logs prev = new, so those never read as gaps. But a
@@ -4108,9 +4109,11 @@ async function reconstructTsvBases(
   // may sit on either side. It keeps the old fold. Such a boundary means the
   // export has been frozen for 180+ days: a locked book (whose Door43 side is
   // authoritative and which the locked mirror, #1418, reconciles nightly) or a
-  // stuck export, which raiseEditLogSweepBoundaryAlerts already reports two
-  // weeks before the sweep reaches it. Counting those gaps would flag every
-  // such row merge_no_base once its post-boundary history aged out.
+  // stuck export. raiseEditLogSweepBoundaryAlerts warns about a stuck
+  // boundary only for ult/ust, not tq, so on a tq export stuck 180+ days this
+  // shape keeps the pre-#1461 behavior (a stale create can still be folded).
+  // Counting those gaps would flag every such row merge_no_base once its
+  // post-boundary history aged out.
   //
   // #653 provisional rows are left alone: their base is the above-boundary
   // create, and #653 never folds anything after it, so a sweep removes nothing
