@@ -128,7 +128,7 @@ function freshEnv(rows) {
           const out = stmts.map((s) => ({ meta: { changes: Number(sqlite.prepare(s._sql).run(...s._args).changes) } }));
           sqlite.exec("COMMIT");
           return out;
-        } catch (e) {
+        } catch {
           sqlite.exec("ROLLBACK");
           throw e;
         }
@@ -626,35 +626,65 @@ console.log("\n[16. an attempt that committed but died before recording its push
   ok(noteOf(d.branch, "bb22") === "Translator restored it.", "the edited row is committed on the retry");
 }
 
+// Runs `run` with ExportWorkflow method `name` throwing; true when it threw.
+async function failOnce(t, name, run) {
+  const real = t.wf[name];
+  t.wf[name] = async () => {
+    throw new Error(`simulated: ${name} failed`);
+  };
+  try {
+    await run();
+    return false;
+  } catch {
+    return true;
+  } finally {
+    t.wf[name] = real;
+  }
+}
+
 console.log("\n[16c. the retry dies before its own commit: a third, unverified attempt still keeps the drop (#1455)]");
 {
   const d = door43();
   const t = freshEnv(ROWS);
   await confirmedNight1(t, d);
   d.master = deleteRow(d.master, "bb22");
-  const once = async (name, run) => {
-    const real = t.wf[name];
-    t.wf[name] = async () => {
-      throw new Error(`simulated: ${name} failed`);
-    };
-    let threw = false;
-    try {
-      await run();
-    } catch {
-      threw = true;
-    }
-    t.wf[name] = real;
-    return threw;
-  };
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
   // Attempt 1 (verified) commits without bb22, then dies before recording it.
-  const a1 = await once("recordPushedRender", () => t.exportOne("export-night-2"));
+  const a1 = await failOnce(t, "recordPushedRender", () => t.exportOne("export-night-2"));
   d.noSize = true;
   // Attempt 2 (unverified) re-writes the marker, then dies before committing.
-  const a2 = await once("recordKeptMasterRows", () => t.exportOne("export-night-2"));
-  ok(a1 && a2 && !hasRow(d.branch, "bb22"), "(setup: attempt 1 committed without bb22; both attempts threw)");
+  const a2 = await failOnce(t, "recordKeptMasterRows", () => t.exportOne("export-night-2"));
+  ok(
+    a1 && a2 && d.writes.length === 1 && !hasRow(d.branch, "bb22") && noteOf(d.branch, "aa11") === "Translator edit.",
+    "(setup: attempt 1 committed without bb22; both attempts threw)",
+  );
   await t.exportOne("export-night-2");
   ok(!hasRow(d.branch, "bb22"), "the third attempt does not add bb22 back");
   ok(!hasRow(t.r2.get(`exports/export-night-2/${BOOK}/tn/${FILE}`).body, "bb22"), "its R2 render leaves bb22 out");
+}
+
+console.log("\n[16d. the retry drops MORE than the committed attempt, then dies before its commit (#1455)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  d.master = deleteRow(d.master, "bb22");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  // Attempt 1 (verified) commits without bb22, then dies before recording it.
+  const a1 = await failOnce(t, "recordPushedRender", () => t.exportOne("export-night-2"));
+  // Door43 then deletes cc33 too; attempt 2 (verified) drops both, then dies
+  // before its own commit.
+  d.master = deleteRow(d.master, "cc33");
+  const a2 = await failOnce(t, "recordKeptMasterRows", () => t.exportOne("export-night-2"));
+  ok(
+    a1 && a2 && d.writes.length === 1 && !hasRow(d.branch, "bb22") && hasRow(d.branch, "cc33"),
+    "(setup: the branch lacks bb22 only; both attempts threw)",
+  );
+  d.noSize = true;
+  await t.exportOne("export-night-2");
+  ok(!hasRow(d.branch, "bb22"), "the unverified third attempt does not add bb22 back");
+  ok(!hasRow(t.r2.get(`exports/export-night-2/${BOOK}/tn/${FILE}`).body, "bb22"), "its R2 render leaves bb22 out");
+  ok(noteOf(d.branch, "aa11") === "Translator edit.", "…and the translator's edit still ships");
 }
 
 if (failed > 0) {
