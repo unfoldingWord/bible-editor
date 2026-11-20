@@ -774,6 +774,27 @@ console.log("\n[16h. the committed-drops read fails on an unverified night: the 
   ok(noteOf(d.branch, "aa11") === "Translator edit.", "…and the translator's edit ships");
 }
 
+console.log("\n[16i. an overlapping instance records a push with the same bytes as the base: stale committed drops are not trusted (#1455)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  const n1Master = d.master;
+  d.master = deleteRow(n1Master, "bb22");
+  // Instance A (verified) drops bb22, commits, dies before recording it.
+  const a1 = await failOnce(t, "recordPushedRender", () => t.exportOne("export-night-2"));
+  // Door43 puts bb22 back; overlapping instance B ships night 1's bytes again
+  // and records that push.
+  d.master = n1Master;
+  await t.exportOne("export-manual-b");
+  // A's retry reads master unverified and short of bb22.
+  d.master = deleteRow(n1Master, "bb22");
+  d.noSize = true;
+  await t.exportOne("export-night-2");
+  ok(a1, "(setup: instance A threw after its commit)");
+  ok(hasRow(t.r2.get(`exports/export-night-2/${BOOK}/tn/${FILE}`).body, "bb22"), "A's retry does not drop bb22 on B's push");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
