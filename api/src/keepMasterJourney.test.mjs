@@ -626,6 +626,37 @@ console.log("\n[16. an attempt that committed but died before recording its push
   ok(noteOf(d.branch, "bb22") === "Translator restored it.", "the edited row is committed on the retry");
 }
 
+console.log("\n[16c. the retry dies before its own commit: a third, unverified attempt still keeps the drop (#1455)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  d.master = deleteRow(d.master, "bb22");
+  const once = async (name, run) => {
+    const real = t.wf[name];
+    t.wf[name] = async () => {
+      throw new Error(`simulated: ${name} failed`);
+    };
+    let threw = false;
+    try {
+      await run();
+    } catch {
+      threw = true;
+    }
+    t.wf[name] = real;
+    return threw;
+  };
+  // Attempt 1 (verified) commits without bb22, then dies before recording it.
+  const a1 = await once("recordPushedRender", () => t.exportOne("export-night-2"));
+  d.noSize = true;
+  // Attempt 2 (unverified) re-writes the marker, then dies before committing.
+  const a2 = await once("recordKeptMasterRows", () => t.exportOne("export-night-2"));
+  ok(a1 && a2 && !hasRow(d.branch, "bb22"), "(setup: attempt 1 committed without bb22; both attempts threw)");
+  await t.exportOne("export-night-2");
+  ok(!hasRow(d.branch, "bb22"), "the third attempt does not add bb22 back");
+  ok(!hasRow(t.r2.get(`exports/export-night-2/${BOOK}/tn/${FILE}`).body, "bb22"), "its R2 render leaves bb22 out");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
