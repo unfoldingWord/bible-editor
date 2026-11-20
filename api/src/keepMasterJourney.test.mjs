@@ -559,6 +559,33 @@ console.log("\n[14. carry mode: an unproven push's dropped row stays off on an u
   ok(noteOf(d.branch, "bb22") === "Translator restored it.", "the edited row is committed");
 }
 
+console.log("\n[15. a step.do retry whose master read is unverified keeps its first attempt's drop (#1452)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  d.master = deleteRow(d.master, "bb22");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  // Attempt 1 (verified): drops bb22, ships aa11, records its push; then a
+  // later write fails and step.do re-runs the same instance.
+  await t.exportOne("export-night-2");
+  ok(!hasRow(d.branch, "bb22") && noteOf(d.branch, "aa11") === "Translator edit.", "(setup: attempt 1 left bb22 off and shipped aa11)");
+  d.noSize = true; // the retry's master read cannot be proven complete
+  await t.exportOne("export-night-2");
+  ok(!hasRow(d.branch, "bb22"), "the unverified retry does not add bb22 back");
+  ok(!hasRow(t.r2.get(`exports/export-night-2/${BOOK}/tn/${FILE}`).body, "bb22"), "the retry's R2 render leaves bb22 out");
+  ok(noteOf(d.branch, "aa11") === "Translator edit.", "…and the translator's edit still ships");
+
+  console.log("\n[15a. a second unverified retry still leaves it out]");
+  await t.exportOne("export-night-2");
+  ok(!hasRow(d.branch, "bb22"), "the third attempt does not add bb22 back");
+
+  console.log("\n[15b. a translator edits bb22 before the retry → it ships]");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator restored it.' WHERE id = 'bb22'`).run();
+  await t.exportOne("export-night-2");
+  ok(noteOf(d.branch, "bb22") === "Translator restored it.", "the edited row is committed on the retry");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);

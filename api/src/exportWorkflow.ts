@@ -1322,11 +1322,21 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           // pushed bytes by sha; basesha/basemode let a step.do retry of
           // this instance reuse this run's verdict. Written FIRST: if the put
           // below then fails, the step retries before anything is recorded.
+          // droppedids lets that retry keep this run's drops out even when its
+          // own master read is unverified (#1452): by then r2Key holds the
+          // retry's raw render, so the pushed bytes cannot be read back here.
+          // At most MASTER_MOVED_REFUSE_THRESHOLD ids reach this line.
           const pushedSha = await gitBlobSha(built.content);
+          const droppedIds = plan.dropped.map((r) => encodeURIComponent(r.id)).join(",");
           await this.env.BLOBS.put(d1RenderKey(r2Key), d1Render, {
             httpMetadata: { contentType: "text/tab-separated-values" },
             // Lowercase keys: R2 metadata travels as HTTP headers in some paths.
-            customMetadata: { pushedsha: pushedSha, basesha: guard.baseBlobSha, basemode: guard.mode },
+            customMetadata: {
+              pushedsha: pushedSha,
+              basesha: guard.baseBlobSha,
+              basemode: guard.mode,
+              ...(droppedIds.length > 0 && droppedIds.length <= 1024 ? { droppedids: droppedIds } : {}),
+            },
           });
           // The R2 copy at r2Key must hold the bytes that ship: it is the
           // pushed render the next export and the sync read back by hash.
@@ -1350,7 +1360,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // captured, on the false premise that reaching this line meant the
     // export would ship; the hard-reject guard below and the DCS commit
     // itself can still stop it. tsvMasterContentForRevertReport itself is
-    // still captured above by checkTsvShrink — only the recording moved.)
+    // still captured above, from fetchTsvMaster before the shrink guard —
+    // only the recording moved.)
 
     // There is deliberately NO blank required-field HOLD gate here any more.
     //
@@ -2883,8 +2894,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // fetchDcsMasterText then falls back to its unpinned default, same as
   // before this fix.
   //
-  // The fetch is its own step (fetchTsvMaster) so the keep-master plan can
-  // run on the same bytes before this guard counts what would ship (#1424).
+  // The fetch is its own method (fetchTsvMaster, called inside the per-book
+  // step, not a step.do of its own) so the keep-master plan can run on the
+  // same bytes before this guard counts what would ship (#1424).
   // null = no master file for this book+resource.
   private async fetchTsvMaster(
     book: string,
@@ -3911,7 +3923,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // reused only when it kept rows, which is exactly when a fallback would push
   // D1's raw render over the guarded branch: it left d1RenderKey(r2Key)
   // carrying the base sha and mode it measured. A retry of an attempt that
-  // kept nothing ships as before, the same as that attempt did.
+  // kept nothing ships as before, the same as that attempt did. When that
+  // attempt's push is the one recorded, the retry also keeps out the rows it
+  // dropped (the marker's droppedids, #1452), so an unverified master read on
+  // the retry does not put them back.
   private async masterMovedGuard(
     book: string,
     resource: "tn" | "tq" | "twl",
@@ -4025,10 +4040,17 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       if (pointer.blobSha == null) return notMeasured("no_prior_push");
       const retry = prior.pushed_r2_key != null && prior.pushed_r2_key === r2Key;
       let mode: "full" | "carry" | null = null;
+      // tn/tq/twl ids the first attempt of this instance left out, when its
+      // push is the one recorded (#1452).
+      let ownDropped: string[] = [];
       if (retry) {
         const marker = await this.env.BLOBS.head(d1RenderKey(r2Key));
         if (marker?.customMetadata?.basesha === pointer.blobSha) {
           mode = marker.customMetadata?.basemode === "carry" ? "carry" : "full";
+          const ids = marker.customMetadata?.droppedids;
+          if (ids && prior.pushed_blob_sha != null && marker.customMetadata?.pushedsha === prior.pushed_blob_sha) {
+            ownDropped = ids.split(",").map((id) => decodeURIComponent(id));
+          }
         }
       } else if (prior.pushed_read_at != null && prior.master_confirmed_at === prior.pushed_read_at) {
         mode = "full";
@@ -4082,6 +4104,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         const pushed = await readVerifiedPushedRenderText(this.env, book, resource, pointer.r2Key, pointer.blobSha);
         if (pushed != null) droppedKeys = droppedIdsBetween(baseText, pushed);
       }
+      // A retry also keeps out what its first attempt dropped on a verified
+      // read (#1452); the plan still drops one only if ours is unchanged from
+      // base and master still lacks it.
+      if (ownDropped.length > 0 && !isVerse) droppedKeys = new Set([...(droppedKeys ?? []), ...ownDropped]);
       if (baseText == null) return notMeasured("base_unreadable");
       return { ok: true, baseText, onlyKeys, droppedKeys, baseBlobSha: pointer.blobSha, mode };
     } catch (e) {
