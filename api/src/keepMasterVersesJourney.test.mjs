@@ -181,7 +181,12 @@ function freshEnv(door43File = DOOR43_OBA) {
   // whose failure after the retries is caught and recorded (#1450).
   const exportStep = (step, instanceId, dcsAllowed = true) =>
     wf.runExportStep(step, BOOK, "ult", () => exportOne(instanceId, dcsAllowed));
-  return { sqlite, env, r2, wf, exportOne, exportStep, live, reverts, render, editD1 };
+  // Nights are hours apart, but these runs fall in the same second, and the
+  // export_step_failed clear removes only rows from a second strictly before
+  // its start (#1450). Back-dating the alerts by a minute stands in for the
+  // time between two nights.
+  const nightPasses = () => sqlite.prepare(`UPDATE system_alerts SET created_at = created_at - 60`).run();
+  return { sqlite, env, r2, wf, exportOne, exportStep, nightPasses, live, reverts, render, editD1 };
 }
 
 // A WorkflowStep stand-in that honours `retries.limit` the way Cloudflare
@@ -662,6 +667,7 @@ console.log("\n[16. Door43 rejects every write → after the retries an export_s
 
   console.log("\n[16c. the next night Door43 accepts the write → the alert clears]");
   d.commitFails = false;
+  t.nightPasses();
   const r2 = await t.exportStep(retryingStep(), "export-night-3");
   ok(d.writes.length === 1 && r2.dcsSkippedReason == null, `the export ships (got ${r2.dcsSkippedReason}, writes ${d.writes.length})`);
   ok(t.live(failSource).length === 0, "the export_step_failed alert is gone");
@@ -677,6 +683,7 @@ console.log("\n[16e. after a failed night, Door43 already matching D1's render (
   ok(t.live(`export_step_failed:${BOOK}:ult`).length === 1, "(setup: the failed night raised the alert)");
   d.commitFails = false;
   d.master = await t.render("n2");
+  t.nightPasses();
   const r = await t.exportStep(retryingStep(), "export-night-2");
   ok(r.dcsSkippedReason === "unchanged", `(setup: unchanged, got ${r.dcsSkippedReason})`);
   ok(t.live(`export_step_failed:${BOOK}:ult`).length === 0, "the export_step_failed alert is gone");
@@ -703,6 +710,7 @@ console.log("\n[16f. a dismissed failure, a clean night, then the same failure a
   // makes the same create call and carries the identical message.
   d.commitFails = false;
   d.master = await t.render("n3");
+  t.nightPasses();
   const clean = await t.exportStep(retryingStep(), "export-night-3");
   ok(clean.dcsSkippedReason === "unchanged", `(setup: a clean night, got ${clean.dcsSkippedReason})`);
   t.editD1(3, "pride", "arrogance");
@@ -726,6 +734,7 @@ console.log("\n[16h. a locked book does not clear the alert; a branchName overri
   );
   ok(locked.dcsSkippedReason != null && d.writes.length === 0, `(setup: the lock skips, got ${locked.dcsSkippedReason})`);
   ok(t.live(failSource).length === 1, "the lock skip leaves the alert up");
+  t.nightPasses();
   const override = await t.wf.runExportStep(retryingStep(), BOOK, "ult", () =>
     t.wf.exportOne(BOOK, "ult", "export-night-3", true, false, new Set(), false, "admin-fix"),
   );
@@ -748,21 +757,42 @@ console.log("\n[16i. a failure an overlapping run writes after a clean run start
   const now = () => Math.floor(Date.now() / 1000);
   insertFailure(now() - 60, "older failure");
   d.master = DOOR43_OBA;
-  const r = await t.wf.runExportStep(retryingStep(), BOOK, "ult", async () => {
-    const out = await t.exportOne("export-night-1");
-    // The other run's failure lands while this one is still in its step.
-    insertFailure(now() + 60, "newer failure");
-    return out;
-  });
+  // runExportStep reads Date.now() first thing in the step attempt; record
+  // that reading so the same-second row below matches its start exactly.
+  const realNow = Date.now;
+  let startedAt = null;
+  Date.now = () => {
+    const v = realNow();
+    if (startedAt == null) startedAt = Math.floor(v / 1000);
+    return v;
+  };
+  let r;
+  try {
+    r = await t.wf.runExportStep(retryingStep(), BOOK, "ult", async () => {
+      const out = await t.exportOne("export-night-1");
+      // The other run's failures land while this one is still in its step:
+      // one in the very second this attempt started, one a minute later.
+      insertFailure(startedAt, "same-second failure");
+      insertFailure(startedAt + 60, "newer failure");
+      return out;
+    });
+  } finally {
+    Date.now = realNow;
+  }
   ok(r.dcsSkippedReason == null, `(setup: the clean run ships, got ${r.dcsSkippedReason})`);
-  const left = t.live(failSource).map((a) => a.message);
-  ok(left.length === 1 && left[0] === "newer failure", `only the newer failure is left (${left.join(" | ")})`);
+  const left = t.live(failSource).map((a) => a.message).sort();
+  ok(
+    left.length === 2 && left[0] === "newer failure" && left[1] === "same-second failure",
+    `the older failure is gone; the same-second and newer failures stay (${left.join(" | ")})`,
+  );
 }
 
 console.log("\n[16j. stepFailureSummary keeps the stable code and status, not the body]");
 {
   ok(stepFailureSummary("dcs_commit_failed: POST 500 <html>oops</html>") === "dcs_commit_failed: POST 500", "commit error → code + method + status");
   ok(stepFailureSummary("dcs_branch_get_failed: 404 not found") === "dcs_branch_get_failed: 404", "status-only error → code + status");
+  ok(stepFailureSummary("dcs_commit_failed: POST 500.") === "dcs_commit_failed: POST 500", "trailing punctuation after the status");
+  ok(stepFailureSummary("dcs_commit_failed: POST 5001 x") === "dcs_commit_failed: POST 5001 x", "a longer number is not read as a status");
   ok(stepFailureSummary("dcs_branch_not_visible: OBA-be-x") === "dcs_branch_not_visible: OBA-be-x", "uncoded error keeps its first line");
   ok(stepFailureSummary("x".repeat(500) + "\nmore").length === 160, "an uncoded error is capped at 160 characters, first line only");
 }

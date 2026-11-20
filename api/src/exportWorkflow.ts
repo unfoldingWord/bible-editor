@@ -309,7 +309,7 @@ export interface StepResult {
 // rule (#458). So a `code: [METHOD ]status` prefix is kept alone; any other
 // error keeps its first line, capped.
 export function stepFailureSummary(reason: string): string {
-  const coded = /^([a-z][a-z0-9_]*): ((?:[A-Z]+ )?\d{3})(?=\s|$)/.exec(reason);
+  const coded = /^([a-z][a-z0-9_]*): ((?:[A-Z]+ )?\d{3})\b/.exec(reason);
   if (coded) return `${coded[1]}: ${coded[2]}`;
   return reason.split("\n")[0].slice(0, 160);
 }
@@ -402,8 +402,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // failure and leaves the alert up. The alert is about Door43 writes
   // failing, not about which branch they went to, so a branchName override
   // run that reaches Door43 cleanly clears it too. The clear removes only rows
-  // written no later than this attempt started: a failure an overlapping run
-  // wrote after that is newer than what this attempt measured, and stays.
+  // written in a whole second before this attempt started: a failure an
+  // overlapping run wrote after that, or in that same second (created_at has
+  // one-second resolution, so the order is unknown), stays until the next
+  // clean run.
   // Both the clear and the write sit inside steps that already exist, so the
   // run spends no extra steps.
   private async runExportStep(
@@ -4372,12 +4374,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // ones too. clearExportAlert keeps dismissed rows, and writeAlert keeps a
   // condition dismissed while its newest row is dismissed with the same
   // message: a later failure with the same error would then raise nothing.
-  // Only rows created at or before `startedAt` (seconds) go; see
+  // Only rows created strictly before `startedAt` (seconds) go; see
   // runExportStep. Best-effort, like clearExportAlert.
   private async endStepFailureEpisode(source: string, startedAt: number): Promise<void> {
     try {
       await this.env.DB.prepare(
-        `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND created_at <= ?3`,
+        `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND created_at < ?3`,
       )
         .bind(EXPORT_ALERT_USERNAME, source, startedAt)
         .run();
