@@ -29,6 +29,7 @@ import {
   raiseEditLogSweepBoundaryAlerts,
 } from "./editLogSweep.ts";
 import { verseVersionFloorSql } from "./verseBridge.ts";
+import { PUBLISHED_BOOKS } from "./publishedGuard.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -68,8 +69,9 @@ function syncRow(d, { book, resource, confirmedAt = null, editId = null }) {
   ).run(book, resource, confirmedAt, editId);
 }
 
+// ?2 is bound exactly as index.ts binds it.
 function sweep(d, cutoff) {
-  d.prepare(EDIT_LOG_SWEEP_SQL).run(cutoff);
+  d.prepare(EDIT_LOG_SWEEP_SQL).run(cutoff, JSON.stringify([...PUBLISHED_BOOKS]));
 }
 
 function survivingIds(d) {

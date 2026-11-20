@@ -27,6 +27,7 @@ import { books } from "./bookImport";
 import { bookLockGuard } from "./bookLockGuard";
 import { serveHashedAsset } from "./staticAssets";
 import { EDIT_LOG_SWEEP_SQL, EDIT_LOG_RETENTION_SECONDS, raiseEditLogSweepBoundaryAlerts } from "./editLogSweep";
+import { PUBLISHED_BOOKS } from "./publishedGuard";
 import { DCS_COMMITS_SWEEP_SQL, DCS_COMMITS_SWEEP_COVERAGE_SQL, DCS_COMMITS_RETENTION_SECONDS } from "./dcsCommitsSweep";
 import { attachAuth, requireAuth, requireCsrf, mintDevToken, startDcsAuth, callbackDcsAuth, authMe, authLogout, refreshToken, updateLastLocation, currentUserId, verifyToken } from "./auth";
 
@@ -475,7 +476,7 @@ export default {
         try {
           const start = Date.now();
           const res = await env.DB.prepare(EDIT_LOG_SWEEP_SQL)
-            .bind(Math.floor(Date.now() / 1000) - EDIT_LOG_RETENTION_SECONDS)
+            .bind(Math.floor(Date.now() / 1000) - EDIT_LOG_RETENTION_SECONDS, JSON.stringify([...PUBLISHED_BOOKS]))
             .run();
           console.log(JSON.stringify({ job: "edit_log_sweep", ms: Date.now() - start, rows: res.meta.changes }));
         } catch (e) {

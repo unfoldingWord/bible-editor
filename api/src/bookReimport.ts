@@ -10734,6 +10734,8 @@ async function mirrorLockedTsv(
   // set edit_log.book since migration 0017 backfilled it, a pending edit is by
   // definition recent, and the plain equality lets this use
   // edit_log_row_by_book (kind, book, row_key) instead of scanning the kind.
+  // editLogSweep.ts branch (9) keeps these entries past the 180-day sweep for
+  // tq/twl (#1457) with the same filters: change one, change the other.
   const nonContentSql = MIRROR_NON_CONTENT_ACTIONS.map((a) => `'${a}'`).join(", ");
   const pendingRs = await env.DB.prepare(
     `SELECT DISTINCT row_key FROM edit_log

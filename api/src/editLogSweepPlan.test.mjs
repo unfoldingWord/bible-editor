@@ -23,6 +23,10 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { EDIT_LOG_SWEEP_SQL } from "./editLogSweep.ts";
+import { PUBLISHED_BOOKS } from "./publishedGuard.ts";
+
+// ?2, bound exactly as index.ts binds it.
+const PUBLISHED_JSON = JSON.stringify([...PUBLISHED_BOOKS]);
 
 const INDEX = "edit_log_kind_action_created";
 const CANDIDATES = "edit_log_sweep_candidates";
@@ -55,11 +59,11 @@ function freshDb() {
 // (2) Every edit_log read in the sweep's exempt branches uses the index.
 {
   const d = freshDb();
-  const details = d.prepare("EXPLAIN QUERY PLAN " + EDIT_LOG_SWEEP_SQL).all(0).map((r) => r.detail);
+  const details = d.prepare("EXPLAIN QUERY PLAN " + EDIT_LOG_SWEEP_SQL).all(0, PUBLISHED_JSON).map((r) => r.detail);
   const elReads = details.filter((x) => /^(SEARCH|SCAN) el\b/.test(x));
-  assert.equal(elReads.length, 8, `one edit_log read per branch (got ${elReads.length}: ${elReads.join(" | ")})`);
+  assert.equal(elReads.length, 9, `one edit_log read per branch (got ${elReads.length}: ${elReads.join(" | ")})`);
   for (const x of elReads) assert.match(x, new RegExp(`USING INDEX ${INDEX} \\(kind=\\?`), `branch read uses ${INDEX}: ${x}`);
-  console.log("  ok: all 8 branch reads use", INDEX);
+  console.log("  ok: all 9 branch reads use", INDEX);
   // The outer DELETE seeks the aged non-tn rows through migration 0077's
   // partial index (issue #1057). Through edit_log_recent it would fetch every
   // aged tn row's table row each hour just to skip it, a cost that only grows.
@@ -93,6 +97,12 @@ function freshDb() {
   brs.run("ZEC", "ult", 6000, 3000); brs.run("ZEC", "ust", 7000, null);
   brs.run("LAM", "ult", 4000, 2500); brs.run("JER", "ust", 5000, null);
   brs.run("JER", "ult", null, null); // RUT has no watermark at all
+  // Issue #1457 branch (9): tq/twl boundaries on a published book (ZEC), an
+  // explicitly locked one (JER), and an explicitly unlocked published one
+  // (LAM), so the pending-on-a-locked-book shield is exercised below.
+  brs.run("ZEC", "tq", 4000, 2000); brs.run("JER", "twl", 5000, null);
+  brs.run("LAM", "tq", 3000, null);
+  d.prepare(`INSERT INTO book_locks (book, locked) VALUES ('JER', 1), ('LAM', 0)`).run();
   for (const kind of ["tn", "tq", "twl"]) {
     const t = d.prepare(`INSERT INTO ${kind}_rows (id, book, chapter, verse, ref_raw) VALUES (?, ?, 1, 1, '1:1')`);
     for (const b of books) for (let i = 0; i < 40; i += 2) t.run(`r${i}`, b);
@@ -102,17 +112,17 @@ function freshDb() {
   assert.notEqual(unhinted, EDIT_LOG_SWEEP_SQL, "sanity: the sweep carries the hint");
   const selectOf = (sql) => sql.replace("DELETE FROM edit_log", "SELECT id FROM edit_log") + " ORDER BY id";
   for (const cutoff of [3000, 5000, 7000, 9000]) {
-    const hinted = d.prepare(selectOf(EDIT_LOG_SWEEP_SQL)).all(cutoff).map((r) => r.id);
-    const plain = d.prepare(selectOf(unhinted)).all(cutoff).map((r) => r.id);
+    const hinted = d.prepare(selectOf(EDIT_LOG_SWEEP_SQL)).all(cutoff, PUBLISHED_JSON).map((r) => r.id);
+    const plain = d.prepare(selectOf(unhinted)).all(cutoff, PUBLISHED_JSON).map((r) => r.id);
     const aged = d.prepare(`SELECT COUNT(*) n FROM edit_log WHERE created_at < ?`).get(cutoff).n;
     assert.ok(hinted.length > 0 && hinted.length < aged, `cutoff ${cutoff}: sweep deletes some aged rows and exempts others (${hinted.length}/${aged})`);
     assert.deepEqual(hinted, plain, `cutoff ${cutoff}: hinted and unhinted sweeps pick the same rows`);
     console.log(`  ok: cutoff ${cutoff} deletes the same ${hinted.length} of ${aged} aged rows with and without the hint`);
   }
   // And the literal DELETE removes exactly that set.
-  const expected = d.prepare(selectOf(EDIT_LOG_SWEEP_SQL)).all(7000).map((r) => r.id);
+  const expected = d.prepare(selectOf(EDIT_LOG_SWEEP_SQL)).all(7000, PUBLISHED_JSON).map((r) => r.id);
   const before = d.prepare(`SELECT COUNT(*) n FROM edit_log`).get().n;
-  const res = d.prepare(EDIT_LOG_SWEEP_SQL).run(7000);
+  const res = d.prepare(EDIT_LOG_SWEEP_SQL).run(7000, PUBLISHED_JSON);
   assert.equal(res.changes, expected.length, "DELETE removes exactly the selected rows");
   assert.equal(d.prepare(`SELECT COUNT(*) n FROM edit_log`).get().n, before - expected.length, "row count drops by that much");
   console.log("  ok: literal DELETE matches");
