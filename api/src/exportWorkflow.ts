@@ -149,8 +149,8 @@ import {
   ALL_RESOURCES as REIMPORT_RESOURCES,
 } from "./bookReimport";
 import { noteLockedPushOnVerseMergeAlert, retireVerseKeptAiMasterFlags } from "./verseMergeConflicts.ts";
-import { dcsResourceFile, fetchDcsMasterTextVerified, fileBlobShaAtCommit, fileHeadCommit, NT_BOOKS, repoHeadCommitSha, type ReimportResource } from "./dcsSources";
-import { loadPreImportVerses, loadSourceWordsForRefs, masterVersesAsImported, partitionUsfmRevertEntriesByImport } from "./revertImportVerses.ts";
+import { dcsResourceFile, fetchDcsMasterTextVerified, fileBlobShaAtCommit, fileHeadCommit, repoHeadCommitSha, type ReimportResource } from "./dcsSources";
+import { loadOpenVerseConflictRefs, loadPreImportVerses, masterVersesAsImported, partitionUsfmRevertEntriesByImport } from "./revertImportVerses.ts";
 import { readLedgerMasterLineage, type LedgerLineageResult } from "./masterLineageLedger.ts";
 import { DCS_POLL_FETCH_TIMEOUT_MS } from "./dcsCommitPoll.ts";
 import { gitBlobSha, gitBlobShaOrNull, findOurMergeForPr, judgeOwnPublishDecline } from "./ownPublish";
@@ -1960,17 +1960,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
                 refs,
                 importedSync!.syncedAt as number,
               );
-              const sourceWords = await loadSourceWordsForRefs(
-                this.env.DB,
-                book,
-                NT_BOOKS.has(book) ? "UGNT" : "UHB",
-                refs.filter((r) => typeof preImport.get(r) === "string"),
-              );
+              const openConflicts = await loadOpenVerseConflictRefs(this.env.DB, book, resource, refs);
               const split = partitionUsfmRevertEntriesByImport(
                 attention,
                 masterVersesAsImported(usfmMasterContentForRevertReport as string),
                 preImport,
-                sourceWords,
+                openConflicts,
               );
               console.log("export: revert report import partition", {
                 book,

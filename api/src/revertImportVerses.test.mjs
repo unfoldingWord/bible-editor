@@ -64,9 +64,9 @@ console.log("\n[2. the partition]");
   const entries = ["1:1", "1:2", "1:3-4", "1:6"].map((ref) => ({ ref, class: "substantive" }));
   pre.set("1:2", asImported.get("1:2").replace("two", "TWO"));
   pre.set("1:6", null);
-  const out = partitionUsfmRevertEntriesByImport(entries, asImported, pre, new Map());
+  const out = partitionUsfmRevertEntriesByImport(entries, asImported, pre, new Set());
   eq([out.attention.map((e) => e.ref), out.probablyOurs.map((e) => e.ref)], [["1:2", "1:3-4", "1:6"], ["1:1"]], "only an exact pre-import match is probably ours; a bridged ref and a null payload stay loud");
-  const none = partitionUsfmRevertEntriesByImport(entries, null, pre, new Map());
+  const none = partitionUsfmRevertEntriesByImport(entries, null, pre, new Set());
   eq(none.probablyOurs, [], "master does not parse: every verse stays in attention");
 }
 

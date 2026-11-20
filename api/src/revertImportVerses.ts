@@ -13,13 +13,16 @@
 //      master has not moved since the import read it.
 //   2. Verse level: D1's own verse as of the import (the newest edit_log row
 //      for the verse at or before synced_at, loadPreImportVerses) is master's
-//      verse exactly as the import stores it. The import stores
-//      extractVersesForRange's output for master's file, byte for byte on a
-//      pristine write or create, and after canonizeAlignmentSource (the \zaln
-//      source words rewritten to the UHB/UGNT bytes) on an adoption over an
-//      edited verse (bookReimport.ts applyVerseRows step 6). Both are
-//      reproduced here and compared EXACTLY: no whitespace, occurrence or NFC
-//      mask, because a looser compare here only moves verses toward quiet.
+//      verse exactly as extractVersesForRange reads it from master's file,
+//      compared EXACTLY: no whitespace, occurrence or NFC mask, because a
+//      looser compare here only moves verses toward quiet. A pristine write
+//      or create stores exactly that. An adoption over an edited verse stores
+//      it after canonizeAlignmentSource (applyVerseRows step 6), which is NOT
+//      reproduced (review A1): canonize can fold a Door43 person's
+//      x-lemma / x-content fix back to D1's stale UHB bytes, so such a verse
+//      stays loud unless canonize changed nothing.
+//   3. No unresolved verse_merge_conflicts row for the verse, of any action
+//      (review A2, loadOpenVerseConflictRefs).
 // Together: D1 held master's verse as imported and master has not moved
 // since, so whatever the render now changes there was edited in Bible Editor
 // after the import. The verse is labelled probably ours (still recorded in
@@ -38,8 +41,9 @@
 //   - a verse master bridges, or a bridged verse in the report (`3:6-9`):
 //     reimport payloads mostly carry no verse_end, so the key alone cannot
 //     prove which rows D1 held;
-//   - a master verse carrying U+FFFD (the import healed it first) or a UHB row
-//     that changed since the import (canonize would differ).
+//   - a master verse carrying U+FFFD (the import healed it first), or an
+//     adoption whose canonize step changed bytes (measured with Door43's own
+//     UHB on the sample files: 0 of 21 OBA verses, 31-32 of 211 ZEC verses).
 //
 // Retention: the hourly sweep (editLogSweep.ts) deletes verse rows older than
 // EDIT_LOG_RETENTION_SECONDS except a few exempt survivors per verse, so an
@@ -49,8 +53,7 @@
 //
 // Known limit, shared by every edit_log reader: a content write that logs
 // nothing (a script, a manual SQL fix) is invisible here.
-import { collectSourceWords, extractVersesForRange, type SourceWord } from "./importParsers.ts";
-import { canonizeAlignmentSource } from "./canonizeHebrew.ts";
+import { extractVersesForRange } from "./importParsers.ts";
 import { verseContentJsonFromPayload } from "./verseHistory.ts";
 import { EDIT_LOG_RETENTION_SECONDS } from "./editLogSweep.ts";
 
@@ -107,33 +110,33 @@ export function masterVersesAsImported(masterUsfm: string): Map<string, string> 
   return out;
 }
 
-// True when D1's pre-import verse is master's verse as the import stores it:
-// the raw extract (pristine write, create), or the extract after the
-// adoption's canonize step against the source words D1 holds for the verse.
+// True when D1's pre-import verse is master's verse exactly as extracted from
+// master's file. Deliberately NOT the extract after the adoption's
+// canonizeAlignmentSource step (review A1): canonize can fold a Door43
+// person's x-lemma / x-content fix back to D1's (possibly stale) UHB bytes, so
+// "D1 held canonize(master)" does not mean D1 held master's verse, and the
+// export would then revert that fix. An adoption whose canonize changed
+// nothing stores the raw extract and still matches; one it changed stays loud.
 export function preImportVerseMatchesMaster(
   preImport: string | null | undefined,
   masterAsImported: string | undefined,
-  sourceWords: readonly SourceWord[] | undefined,
 ): boolean {
-  if (typeof preImport !== "string" || typeof masterAsImported !== "string") return false;
-  if (preImport === masterAsImported) return true;
-  if (!sourceWords || sourceWords.length === 0) return false;
-  const vo = JSON.parse(masterAsImported) as unknown[];
-  if (canonizeAlignmentSource(vo, [...sourceWords]) === 0) return false;
-  return preImport === JSON.stringify(vo);
+  return typeof preImport === "string" && typeof masterAsImported === "string" && preImport === masterAsImported;
 }
 
 export function partitionUsfmRevertEntriesByImport<E extends { ref: string }>(
   entries: E[],
   masterAsImported: ReadonlyMap<string, string> | null,
   preImport: ReadonlyMap<string, string | null>,
-  sourceWords: ReadonlyMap<string, SourceWord[]>,
+  // Refs with an unresolved verse_merge_conflicts row (loadOpenVerseConflictRefs).
+  openConflicts: ReadonlySet<string>,
 ): { attention: E[]; probablyOurs: E[] } {
   if (masterAsImported === null) return { attention: entries, probablyOurs: [] };
   const ours = (e: E): boolean =>
     typeof e.ref === "string" &&
     PLAIN_REF.test(e.ref) &&
-    preImportVerseMatchesMaster(preImport.get(e.ref), masterAsImported.get(e.ref), sourceWords.get(e.ref));
+    !openConflicts.has(e.ref) &&
+    preImportVerseMatchesMaster(preImport.get(e.ref), masterAsImported.get(e.ref));
   // Decided per ref (export_reverts is unique on book, resource, ref).
   const loudRefs = new Set(entries.filter((e) => !ours(e)).map((e) => e.ref));
   const attention: E[] = [];
@@ -190,31 +193,39 @@ export async function loadPreImportVerses(
   return out;
 }
 
-// The UHB (OT) / UGNT (NT) words D1 holds for each plain ref, as
-// applyVerseRows step 6 reads them for canonizeAlignmentSource. Refs whose
-// source row is missing or unparseable are absent (no canonized variant).
-export async function loadSourceWordsForRefs(
+// The plain refs among `refs` that have an unresolved verse_merge_conflicts row
+// for this book and resource, of ANY action (review A2). Such a verse stays
+// loud: after an adopt_conflict, a translator restoring or re-typing their
+// overwritten text reverts the Door43 author's commit, and the payload test
+// alone would call that ours; a kept source_attr_divergent /
+// keep_alignment_refused / keep_local_structure verse means D1 did not take
+// master's verse. A clean 'adopt' row is included too (stay loud when in
+// doubt), so only verses the import wrote with no recorded merge decision (a
+// pristine write or a create) can go quiet. Read per chapter, chunked under
+// D1's 100-parameter limit; a failed read throws, and the caller then keeps
+// every verse in attention.
+export async function loadOpenVerseConflictRefs(
   db: D1Database,
   book: string,
-  sourceVersion: "UHB" | "UGNT",
+  resource: "ult" | "ust",
   refs: string[],
-): Promise<Map<string, SourceWord[]>> {
+): Promise<Set<string>> {
   const chapters = [...new Set(refs.flatMap((r) => (PLAIN_REF.test(r) ? [Number(r.split(":")[0])] : [])))];
-  const out = new Map<string, SourceWord[]>();
-  if (chapters.length === 0) return out;
   const wanted = new Set(refs);
+  const out = new Set<string>();
   for (let i = 0; i < chapters.length; i += PRE_IMPORT_CHUNK) {
     const chunk = chapters.slice(i, i + PRE_IMPORT_CHUNK);
     const marks = chunk.map((_, j) => `?${j + 3}`).join(", ");
     const { results } = await db
-      .prepare(`SELECT chapter, verse, content_json FROM verses WHERE book = ?1 AND bible_version = ?2 AND chapter IN (${marks})`)
-      .bind(book, sourceVersion, ...chunk)
-      .all<{ chapter: number; verse: number; content_json: string }>();
+      .prepare(
+        `SELECT chapter, verse FROM verse_merge_conflicts
+          WHERE book = ?1 AND resource = ?2 AND resolved_at IS NULL AND chapter IN (${marks})`,
+      )
+      .bind(book, resource, ...chunk)
+      .all<{ chapter: number; verse: number }>();
     for (const r of results ?? []) {
       const ref = `${r.chapter}:${r.verse}`;
-      if (!wanted.has(ref)) continue;
-      const vo = verseObjectsJson(r.content_json);
-      if (vo !== null) out.set(ref, collectSourceWords(JSON.parse(vo) as unknown[]));
+      if (wanted.has(ref)) out.add(ref);
     }
   }
   return out;

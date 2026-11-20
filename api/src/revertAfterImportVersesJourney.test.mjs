@@ -364,20 +364,33 @@ console.log("\n[5. the in-app edit landed before the import read master (D1's ne
   ok(t.live(`export_revert:${BOOK}:ult`).length === 1, "export_revert alert raised");
 }
 
-console.log("\n[6. the import ADOPTED master's verse over an edited verse (canonize rewrote its source words) → in-app edit → quiet]");
+// An edited verse (translator-owned) whose ancestor row sits below `editId`.
+function seedEditedVerse(t, verse, at) {
+  t.sqlite.prepare(`UPDATE verses SET updated_by = 1 WHERE book = ? AND chapter = 1 AND verse = ? AND bible_version = 'ULT'`).run(BOOK, verse);
+  return Number(
+    t.sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source, created_at)
+         VALUES ('verse', ?, ?, 1, 0, 1, 'update', ?, NULL, ?)`,
+      )
+      .run(`${BOOK}/1/${verse}/ULT`, BOOK, JSON.stringify({ content: t.contentOf(verse) }), at).lastInsertRowid,
+  );
+}
+const HUMAN = { mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "", counts: { ours: 1, ai: 0, human: 1 }, humanShas: ["abc123"] };
+
+console.log("\n[6. review A1: a person fixes an x-lemma on Door43, D1's UHB is stale, the adoption's canonize folds it back → loud]");
 {
   const d = door43();
   const t = freshEnv();
   await confirmedNight1(t, d);
-  // A UHB row per verse whose words are the same Hebrew in the other
-  // combining-mark order, so the adoption's canonize step changes bytes.
-  const otherOrder = (s) => (s.normalize("NFC") !== s ? s.normalize("NFC") : s.replace(/([ְ-ׇֻ])ּ/g, "ּ$1"));
+  // UHB rows with the same word bytes as the ULT's milestones and the lemma
+  // D1 already had: the stale source the canonize step reads.
   for (const r of t.sqlite.prepare(`SELECT chapter, verse, content_json FROM verses WHERE book = ? AND bible_version = 'ULT'`).all(BOOK)) {
     const words = [];
     const walk = (nodes) => {
       for (const o of nodes ?? []) {
         if (o?.tag === "zaln" && typeof o.content === "string") {
-          words.push({ tag: "w", type: "word", text: otherOrder(o.content), strong: o.strong ?? "", lemma: o.lemma ?? "", morph: o.morph ?? "" });
+          words.push({ tag: "w", type: "word", text: o.content, strong: o.strong ?? "", lemma: o.lemma ?? "", morph: o.morph ?? "" });
         }
         if (Array.isArray(o?.children)) walk(o.children);
       }
@@ -387,28 +400,39 @@ console.log("\n[6. the import ADOPTED master's verse over an edited verse (canon
       .prepare(`INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text) VALUES (?, ?, ?, 'UHB', ?, '')`)
       .run(BOOK, r.chapter, r.verse, JSON.stringify({ verseObjects: words }));
   }
-  // Verse 4 is translator-owned but unchanged since our publish (ours == base).
-  t.sqlite.prepare(`UPDATE verses SET updated_by = 1 WHERE book = ? AND chapter = 1 AND verse = 4 AND bible_version = 'ULT'`).run(BOOK);
-  const boundary = Number(
-    t.sqlite
-      .prepare(
-        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source, created_at)
-         VALUES ('verse', ?, ?, 1, 0, 1, 'update', ?, NULL, ?)`,
-      )
-      .run(`${BOOK}/1/4/ULT`, BOOK, JSON.stringify({ content: t.contentOf(4) }), NOW - 5000).lastInsertRowid,
-  );
+  const boundary = seedEditedVerse(t, 4, NOW - 5000);
+  const lemma4 = lemmaIn(d.master, 4);
+  d.master = editMaster(d.master, 4, `x-lemma="${lemma4}"`, `x-lemma="${lemma4}FIX"`);
   d.master = editMaster(d.master, 4, "\\w eagle|", "\\w vulture|");
-  const HUMAN = { mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "", counts: { ours: 1, ai: 0, human: 1 }, humanShas: ["abc123"] };
   const { counts, syncedAt } = await reimport(t, d, { confirmedAt: NOW - 4500, editId: boundary, lineage: HUMAN });
-  const raw = extractVersesForRange(d.master, 1, 1).find((v) => v.verse === 4).contentJson;
   ok(counts.merge_adopted === 1 && t.contentOf(4).includes(`"text":"vulture"`), `(setup: verse 4 adopted master's verse: merge_adopted ${counts.merge_adopted})`);
-  ok(t.contentOf(4) !== raw, "(setup: the adoption's canonize step changed the stored bytes)");
+  ok(!t.contentOf(4).includes(`${lemma4}FIX`), "(setup: canonize folded the person's lemma fix back to D1's stale UHB lemma)");
+  // Resolve the merge row so only the payload evidence (A1) is under test.
+  t.sqlite.prepare(`UPDATE verse_merge_conflicts SET resolved_at = unixepoch() WHERE book = ?`).run(BOOK);
   t.editD1(4, "vulture", "hawk", syncedAt + 100);
   await t.exportOne("export-night-2");
-  const rows = t.reverts();
-  ok(rows.some((r) => r.ref === "1:4" && r.probably_ours === 1), `1:4 is labelled probably ours (got ${JSON.stringify(rows)})`);
-  ok(t.live(`export_revert:${BOOK}:ult`).length === 0, "no export_revert alert");
-  ok(t.live(`revert_probably_ours:${BOOK}:ult`).length === 1, "one quiet record");
+  ok(verseText(d.branch, 4).includes(`x-lemma="${lemma4}"`), "(the export does render the stale lemma over master's fix)");
+  ok(t.reverts().some((r) => r.ref === "1:4" && r.probably_ours === 0), `1:4 needs attention (got ${JSON.stringify(t.reverts())})`);
+  ok(t.live(`export_revert:${BOOK}:ult`).length === 1, "export_revert alert raised");
+}
+
+console.log("\n[7. review A2: adopt_conflict took the person's verse over a translator's edit, the translator re-types their text → loud]");
+{
+  const d = door43();
+  const t = freshEnv();
+  await confirmedNight1(t, d);
+  const boundary = seedEditedVerse(t, 3, NOW - 5000);
+  t.editD1(3, "pride", "arrogance", NOW - 4000);
+  d.master = editMaster(d.master, 3, "\\w deceived|", "\\w fooled|");
+  const { counts, syncedAt } = await reimport(t, d, { confirmedAt: NOW - 4500, editId: boundary, lineage: HUMAN });
+  const conflict = t.sqlite.prepare(`SELECT action, resolved_at FROM verse_merge_conflicts WHERE book = ? AND verse = 3`).get(BOOK);
+  ok(counts.merge_adopted === 1 && conflict?.action === "adopt_conflict" && conflict.resolved_at == null, `(setup: an unresolved adopt_conflict on 1:3: ${JSON.stringify(conflict)})`);
+  ok(t.contentOf(3).includes(`"text":"fooled"`) && t.contentOf(3).includes(`"text":"pride"`), "(setup: D1 holds master's verse, as extracted: no UHB rows, so no canonize)");
+  t.editD1(3, "pride", "arrogance", syncedAt + 100);
+  await t.exportOne("export-night-2");
+  ok(t.reverts().some((r) => r.ref === "1:3" && r.probably_ours === 0), `1:3 needs attention (got ${JSON.stringify(t.reverts())})`);
+  ok(t.live(`export_revert:${BOOK}:ult`).length === 1, "export_revert alert raised");
+  ok(t.live(`revert_probably_ours:${BOOK}:ult`).length === 0, "no quiet record");
 }
 
 if (failed > 0) {
