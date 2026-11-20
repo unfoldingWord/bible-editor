@@ -795,6 +795,110 @@ console.log("\n[16i. an overlapping instance records a push with the same bytes 
   ok(hasRow(t.r2.get(`exports/export-night-2/${BOOK}/tn/${FILE}`).body, "bb22"), "A's retry does not drop bb22 on B's push");
 }
 
+console.log("\n[16j. a retry commits more drops and dies before recording: the next unverified retry keeps them (#1463)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  const n1Master = d.master;
+  d.master = deleteRow(n1Master, "bb22");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  // Attempt 1 (verified) drops bb22, commits, and records its push; a later
+  // write then fails and step.do re-runs the same instance.
+  await t.exportOne("export-night-2");
+  // Door43 deletes cc33 too. Attempt 2 (a verified retry) drops both,
+  // commits, and dies before recording its push.
+  d.master = deleteRow(d.master, "cc33");
+  const a2 = await failOnce(t, "recordPushedRender", () => t.exportOne("export-night-2"));
+  ok(
+    a2 && d.writes.length === 2 && !hasRow(d.writes[0], "bb22") && hasRow(d.writes[0], "cc33") &&
+      !hasRow(d.branch, "bb22") && !hasRow(d.branch, "cc33"),
+    "(setup: attempt 1 committed without bb22, attempt 2 committed without bb22 and cc33, then threw)",
+  );
+  // Attempt 3 reads master unverified, and master lacks bb22.
+  d.noSize = true;
+  await t.exportOne("export-night-2");
+  ok(!hasRow(d.branch, "bb22"), "the unverified third attempt does not add bb22 back");
+  ok(!hasRow(d.branch, "cc33"), "…nor cc33");
+  ok(!hasRow(t.r2.get(`exports/export-night-2/${BOOK}/tn/${FILE}`).body, "bb22"), "its R2 render leaves bb22 out");
+  ok(noteOf(d.branch, "aa11") === "Translator edit.", "…and the translator's edit still ships");
+}
+
+console.log("\n[16j2. a retry plans more drops and dies before its commit: the next unverified retry keeps only the committed one (#1463)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  d.master = deleteRow(d.master, "bb22");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  // Attempt 1 (verified) drops bb22, commits, and records its push.
+  await t.exportOne("export-night-2");
+  // Door43 deletes cc33 too. Attempt 2 (a verified retry) plans to drop both,
+  // rewrites the marker, and dies before its commit.
+  d.master = deleteRow(d.master, "cc33");
+  const a2 = await failOnce(t, "recordKeptMasterRows", () => t.exportOne("export-night-2"));
+  ok(
+    a2 && d.writes.length === 1 && !hasRow(d.branch, "bb22") && hasRow(d.branch, "cc33"),
+    "(setup: only attempt 1 committed; the branch lacks bb22 and has cc33)",
+  );
+  d.noSize = true;
+  await t.exportOne("export-night-2");
+  const r2Render = t.r2.get(`exports/export-night-2/${BOOK}/tn/${FILE}`).body;
+  ok(!hasRow(d.branch, "bb22") && !hasRow(r2Render, "bb22"), "the unverified third attempt keeps bb22 off");
+  ok(hasRow(d.branch, "cc33") && hasRow(r2Render, "cc33"), "…and does not drop cc33, which no commit left out");
+}
+
+console.log("\n[16k. a retry commits a dropped row back (and drops another), then dies: the next unverified retry does not drop it (#1463)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  const n1Master = d.master;
+  d.master = deleteRow(n1Master, "bb22");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  // Attempt 1 (verified) drops bb22, commits, and records its push.
+  await t.exportOne("export-night-2");
+  // Door43 restores bb22 and deletes cc33. Attempt 2 (a verified retry)
+  // ships bb22 back, drops cc33, commits, and dies before recording.
+  d.master = deleteRow(n1Master, "cc33");
+  const a2 = await failOnce(t, "recordPushedRender", () => t.exportOne("export-night-2"));
+  ok(
+    a2 && d.writes.length === 2 && !hasRow(d.writes[0], "bb22") && hasRow(d.branch, "bb22") && !hasRow(d.branch, "cc33"),
+    "(setup: attempt 2 committed bb22 back and cc33 off, then threw)",
+  );
+  // Attempt 3 reads master unverified and short of bb22.
+  d.master = deleteRow(d.master, "bb22");
+  d.noSize = true;
+  await t.exportOne("export-night-2");
+  ok(hasRow(d.branch, "bb22"), "the unverified third attempt does not drop bb22, which the last commit shipped");
+  ok(!hasRow(d.branch, "cc33"), "…and keeps cc33 off");
+}
+
+console.log("\n[16l. a retry whose guard drops nothing commits a dropped row back, then dies: the next unverified retry does not drop it (#1463)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  const n1Master = d.master;
+  d.master = deleteRow(n1Master, "bb22");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  // Attempt 1 (verified) drops bb22, commits, and records its push.
+  await t.exportOne("export-night-2");
+  // Door43 restores bb22. Attempt 2 (a verified retry) keeps and drops
+  // nothing, commits bb22 back, and dies before recording.
+  d.master = n1Master;
+  const a2 = await failOnce(t, "recordPushedRender", () => t.exportOne("export-night-2"));
+  ok(
+    a2 && d.writes.length === 2 && !hasRow(d.writes[0], "bb22") && hasRow(d.branch, "bb22"),
+    "(setup: attempt 2 committed bb22 back, then threw)",
+  );
+  // Attempt 3 reads master unverified and short of bb22.
+  d.master = deleteRow(n1Master, "bb22");
+  d.noSize = true;
+  await t.exportOne("export-night-2");
+  ok(hasRow(d.branch, "bb22"), "the unverified third attempt does not drop bb22, which the last commit shipped");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
