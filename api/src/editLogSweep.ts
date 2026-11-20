@@ -539,12 +539,12 @@ export function toStaleSweepBoundary(
 }
 
 // `publishedBooks` is PUBLISHED_BOOKS (the caller passes it; see ?2 above).
-// Empty treats every book without a lock row as unlocked, which errs toward
-// alarming.
+// Required, not defaulted: an empty list would read every published book
+// without a lock row as unlocked and raise a tq/twl alert for each one.
 export async function findStaleSweepBoundaries(
   env: Env,
   now: number,
-  publishedBooks: Iterable<string> = [],
+  publishedBooks: Iterable<string>,
 ): Promise<StaleSweepBoundary[]> {
   const threshold = now - (EDIT_LOG_RETENTION_SECONDS - EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS);
   const rs = await env.DB.prepare(EDIT_LOG_SWEEP_ALARM_QUERY_SQL)
@@ -568,9 +568,35 @@ export async function findStaleSweepBoundaries(
 // staleness condition), so both dates hold still across runs. No information is
 // lost: an absolute deadline is what the reader acts on anyway, and elapsed
 // days are the difference between the stated date and today.
+//
+// tq/twl get their own wording (issue #1467): they alarm only on unlocked
+// books, so a lock or a published book is never the cause, and their hazard is
+// not the verse merge's. The ult/ust text below must stay byte-identical, or
+// every dismissed ult/ust alert comes back.
 function boundaryMessage(s: StaleSweepBoundary): string {
   const res = s.resource.toUpperCase();
   const day = (epochSeconds: number) => new Date(epochSeconds * 1000).toISOString().slice(0, 10);
+  const since = day(s.masterConfirmedAt);
+  const passes = day(s.masterConfirmedAt + EDIT_LOG_RETENTION_SECONDS);
+  if (s.resource === "tq") {
+    return (
+      `Benjamin — ${s.book} TQ's export to Door43 hasn't been confirmed since ${since}. ` +
+      `The edit history cleanup (180 days) will start removing ${s.book} TQ history behind that point on ${passes}. ` +
+      `After that, the nightly Door43 sync can lose track of where a TQ row started, and Door43's older text ` +
+      `could replace a newer edit made in Bible Editor without any warning (see issues #1461 and #1467). ` +
+      `Nothing has been lost yet — this is early warning. Find out why ${s.book} TQ's export stopped ` +
+      `(for example a stuck -be- branch or a failing export) and unblock it.`
+    );
+  }
+  if (s.resource === "twl") {
+    return (
+      `Benjamin — ${s.book} TWL's export to Door43 hasn't been confirmed since ${since}, so the export may be stuck. ` +
+      `The edit history cleanup (180 days) will start removing ${s.book} TWL history behind that point on ${passes}, ` +
+      `after which the nightly Door43 sync has less history to protect newer edits made in Bible Editor (see issue #1467). ` +
+      `Nothing has been lost yet — this is early warning. Find out why ${s.book} TWL's export stopped ` +
+      `(for example a stuck -be- branch or a failing export) and unblock it.`
+    );
+  }
   return (
     `Benjamin — ${s.book} ${res}'s master-confirmed export watermark hasn't advanced since ` +
     `${day(s.masterConfirmedAt)}. ` +
@@ -615,7 +641,7 @@ function boundaryMessage(s: StaleSweepBoundary): string {
 export async function raiseEditLogSweepBoundaryAlerts(
   env: Env,
   now: number = Math.floor(Date.now() / 1000),
-  publishedBooks: Iterable<string> = [],
+  publishedBooks: Iterable<string>,
 ): Promise<void> {
   try {
     const stale = await findStaleSweepBoundaries(env, now, publishedBooks);
