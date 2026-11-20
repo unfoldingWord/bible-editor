@@ -104,6 +104,16 @@ function keptIdsBetween(d1Render: string, pushed: string): Set<string> {
   return out;
 }
 
+// IDs in D1's render that the push left out: the rows it dropped because
+// Door43 had deleted them (#1415). keptIdsBetween's second half.
+function droppedIdsBetween(d1Render: string, pushed: string): Set<string> {
+  const ids = (raw: string) => new Set(raw.split(/\r?\n/).slice(1).filter(Boolean).map((l) => l.split("\t")[1]?.trim() ?? ""));
+  const pushedIds = ids(pushed);
+  const out = new Set<string>();
+  for (const id of ids(d1Render)) if (id && !pushedIds.has(id)) out.add(id);
+  return out;
+}
+
 // "id (ref), …" for the #1403 alerts, capped so a 79-row refusal stays readable.
 function describeKeptRows(rows: KeptMasterRow[]): string {
   const shown = rows.slice(0, 12).map((r) => `${r.id} (${r.ref})`);
@@ -1129,12 +1139,36 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // Only when we'd actually commit (dcsAllowed) and only for TSV resources,
     // whose row==line model makes the count exact. This is what would have
     // stopped the twl_PSA clobber (4880 rows shipped over master's 7776).
+    //
+    // The count is taken on what would ship (#1424): when the keep-master
+    // plan below leaves out rows Door43 deleted, those rows are not on master,
+    // so counting them would hide as many master rows the render lacks. The
+    // plan is computed first (it only reads) and applied further down; when
+    // it refuses or drops nothing, the count is on the render as before.
     let tsvMasterContentForRevertReport: string | null = null;
     let tsvMasterVerified = false;
+    let keepMaster: Awaited<ReturnType<ExportWorkflow["masterMovedGuard"]>> | null = null;
+    let shrinkRows = built.rowCount;
     if (dcsAllowed && (resource === "tn" || resource === "tq" || resource === "twl")) {
-      const guard = await this.checkTsvShrink(book, resource, built.rowCount, built.content, fresh.masterSha);
-      tsvMasterContentForRevertReport = guard.masterContent;
-      tsvMasterVerified = guard.masterVerified === true;
+      const master = await this.fetchTsvMaster(book, resource, fresh.masterSha);
+      tsvMasterContentForRevertReport = master?.text ?? null;
+      tsvMasterVerified = master?.verified === true;
+      let shrinkContent = built.content;
+      if (tsvMasterContentForRevertReport != null) {
+        keepMaster = await this.masterMovedGuard(
+          book,
+          resource,
+          built.content,
+          tsvMasterContentForRevertReport,
+          r2Key,
+          tsvMasterVerified,
+        );
+        if (keepMaster.measured && !masterMovedGuardRefuses(keepMaster.plan) && keepMaster.plan.dropped.length > 0) {
+          shrinkContent = keepMaster.plan.content;
+          shrinkRows = built.rowCount - keepMaster.plan.dropped.length;
+        }
+      }
+      const guard = await this.checkTsvShrink(book, resource, shrinkRows, shrinkContent, master);
       if (!guard.ok && allowShrink && guard.detail.startsWith("shrink_")) {
         // Explicit human override for a verified-intentional deletion. Scoped to
         // a real shrink only — "master_unreadable" still fails closed, since an
@@ -1173,7 +1207,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         await this.writeAlert(
           `export_shrink_override:${book}:${resource}`,
           `${book} ${resource.toUpperCase()}: shrink guard bypassed by explicit request ` +
-            `(${guard.detail}) — a render of ${built.rowCount} rows was allowed past master's ` +
+            `(${guard.detail}) — a render of ${shrinkRows} rows was allowed past master's ` +
             `${guard.masterRows ?? "?"}. A human confirmed the deletion was intentional. ` +
             `Check the export snapshot for whether the push itself then succeeded.`,
           `${this.env.DCS_BASE_URL}/unfoldingWord`,
@@ -1215,14 +1249,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         await this.writeAlert(
           `export_shrink_credited:${book}:${resource}`,
           `${book} ${resource.toUpperCase()}: shrink guard auto-credited ${guard.explained ?? "?"} human ` +
-            `deletion(s) in D1 (${guard.detail}) — a render of ${built.rowCount} rows was allowed past ` +
+            `deletion(s) in D1 (${guard.detail}) — a render of ${shrinkRows} rows was allowed past ` +
             `master's ${guard.masterRows ?? "?"}, with 0 rows unexplained. No human reviewed this; ` +
             `check the export snapshot for whether the push itself then succeeded.`,
           `${this.env.DCS_BASE_URL}/unfoldingWord`,
           "info",
         );
       } else if (!guard.ok) {
-        await this.recordShrinkSkipAlert(book, resource, built.rowCount, guard.masterRows, guard.detail, guard.explained, guard.unexplained);
+        await this.recordShrinkSkipAlert(book, resource, shrinkRows, guard.masterRows, guard.detail, guard.explained, guard.unexplained);
         const reason = `shrink_guard:${guard.detail}`;
         await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
         return {
@@ -1245,21 +1279,16 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // last push that reached master, but that Door43 changed substantively,
     // ships as master's row instead of reverting it. Such a row that Door43
     // deleted is left out instead of added back (#1415), but only when the
-    // master read is verified complete. Too many kept-or-dropped rows (or a
+    // master read is verified complete or the last push already left it out
+    // (#1424). Too many kept-or-dropped rows (or a
     // row Door43 also moved to another verse) refuses the push. Runs before
     // the hard-reject gate so every later step (that gate, the R2 copy,
     // commitToDcs, recordPushedRender, a conflict rebuild, the revert report)
     // sees the one content that actually ships. Not measured (no proven base,
-    // unreadable base or master, unparseable TSV) → ships as before.
-    if (dcsAllowed && (resource === "tn" || resource === "tq" || resource === "twl") && tsvMasterContentForRevertReport != null) {
-      const guard = await this.masterMovedGuard(
-        book,
-        resource,
-        built.content,
-        tsvMasterContentForRevertReport,
-        r2Key,
-        tsvMasterVerified,
-      );
+    // unreadable base or master, unparseable TSV) → ships as before. The plan
+    // itself was computed above, before the shrink guard (#1424).
+    if (keepMaster != null) {
+      const guard = keepMaster;
       if (guard.measured) {
         const { plan } = guard;
         if (masterMovedGuardRefuses(plan)) {
@@ -2853,34 +2882,42 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // gate had no SHA to offer (e.g. a fresh book with no watermark yet) —
   // fetchDcsMasterText then falls back to its unpinned default, same as
   // before this fix.
+  //
+  // The fetch is its own step (fetchTsvMaster) so the keep-master plan can
+  // run on the same bytes before this guard counts what would ship (#1424).
+  // null = no master file for this book+resource.
+  private async fetchTsvMaster(
+    book: string,
+    resource: Resource,
+    masterSha: string | null,
+  ): Promise<{ text: string | null; verified: boolean } | null> {
+    const file = dcsResourceFile(book, resource as ReimportResource);
+    if (!file) return null;
+    return fetchDcsMasterTextVerified(this.env, file.repo, file.path, masterSha ?? undefined);
+  }
+
   private async checkTsvShrink(
     book: string,
     resource: Resource,
     renderedRows: number,
     renderedContent: string,
-    masterSha: string | null,
+    master: { text: string | null; verified: boolean } | null,
   ): Promise<{
     ok: boolean;
     detail: string;
     masterRows: number | null;
     explained?: number;
     unexplained?: number;
-    // Master's raw TSV, exactly as fetched above — carried out so the caller
-    // (exportOne) can build the export-revert report (export.ts's
-    // tsvRevertReport) WITHOUT a second fetch. null whenever master was never
-    // actually read (no_file / master_unreadable).
+    // Master's raw TSV as passed in, and whether it is provably the whole
+    // file. exportOne no longer reads these (#1424): it takes master from
+    // fetchTsvMaster before calling this guard. null whenever master was
+    // never actually read (no_file / master_unreadable).
     masterContent: string | null;
-    // True only when masterContent is provably the whole file (a pinned SHA
-    // whose contents-API size matched; fetchDcsMasterTextVerified). The
-    // keep-master guard leaves out a row master lacks only then (#1415): a
-    // short read must never read as "Door43 deleted it".
     masterVerified?: boolean;
   }> {
-    const file = dcsResourceFile(book, resource as ReimportResource);
-    if (!file) return { ok: true, detail: "no_file", masterRows: null, masterContent: null };
-    const fetched = await fetchDcsMasterTextVerified(this.env, file.repo, file.path, masterSha ?? undefined);
-    const raw = fetched.text;
-    const masterVerified = fetched.verified;
+    if (!master) return { ok: true, detail: "no_file", masterRows: null, masterContent: null };
+    const raw = master.text;
+    const masterVerified = master.verified;
     if (raw == null) return { ok: false, detail: "master_unreadable", masterRows: null, masterContent: null };
     // Data rows = non-empty lines minus the header (mirrors parseTsv's model).
     const masterRows = Math.max(0, raw.split(/\r?\n/).filter((l) => l.length > 0).length - 1);
@@ -3882,7 +3919,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     masterTsv: string,
     r2Key: string,
     // masterTsv is provably the whole file: only then may a row master lacks
-    // be left out as deleted on Door43 (#1415).
+    // be left out as deleted on Door43 (#1415), apart from a row the base
+    // push already left out (#1424; keepMasterBase's droppedKeys).
     masterVerified: boolean,
   ): Promise<
     | { measured: true; plan: KeepMasterPlan; baseBlobSha: string; mode: "full" | "carry" }
@@ -3891,7 +3929,15 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     const base = await this.keepMasterBase(book, resource, r2Key);
     if (!base.ok) return { measured: false, reason: base.reason };
     try {
-      const plan = planKeepMasterRows(rendered, base.baseText, masterTsv, resource, base.onlyKeys, masterVerified);
+      const plan = planKeepMasterRows(
+        rendered,
+        base.baseText,
+        masterTsv,
+        resource,
+        base.onlyKeys,
+        masterVerified,
+        base.droppedKeys,
+      );
       if (plan == null) return this.keepMasterNotMeasured(book, resource, "unparseable");
       return { measured: true, plan, baseBlobSha: base.baseBlobSha, mode: base.mode };
     } catch (e) {
@@ -3944,7 +3990,16 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     resource: Resource,
     r2Key: string,
   ): Promise<
-    | { ok: true; baseText: string; onlyKeys: Set<string> | null; baseBlobSha: string; mode: "full" | "carry" }
+    | {
+        ok: true;
+        baseText: string;
+        onlyKeys: Set<string> | null;
+        // tn/tq/twl ids the base push left out as deleted on Door43 (#1424);
+        // null when it dropped none or its pushed bytes could not be read.
+        droppedKeys: Set<string> | null;
+        baseBlobSha: string;
+        mode: "full" | "carry";
+      }
     | { ok: false; reason: string }
   > {
     const notMeasured = (reason: string) => ({ ok: false as const, ...this.keepMasterNotMeasured(book, resource, reason) });
@@ -4009,18 +4064,26 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       }
       let baseText = d1Base;
       let onlyKeys: Set<string> | null = null;
+      let droppedKeys: Set<string> | null = null;
+      const isVerse = resource === "ult" || resource === "ust";
       if (mode === "carry") {
         if (d1Base == null) return notMeasured("carry_base_missing");
         const pushed = await readVerifiedPushedRenderText(this.env, book, resource, pointer.r2Key, pointer.blobSha);
         if (pushed == null) return notMeasured("base_unreadable");
-        onlyKeys =
-          resource === "ult" || resource === "ust" ? keptVerseRefsBetween(d1Base, pushed) : keptIdsBetween(d1Base, pushed);
+        onlyKeys = isVerse ? keptVerseRefsBetween(d1Base, pushed) : keptIdsBetween(d1Base, pushed);
         if (onlyKeys == null) return notMeasured("base_unreadable");
+        if (!isVerse) droppedKeys = droppedIdsBetween(d1Base, pushed);
       } else if (baseText == null) {
         baseText = await readVerifiedPushedRenderText(this.env, book, resource, pointer.r2Key, pointer.blobSha);
+      } else if (!isVerse) {
+        // A d1-render sibling means the base push kept or dropped rows; its
+        // pushed bytes say which it dropped (#1424). Unreadable: none known,
+        // so an unverified night ships them as before.
+        const pushed = await readVerifiedPushedRenderText(this.env, book, resource, pointer.r2Key, pointer.blobSha);
+        if (pushed != null) droppedKeys = droppedIdsBetween(baseText, pushed);
       }
       if (baseText == null) return notMeasured("base_unreadable");
-      return { ok: true, baseText, onlyKeys, baseBlobSha: pointer.blobSha, mode };
+      return { ok: true, baseText, onlyKeys, droppedKeys, baseBlobSha: pointer.blobSha, mode };
     } catch (e) {
       return { ok: false, ...this.keepMasterFailed(book, resource, e) };
     }

@@ -467,6 +467,98 @@ console.log("\n[11. too many rows deleted on Door43 → push refused + alert]");
   }
 }
 
+// Add a row to a rendered TSV under a new id (a person adding a note on
+// Door43 that D1 never received).
+const addRow = (tsv, id, note) => {
+  const lines = tsv.split("\n");
+  const c = lines[1].split("\t");
+  c[1] = id;
+  c[6] = note;
+  const last = lines[lines.length - 1] === "" ? lines.length - 1 : lines.length;
+  lines.splice(last, 0, c.join("\t"));
+  return lines.join("\n");
+};
+
+console.log("\n[12. dropped rows must not hide master rows the render lacks from the shrink guard (#1424)]");
+{
+  const id = (i) => `m${String(i).padStart(3, "0")}`;
+  const many = Array.from({ length: 80 }, (_, i) => [id(i), (i % 20) + 1, `Note ${i}.`]);
+  const d = door43();
+  const t = freshEnv(many);
+  await confirmedNight1(t, d);
+  // Door43: 10 of our rows deleted, 30 new rows D1 never got. Master 100,
+  // render 80 (a net loss of 20 passes the count), but the 10 deleted rows
+  // are dropped from what ships, so the push would hold 70: 30 lost.
+  for (let i = 0; i < 10; i++) d.master = deleteRow(d.master, id(i));
+  for (let i = 0; i < 30; i++) d.master = addRow(d.master, `n${String(i).padStart(3, "0")}`, `Door43 note ${i}.`);
+  const n2 = await t.exportOne("export-night-2");
+  ok(String(n2.dcsSkippedReason).startsWith("shrink_guard:shrink_30_of_100"), `refused by the shrink guard (got ${n2.dcsSkippedReason})`);
+  ok(d.writes.length === 0, `nothing committed (writes: ${d.writes.length})`);
+  const shrinkAlert = t.live(`export_shrink:${BOOK}:tn`);
+  ok(
+    shrinkAlert.length === 1 && shrinkAlert[0].message.includes("the render has 70 rows but master has 100"),
+    `a shrink alert counts the rows that would ship (${shrinkAlert[0]?.message})`,
+  );
+}
+
+console.log("\n[13. a row dropped on a verified night stays off on an unverified night (#1424)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  d.master = deleteRow(d.master, "bb22");
+  await t.exportOne("export-night-2"); // verified: bb22 dropped, render equals master
+  ok(d.writes.length === 0, "(setup: night 2 dropped bb22 and committed nothing)");
+  d.noSize = true; // the master read can no longer be proven complete
+  const n3 = await t.exportOne("export-night-3");
+  ok(d.writes.length === 0 && !hasRow(d.branch, "bb22"), `night 3 (unverified) does not add bb22 back (got ${n3.dcsSkippedReason}, writes ${d.writes.length})`);
+  ok(!hasRow(t.r2.get(`exports/export-night-3/${BOOK}/tn/${FILE}`).body, "bb22"), "the R2 copy of night 3's render leaves bb22 out");
+
+  console.log("\n[13b. a second unverified night still leaves it out]");
+  const n4 = await t.exportOne("export-night-4");
+  ok(d.writes.length === 0 && !hasRow(d.branch, "bb22"), `night 4 still leaves bb22 out (got ${n4.dcsSkippedReason}, writes ${d.writes.length})`);
+
+  console.log("\n[13b2. on an unverified night, a row the last push did NOT drop ships even if master lacks it]");
+  d.master = deleteRow(d.master, "cc33");
+  await t.exportOne("export-night-4b");
+  ok(hasRow(d.branch, "cc33"), "cc33 ships: only last push's drops carry over an unverified read");
+  ok(!hasRow(d.branch, "bb22"), "…while bb22 stays out");
+
+  console.log("\n[13c. a translator edits bb22 in Bible Editor → it ships on an unverified night]");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator restored it.' WHERE id = 'bb22'`).run();
+  await t.exportOne("export-night-5");
+  ok(noteOf(d.branch, "bb22") === "Translator restored it.", "the edited row is committed");
+}
+
+console.log("\n[14. carry mode: an unproven push's dropped row stays off on an unverified night (#1424)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  t.sqlite
+    .prepare(`UPDATE book_resource_syncs SET pushed_read_at = pushed_read_at - 100, master_confirmed_at = master_confirmed_at - 100 WHERE book = ?`)
+    .run(BOOK);
+  d.master = deleteRow(d.master, "bb22");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  await t.exportOne("export-night-2"); // verified: drops bb22, pushes aa11; PR not merged
+  const syncs = t.sqlite.prepare(`SELECT pushed_read_at, master_confirmed_at FROM book_resource_syncs WHERE book = ?`).get(BOOK);
+  ok(syncs.master_confirmed_at !== syncs.pushed_read_at, "(setup: night 2's push is not proven on master)");
+  ok(!hasRow(d.branch, "bb22"), "(setup: night 2 left bb22 off the branch)");
+  d.noSize = true;
+  await t.exportOne("export-lockpush-1");
+  ok(!hasRow(d.branch, "bb22"), "an unverified lock & push does not put bb22 back on the branch");
+  ok(noteOf(d.branch, "aa11") === "Translator edit.", "…and the translator's edit still ships");
+
+  console.log("\n[14b. a second unverified push still leaves it out]");
+  await t.exportOne("export-lockpush-2");
+  ok(!hasRow(d.branch, "bb22"), "bb22 stays off the branch");
+
+  console.log("\n[14c. a translator edits bb22 → it ships]");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator restored it.' WHERE id = 'bb22'`).run();
+  await t.exportOne("export-lockpush-3");
+  ok(noteOf(d.branch, "bb22") === "Translator restored it.", "the edited row is committed");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);

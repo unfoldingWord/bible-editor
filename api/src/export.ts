@@ -1288,7 +1288,9 @@ export function tsvRevertReport(
 // bookReimport.ts), so a human-edited or preserved row deleted on Door43 stays
 // in D1 and reaches this point. Dropped rows count with kept rows toward
 // MASTER_MOVED_REFUSE_THRESHOLD. Only when the caller proves master's file was
-// read whole (`masterComplete`): a truncated read must not delete rows.
+// read whole (`masterComplete`): a truncated read must not delete rows. The
+// one exception is a row the base push itself already left out
+// (`previouslyDropped`, #1424): keeping it out changes nothing on the branch.
 //
 // A row Door43 moved to another Reference (with or without a text change) is
 // NOT kept: substituting it in place would leave it under the wrong verse in
@@ -1358,8 +1360,15 @@ export function planKeepMasterRows(
   // ExportWorkflow.masterMovedGuard). Absent = every row.
   onlyIds: ReadonlySet<string> | null = null,
   // masterTsv is provably the whole file (fetchDcsMasterTextVerified). Rows
-  // master lacks are dropped only then; otherwise they ship as before (#1415).
+  // master lacks are dropped only then (#1415), or when `previouslyDropped`
+  // holds them (#1424); otherwise they ship as before.
   masterComplete = false,
+  // IDs the base push itself left out as deleted on Door43 (#1424). On a
+  // night the master read is not proven complete, such a row that master
+  // still lacks stays out: shipping it would add back on Door43 a row the
+  // branch already left out, and the next verified night would delete it
+  // again. Only a row ours still holds unchanged from base, as for any drop.
+  previouslyDropped: ReadonlySet<string> | null = null,
 ): KeepMasterPlan | null {
   const headers = kind === "tn" ? TN_HEADERS : kind === "tq" ? TQ_HEADERS : TWL_HEADERS;
   const refIdx = headers.indexOf("Reference");
@@ -1395,8 +1404,9 @@ export function planKeepMasterRows(
     if (!oursUnchanged) continue; // we changed it: today's behaviour
     if (!masterCells) {
       // Only Door43 deleted it (#1415): leave it out rather than add it back.
-      // A master read not proven complete could just be short: ship as before.
-      if (!masterComplete) continue;
+      // A master read not proven complete could just be short: ship as
+      // before, unless the base push already left this row out (#1424).
+      if (!masterComplete && !previouslyDropped?.has(id)) continue;
       dropped.push({ id, ref: oursCells[refIdx] ?? "", fields: [] });
       keepLine.set(id, "");
       continue;
