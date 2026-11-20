@@ -204,6 +204,7 @@ import {
 } from "./verseBridge.ts";
 import { isAboveBoundary, planStructure, structureKey, type StructureAdoption, type StructuralEdit } from "./verseStructure.ts";
 import { effectiveBookLock } from "./bookLock.ts";
+import { EDIT_LOG_RETENTION_SECONDS } from "./editLogSweep.ts";
 
 export type Resource = "ult" | "ust" | "tn" | "tq" | "twl";
 
@@ -2372,6 +2373,8 @@ export async function applyTsvRows(
             // #1090: while locked the boundary is frozen, so the sync's own
             // later writes advance the content ancestor.
             bookLocked,
+            // #1461: a version the surviving history cannot reach is a gap.
+            new Map(editedCandidates.map((c) => [c.row.id, Number(c.cur.version)])),
           )
         : new Map<string, TsvBaseRecord>();
     for (const { row, cur } of editedCandidates) {
@@ -3767,6 +3770,54 @@ function withBlockedSha(json: string | null, sha: string): string | null {
   }
 }
 
+// One book-known edit_log entry of a row, for sweptHistoryCut. A version or
+// timestamp that is missing or not a finite number is null, never a coerced 0.
+interface SweptChainEntry {
+  id: number;
+  action: string;
+  prev: number | null;
+  next: number | null;
+  at: number | null;
+}
+
+// Where a row's surviving edit_log history has a gap the retention sweep could
+// have made (#1461; reconstructTsvBases explains why it matters). `chain` is
+// every book-known entry of the row, ordered by id; `rowVersion` is the row's
+// current version. Returns null when there is no such gap, else the edit_log id
+// from which the history can be trusted (entries below it are dropped), or
+// +Infinity when the gap is after the last entry.
+//
+// A `create` restarts the chain at its new_version (a reclaim starts a new
+// life). Any other entry with both versions must continue it: prev_version
+// equal to the version reached so far. An entry missing either version
+// (sync_clear_review, tombstone_swept) moves nothing. A gap counts only when
+// the entry before it is older than `horizon` and `atOrBelowBoundary`; a gap
+// whose versions are unknown is not claimed, which leaves the fold as it was.
+function sweptHistoryCut(
+  chain: readonly SweptChainEntry[],
+  rowVersion: number | null,
+  horizon: number,
+  atOrBelowBoundary: (e: SweptChainEntry) => boolean,
+): number | null {
+  const sweepCouldFollow = (e: SweptChainEntry) => e.at != null && e.at < horizon && atOrBelowBoundary(e);
+  let cut: number | null = null;
+  let version: number | null = null;
+  let last: SweptChainEntry | null = null;
+  for (const e of chain) {
+    if (e.action === "create") {
+      version = e.next;
+    } else if (e.prev != null && e.next != null) {
+      if (version != null && last != null && e.prev !== version && sweepCouldFollow(last)) cut = e.id;
+      version = e.next;
+    }
+    last = e;
+  }
+  if (rowVersion != null && version != null && last != null && rowVersion !== version && sweepCouldFollow(last)) {
+    cut = Number.POSITIVE_INFINITY;
+  }
+  return cut;
+}
+
 // Reconstruct the three-way-merge ancestor for a set of edited TSV rows: the row
 // content D1 held as of the master-confirmed watermark (`cutoff`), which is what
 // the export rendered to master. Because a human TSV edit logs only the CHANGED
@@ -3806,9 +3857,13 @@ async function reconstructTsvBases(
   cutoff: number,
   boundaryId: number | null,
   advanceThroughSyncWrites = false,
+  rowVersions: ReadonlyMap<string, number> = new Map(),
 ): Promise<Map<string, TsvBaseRecord>> {
   const out = new Map<string, TsvBaseRecord>();
   const entriesById = new Map<string, TsvEditLogEntry[]>();
+  // edit_log ids of entriesById's entries, index for index, so a swept-history
+  // cut (#1461, below) can drop the entries before a gap.
+  const entryLogIds = new Map<string, number[]>();
   // P1.3: cut at the precise id boundary when we have one, else the timestamp.
   // Either way ?3 carries the single bound value; only the column/operator swaps.
   const boundaryClause = boundaryId != null ? `id <= ?3` : `created_at < ?3`;
@@ -3821,7 +3876,7 @@ async function reconstructTsvBases(
     // created_at.
     const inClause = slice.map((_, j) => `?${j + 4}`).join(", ");
     const rs = await env.DB.prepare(
-      `SELECT row_key, action, payload_json, book FROM edit_log
+      `SELECT row_key, id, action, payload_json, book FROM edit_log
         WHERE kind = ?2 AND (book = ?1 OR book IS NULL)
           AND action IN (${TSV_ANCESTOR_ACTIONS_SQL})
           AND ${boundaryClause}
@@ -3829,7 +3884,7 @@ async function reconstructTsvBases(
         ORDER BY row_key ASC, id ASC`,
     )
       .bind(book, kind, boundaryBind, ...slice)
-      .all<{ row_key: string; action: string; payload_json: string | null; book: string | null }>();
+      .all<{ row_key: string; id: number; action: string; payload_json: string | null; book: string | null }>();
     for (const r of rs.results) {
       let payload: Record<string, unknown> | null = null;
       if (r.payload_json) {
@@ -3843,6 +3898,9 @@ async function reconstructTsvBases(
       const list = entriesById.get(r.row_key) ?? [];
       list.push({ action: r.action, payload, bookKnown: r.book != null });
       entriesById.set(r.row_key, list);
+      const logIds = entryLogIds.get(r.row_key) ?? [];
+      logIds.push(r.id);
+      entryLogIds.set(r.row_key, logIds);
     }
   }
   // CREATE-AS-ANCESTOR FALLBACK (#653). A row whose bounded candidate set is
@@ -3903,14 +3961,21 @@ async function reconstructTsvBases(
   // than only for ids the bounded read missed — the lifecycle question cannot be
   // answered without asking it. Same order of magnitude as the bounded read it
   // sits beside, and it reads at most one `create` row per candidate id.
+  //
+  // For tq the same read also returns every OTHER book-known entry of the row
+  // (payload only on creates), for the swept-history check below (#1461). Same
+  // read count; tn and twl keep the create-only read.
+  const checkSweptHistory = kind === "tq";
+  const versionChain = new Map<string, SweptChainEntry[]>();
   const currentLifeCreate = new Map<string, { aboveBoundary: boolean; entry: TsvEditLogEntry }>();
   for (let i = 0; i < ids.length; i += WRITE_BATCH) {
     const slice = ids.slice(i, i + WRITE_BATCH);
     const inClause = slice.map((_, j) => `?${j + 3}`).join(", ");
     const rs = await env.DB.prepare(
-      `SELECT row_key, id, created_at, action, payload_json, book FROM edit_log
+      `SELECT row_key, id, created_at, action, prev_version, new_version,
+              CASE WHEN action = 'create' THEN payload_json END AS payload_json, book FROM edit_log
         WHERE kind = ?2 AND book = ?1
-          AND action = 'create'
+          ${checkSweptHistory ? "" : "AND action = 'create'"}
           AND row_key IN (${inClause})
         ORDER BY row_key ASC, id ASC`,
     )
@@ -3920,10 +3985,24 @@ async function reconstructTsvBases(
         id: number | null;
         created_at: number | null;
         action: string;
+        prev_version: number | null;
+        new_version: number | null;
         payload_json: string | null;
         book: string | null;
       }>();
     for (const r of rs.results) {
+      if (checkSweptHistory && typeof r.id === "number" && Number.isFinite(r.id)) {
+        const chain = versionChain.get(r.row_key) ?? [];
+        chain.push({
+          id: r.id,
+          action: r.action,
+          prev: typeof r.prev_version === "number" && Number.isFinite(r.prev_version) ? r.prev_version : null,
+          next: typeof r.new_version === "number" && Number.isFinite(r.new_version) ? r.new_version : null,
+          at: typeof r.created_at === "number" && Number.isFinite(r.created_at) ? r.created_at : null,
+        });
+        versionChain.set(r.row_key, chain);
+      }
+      if (r.action !== "create") continue;
       // NEWEST create per row_key: the ORDER BY is ascending, so each row seen
       // replaces the previous one and the last write wins.
       let payload: Record<string, unknown> | null = null;
@@ -3967,6 +4046,55 @@ async function reconstructTsvBases(
       // nothing at all) and is discarded wholesale.
       entriesById.set(id, [create.entry]);
       provisionalIds.add(id);
+    }
+  }
+  // SWEPT HISTORY (#1461), tq only. The hourly retention sweep (editLogSweep.ts)
+  // deletes tq/twl entries older than EDIT_LOG_RETENTION_SECONDS but keeps each
+  // live row's newest `create` (its branch 6). A row whose later updates were
+  // swept then folds the create ALONE, and a create is present-but-WRONG for
+  // every field a swept update changed — the dangerous failure (STATE.md:
+  // "absent" and "wrong" are opposite failures). Measured repro: master's
+  // exported value read as moved, adopt_conflict over a newer in-app edit.
+  //
+  // The signal is the row's version chain. On tq every version bump is a
+  // logged write with prev/new versions (PATCH update/restore/delete, reimport
+  // update/restore/create, AI apply), and non-content actions do not bump it
+  // (review_clear and reorder write no version; dismiss_review logs prev = new).
+  // So a surviving entry whose prev_version skips past the version the chain
+  // had reached, or a row version the chain never reaches, means a
+  // version-bumping entry is missing. sweptHistoryCut drops every entry before
+  // such a gap, from both folds, so the fields only the missing entries could
+  // vouch for come out absent (no_base, D1 kept and flagged).
+  //
+  // Only gaps the SWEEP could have made count, so an old logging quirk never
+  // strips an ancestor that is merely old: the entry before the gap must be
+  // older than the retention horizon (the sweep deletes nothing newer, and ids
+  // are chronological per row) and at or below the boundary (a gap above it
+  // removed nothing the bounded fold reads).
+  //
+  // Not applied to twl: measured 2026-11-20, twlSortOrderApply bumped twl
+  // versions on pure reorders WITHOUT an edit_log entry from 3005039
+  // (2026-07-13) until #687 (ebc2b76, 2026-09-03), so half of JER's
+  // create-only twl rows sit above version 1 with nothing swept. tn is never
+  // swept (#1057). Provisional rows (#653) are left alone: their base already
+  // sits above the boundary, where no gap counts.
+  if (checkSweptHistory) {
+    const horizon = Math.floor(Date.now() / 1000) - EDIT_LOG_RETENTION_SECONDS;
+    const atOrBelowBoundary = (e: SweptChainEntry) =>
+      boundaryId != null ? e.id <= boundaryId : e.at != null && e.at < cutoff;
+    for (const id of ids) {
+      if (provisionalIds.has(id)) continue;
+      const rowVersion = rowVersions.get(id);
+      const cut = sweptHistoryCut(
+        versionChain.get(id) ?? [],
+        typeof rowVersion === "number" && Number.isFinite(rowVersion) ? rowVersion : null,
+        horizon,
+        atOrBelowBoundary,
+      );
+      if (cut == null) continue;
+      const entries = entriesById.get(id) ?? [];
+      const logIds = entryLogIds.get(id) ?? [];
+      entriesById.set(id, entries.filter((_, k) => logIds[k] >= cut));
     }
   }
   // LOCKED BOOK: ADVANCE THROUGH THE SYNC'S OWN WRITES (#1090). Only when the

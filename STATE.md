@@ -406,6 +406,14 @@ Highlights that bite repeatedly:
   **7,689** tn/tq/twl `edit_log` rows with a NULL `book`, and row ids are unique only per `(book, id)`, so another
   book's history can fold into this one's ancestor (#545).
 
+- **A tq row's version chain proves its edit_log history is complete; a twl row's does not (#1461).** The sweep keeps
+  a tq/twl row's create and deletes its old updates, so `reconstructTsvBases` drops a tq fold's entries before any
+  prev/new version gap the sweep could have made. That works because every tq version bump is a logged write
+  (measured 2026-11-20: 0 chain breaks across all 37 tq books). twl versions are not evidence:
+  `twlSortOrderApply` bumped them on pure reorders without an edit_log row from 3005039 (2026-07-13) until #687
+  (2026-09-03), so about half of JER's create-only twl rows sit above version 1 with nothing deleted. twl keeps the
+  stale-create hazard until someone picks a different signal.
+
 - **`source_sha` and `master_confirmed_at` are two different points in master's history, and they drift apart by
   design.** `recordResourceSync` advances `source_sha` at the end of any successful reimport; `master_confirmed_at`
   moves only on a POSITIVE measurement that master holds our render (`markOwnPublishConverged`, or

@@ -59,7 +59,7 @@ function loadEntriesById(ids, boundaryId = null) {
   const boundaryBind = boundaryId != null ? boundaryId : CUTOFF;
   const rows = db
     .prepare(
-      `SELECT row_key, action, payload_json, book FROM edit_log
+      `SELECT row_key, id, action, payload_json, book FROM edit_log
         WHERE kind = ? AND (book = ? OR book IS NULL)
           AND action IN ('create', 'update', 'restore')
           AND ${boundaryClause}
