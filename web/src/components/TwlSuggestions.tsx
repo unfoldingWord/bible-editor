@@ -13,7 +13,7 @@
 // "Suggest gave me words that actually belong to the other verse." A singleton
 // verse reduces to the old single-group behaviour with no per-verse header.
 
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   Box,
   Stack,
@@ -68,6 +68,11 @@ interface Props {
   // quote on its verse. Blocked ids are pruned from the picker; a suggestion
   // whose every article is blocked is dropped entirely.
   blockedArticleIds?: (suggestion: TwlSuggestion, verse: number, candidateIds?: string[]) => Set<string>;
+  // Moves fetched suggestions to the verse they belong to before anything else
+  // sees them (a bridged ULT row is fetched under its start verse only; #1432).
+  // Must be a stable callback: its identity feeds a memo whose result is
+  // reported up through onSuggestions.
+  regroup?: (groups: TwlVerseSuggestions[]) => TwlVerseSuggestions[];
   // Whether the deny-lists have settled (loaded or failed). The list holds off
   // rendering until then so a blocked suggestion can't show — or be added —
   // before isExcluded / blockedArticleIds have real data. Defaults to true so a
@@ -79,7 +84,7 @@ interface Props {
   paused?: boolean;
 }
 
-function TwlSuggestionsInner({ book, chapter, verses, refreshKey, onAdd, isExcluded, onSuggestions, blockedArticleIds, filtersReady = true, paused = false }: Props) {
+function TwlSuggestionsInner({ book, chapter, verses, refreshKey, onAdd, isExcluded, onSuggestions, blockedArticleIds, regroup, filtersReady = true, paused = false }: Props) {
   // Stable, ascending, 0-free verse list + a location key derived from it, so a
   // reordered/duplicated `verses` prop doesn't churn the fetch. Recomputed each
   // render (cheap; usually 1–2 entries).
@@ -91,8 +96,13 @@ function TwlSuggestionsInner({ book, chapter, verses, refreshKey, onAdd, isExclu
   useEffect(() => {
     setPeeked(false);
   }, [book, chapter, versesKey, paused]);
-  // Raw suggestions grouped by verse, in `scanVerses` order.
-  const [groups, setGroups] = useState<TwlVerseSuggestions[]>([]);
+  // Raw suggestions grouped by the verse each was fetched for, in `scanVerses`
+  // order; `groups` is the same after `regroup` moves each to its own verse.
+  const [fetchedGroups, setGroups] = useState<TwlVerseSuggestions[]>([]);
+  const groups = useMemo(
+    () => (regroup ? regroup(fetchedGroups) : fetchedGroups),
+    [fetchedGroups, regroup],
+  );
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
   // Per-suggestion chosen article for disambiguation (keyed by verse+span+occ).

@@ -10,7 +10,7 @@
 //   collectTargetTokens  — ULT \w tokens + their \zaln-s source-ancestor chains
 //   buildQuoteFromSelection — source-key set -> {quote, occurrence}
 
-import { collectTargetTokens, buildQuoteFromSelection } from "./quoteBuilder.ts";
+import { collectTargetTokens, buildQuoteFromSelection, type TargetToken } from "./quoteBuilder.ts";
 import type { HighlightKey } from "./highlight.ts";
 
 export interface ResolvedQuote {
@@ -40,6 +40,35 @@ function spanWords(span: string): string[] {
     .filter(Boolean);
 }
 
+// The ULT token run a suggestion's span names: every contiguous run that equals
+// `want`, in document order, then the glOccurrence-th; the first (not
+// confident) when the occurrence overshoots (counts can drift between the
+// matcher's text scan and the aligned token list). Shared by the resolver and
+// the bridge regroup below, so both always pick the same run.
+function pickRun(
+  tokens: TargetToken[],
+  want: string[],
+  glOccurrence: number,
+): { start: number; confident: boolean } | null {
+  if (tokens.length === 0 || want.length === 0) return null;
+  const normTokens = tokens.map((t) => normWord(t.text));
+  const runStarts: number[] = [];
+  for (let i = 0; i + want.length <= normTokens.length; i++) {
+    let ok = true;
+    for (let j = 0; j < want.length; j++) {
+      if (normTokens[i + j] !== want[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) runStarts.push(i);
+  }
+  if (runStarts.length === 0) return null;
+  const occ = Math.max(1, glOccurrence | 0);
+  const chosen = runStarts[occ - 1];
+  return chosen === undefined ? { start: runStarts[0], confident: false } : { start: chosen, confident: true };
+}
+
 export function resolveSpanToSource(
   ultVerseObjects: unknown[] | null | undefined,
   uhbVerseObjects: unknown[] | null | undefined,
@@ -64,35 +93,11 @@ export function resolveSpanToSource(
   // SECOND English "all" resolved to the FIRST Hebrew word and returned it as
   // confident, writing the wrong orig_words onto a TWL row.
   const tokens = collectTargetTokens(ultVerseObjects, uhbVerseObjects, sourceRef);
-  if (tokens.length === 0) return null;
-  const normTokens = tokens.map((t) => normWord(t.text));
+  const run = pickRun(tokens, want, glOccurrence);
+  if (!run) return null;
+  let confident = run.confident;
 
-  // Every contiguous ULT token run that equals the span, in document order.
-  const runStarts: number[] = [];
-  for (let i = 0; i + want.length <= normTokens.length; i++) {
-    let ok = true;
-    for (let j = 0; j < want.length; j++) {
-      if (normTokens[i + j] !== want[j]) {
-        ok = false;
-        break;
-      }
-    }
-    if (ok) runStarts.push(i);
-  }
-  if (runStarts.length === 0) return null;
-
-  // Pick the glOccurrence-th run; fall back to the first (not confident) if the
-  // occurrence index overshoots (counts can drift between the matcher's text
-  // scan and the aligned token list).
-  const occ = Math.max(1, glOccurrence | 0);
-  let confident = true;
-  let chosenStart = runStarts[occ - 1];
-  if (chosenStart === undefined) {
-    chosenStart = runStarts[0];
-    confident = false;
-  }
-
-  const runTokens = tokens.slice(chosenStart, chosenStart + want.length);
+  const runTokens = tokens.slice(run.start, run.start + want.length);
   const keys = new Set<HighlightKey>();
   let allHaveSources = true;
   for (const t of runTokens) {
@@ -110,4 +115,59 @@ export function resolveSpanToSource(
     occurrence: built.occurrence,
     confident: confident && allHaveSources,
   };
+}
+
+// Per-verse TWL suggestions for a bridged ULT row (#1432). The suggest route
+// reads one D1 row per verse number, and a bridge is stored once under its
+// start verse, so every suggestion for 9:10-12 arrives in the 9:10 group and
+// 9:11 / 9:12 get none. Where tCore named each milestone's source verse
+// (x-ref), move each suggestion to the verse its English is aligned in, so it
+// is shown, resolved (with that verse's sourceRef) and added there.
+// glOccurrence is left as is: it counts over the whole row, which is what
+// resolveSpanToSource expects. A suggestion stays where it was fetched when its
+// run is not found, is unaligned, carries no x-ref, mixes verses, or names a
+// verse with no group. Never split by text position: a bridge's English need
+// not follow verse order (2CH 9:10-12 UST reads 9:12, 9:10, then 9:11).
+// `bridgedUltFor(verse)` returns the ULT verseObjects only when that verse's
+// ULT row is a bridge; otherwise the group is left alone. Returns `groups`
+// itself when nothing moves.
+export function regroupTwlSuggestionsByXref<S extends { matchedText: string; glOccurrence: number }>(
+  groups: { verse: number; suggestions: S[] }[],
+  chapter: number,
+  bridgedUltFor: (verse: number) => unknown[] | null | undefined,
+): { verse: number; suggestions: S[] }[] {
+  const has = new Set(groups.map((g) => g.verse));
+  const moves: { from: number; s: S; to: number }[] = [];
+  for (const g of groups) {
+    const ult = bridgedUltFor(g.verse);
+    if (!Array.isArray(ult) || g.suggestions.length === 0) continue;
+    const tokens = collectTargetTokens(ult);
+    for (const s of g.suggestions) {
+      const want = spanWords(s.matchedText);
+      const run = pickRun(tokens, want, s.glOccurrence);
+      if (!run || !run.confident) continue;
+      const refs = new Set<string>();
+      let unnamed = false;
+      for (const t of tokens.slice(run.start, run.start + want.length)) {
+        for (const src of t.sources) {
+          if (src.ref === undefined) unnamed = true;
+          else refs.add(src.ref);
+        }
+      }
+      if (unnamed || refs.size !== 1) continue;
+      const m = /^(\d+):(\d+)$/.exec([...refs][0]);
+      if (!m || Number(m[1]) !== chapter) continue;
+      const to = Number(m[2]);
+      if (to !== g.verse && has.has(to)) moves.push({ from: g.verse, s, to });
+    }
+  }
+  if (moves.length === 0) return groups;
+  const leaving = new Set(moves.map((x) => x.s));
+  return groups.map((g) => ({
+    verse: g.verse,
+    suggestions: [
+      ...g.suggestions.filter((s) => !leaving.has(s)),
+      ...moves.filter((x) => x.to === g.verse).map((x) => x.s),
+    ],
+  }));
 }
