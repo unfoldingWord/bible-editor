@@ -128,7 +128,7 @@ function freshEnv(rows) {
           const out = stmts.map((s) => ({ meta: { changes: Number(sqlite.prepare(s._sql).run(...s._args).changes) } }));
           sqlite.exec("COMMIT");
           return out;
-        } catch {
+        } catch (e) {
           sqlite.exec("ROLLBACK");
           throw e;
         }
@@ -685,6 +685,68 @@ console.log("\n[16d. the retry drops MORE than the committed attempt, then dies 
   ok(!hasRow(d.branch, "bb22"), "the unverified third attempt does not add bb22 back");
   ok(!hasRow(t.r2.get(`exports/export-night-2/${BOOK}/tn/${FILE}`).body, "bb22"), "its R2 render leaves bb22 out");
   ok(noteOf(d.branch, "aa11") === "Translator edit.", "…and the translator's edit still ships");
+}
+
+console.log("\n[16e. a drop the retry only planned (it died before committing) is not treated as committed (#1455)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  d.master = deleteRow(d.master, "bb22");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  // Attempt 1 (verified) commits without bb22, then dies before recording it.
+  const a1 = await failOnce(t, "recordPushedRender", () => t.exportOne("export-night-2"));
+  // Attempt 2 (verified) also plans to drop cc33, then dies before committing.
+  d.master = deleteRow(d.master, "cc33");
+  const a2 = await failOnce(t, "recordKeptMasterRows", () => t.exportOne("export-night-2"));
+  ok(a1 && a2 && d.writes.length === 1 && hasRow(d.branch, "cc33"), "(setup: only attempt 1 committed; the branch has cc33)");
+  d.noSize = true;
+  await t.exportOne("export-night-2");
+  ok(!hasRow(d.branch, "bb22"), "the unverified third attempt keeps bb22 off");
+  ok(hasRow(d.branch, "cc33"), "…and does not drop cc33, which no commit left out");
+}
+
+console.log("\n[16f. a later commit that shipped the row back clears it from the committed drops (#1455)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  const n1Master = d.master;
+  d.master = deleteRow(n1Master, "bb22");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  // Attempt 1 (verified) commits without bb22, then dies before recording it.
+  const a1 = await failOnce(t, "recordPushedRender", () => t.exportOne("export-night-2"));
+  // Door43 puts bb22 back and deletes cc33. Attempt 2 (verified) ships bb22,
+  // drops cc33, commits, and dies before recording it.
+  d.master = deleteRow(n1Master, "cc33");
+  const a2 = await failOnce(t, "recordPushedRender", () => t.exportOne("export-night-2"));
+  ok(a1 && a2 && d.writes.length === 2 && hasRow(d.branch, "bb22") && !hasRow(d.branch, "cc33"), "(setup: attempt 2 committed bb22 back, cc33 off)");
+  // Attempt 3 reads master unverified and short of bb22.
+  d.master = deleteRow(d.master, "bb22");
+  d.noSize = true;
+  await t.exportOne("export-night-2");
+  ok(hasRow(d.branch, "bb22"), "the unverified third attempt does not drop bb22, which the last commit shipped");
+  ok(!hasRow(d.branch, "cc33"), "…and keeps cc33 off");
+}
+
+console.log("\n[16g. a retry whose guard drops nothing still clears the committed drops its commit undid (#1455)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  const n1Master = d.master;
+  d.master = deleteRow(n1Master, "bb22");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  const a1 = await failOnce(t, "recordPushedRender", () => t.exportOne("export-night-2"));
+  // Door43 puts bb22 back; attempt 2 (verified) keeps and drops nothing,
+  // commits bb22 back, and dies before recording it.
+  d.master = n1Master;
+  const a2 = await failOnce(t, "recordPushedRender", () => t.exportOne("export-night-2"));
+  ok(a1 && a2 && d.writes.length === 2 && hasRow(d.branch, "bb22"), "(setup: attempt 2 committed bb22 back)");
+  d.master = deleteRow(n1Master, "bb22");
+  d.noSize = true;
+  await t.exportOne("export-night-2");
+  ok(hasRow(d.branch, "bb22"), "the unverified third attempt does not drop bb22");
 }
 
 if (failed > 0) {
