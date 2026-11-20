@@ -133,7 +133,7 @@ import { evaluateStaleBaseReplacement, type StaleBaseHold } from "./staleBaseGat
 import { recordStaleBaseHold, raiseStaleBaseHoldAlert, clearStaleBaseHold } from "./staleBaseHolds";
 import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
-import { planVerseSortOrders, verseOrderKey, type LiveOrderRow, type VerseOrderPlan } from "./tsvVerseOrder";
+import { orderChangedChapters, planVerseSortOrders, verseOrderKey, type LiveOrderRow, type VerseOrderPlan } from "./tsvVerseOrder";
 import {
   MIRROR_KEPT,
   MIRROR_NON_CONTENT_ACTIONS,
@@ -2283,7 +2283,13 @@ export async function applyTsvRows(
     // BEFORE the aiOnly re-seed, so the reorder is preserved (the reorder-revert
     // fix). Only a reordered AI row whose CONTENT also drifted on master takes
     // master wholesale (content + file order) — the re-seed we want.
-    const fate = classifyReimportRow(contentMatches, sortMatches, reimportable, preserveLocalOrder, aiOnly);
+    let fate = classifyReimportRow(contentMatches, sortMatches, reimportable, preserveLocalOrder, aiOnly);
+    // #1411: an AI-only row whose content already equals master's and whose
+    // only difference is order (a tq row, or a tn row with a NULL number) is
+    // not re-seeded: that is a version bump, an edit_log row and a 409 for an
+    // open editor over an order change. The whole-verse plan's sort-only
+    // batch at the end of this function moves it instead.
+    if (fate === "update_ai" && contentMatches && orderPlan != null) fate = "noop";
     if (fate === "noop") {
       counts.skipped_noop++;
       // A resolved reference-move flag has to be cleared HERE, on the no-op path,
@@ -10238,11 +10244,21 @@ function storedTsvRowToParsed(kind: TsvKind, row: Record<string, unknown>): Pars
 // human-edited id is harmless — softDeleteRemovedTsvRows's own
 // isReimportableRow check refuses to prune it — so this only ever widens
 // "changed", never narrows it.
+//
+// Issue #1411: the signature leaves out sort_order, so a chapter whose only
+// Door43 change is note order read as unchanged and master's order never
+// reached D1. With `order` (tn/tq on a book the locked mirror does not own),
+// a chapter is also changed when master's file would move a row in one of its
+// verses (orderChangedChapters: the same per-verse decision applyTsvRows'
+// order plan makes, so a verse a person reordered in-app since the last
+// confirmed export, `order.confirmedAt`, does not count). The chapter then
+// takes the ordinary apply, whose batched sort-only writes do the reorder.
 export async function changedTsvChapters(
   env: Env,
   book: string,
   kind: TsvKind,
   rawTsv: string,
+  order?: { confirmedAt: number | null },
 ): Promise<Set<number>> {
   const pristine =
     kind === "tn"
@@ -10268,12 +10284,14 @@ export async function changedTsvChapters(
   // actually yields negative, but a malformed ref still shouldn't crash this)
   // while letting chapter 0 flow through like any other chapter.
   const incoming = new Map<number, Map<string, string>>();
+  const incomingOrder: ParsedTsvRow[] = [];
   for (const r of parseTsv(rawTsv).rows) {
     const p = parseTsvRow(r, kind);
     if (!p || p.chapter < 0) continue;
     let m = incoming.get(p.chapter);
     if (!m) incoming.set(p.chapter, (m = new Map()));
     m.set(p.id, tsvRowSignature(kind, p));
+    incomingOrder.push(p);
   }
 
   const stored = new Map<number, Map<string, string>>();
@@ -10327,6 +10345,26 @@ export async function changedTsvChapters(
       }
     }
     if (!same) changed.add(ch);
+  }
+
+  // #1411: order-only chapters. One read of every live row, the same set
+  // applyTsvRows plans over (`deleted_at IS NULL`, trashed rows included).
+  if (order && kind !== "twl") {
+    const rs = await env.DB.prepare(
+      `SELECT id, chapter, verse, sort_order, last_change_action, last_change_source, updated_at
+         FROM ${TSV_TABLE[kind]} WHERE book = ?1 AND deleted_at IS NULL`,
+    )
+      .bind(book)
+      .all<LiveOrderRow>();
+    const live = (rs.results ?? []).map((r) => ({
+      ...r,
+      id: String(r.id),
+      chapter: Number(r.chapter),
+      verse: Number(r.verse),
+      sort_order: r.sort_order == null ? null : Number(r.sort_order),
+      updated_at: r.updated_at == null ? null : Number(r.updated_at),
+    }));
+    for (const ch of orderChangedChapters(kind, incomingOrder, live, order.confirmedAt)) changed.add(ch);
   }
   return changed;
 }
@@ -11931,6 +11969,15 @@ async function runLockedMirrors(
         incomplete = true;
         break;
       }
+      // #1411: the book was locked when this run staged the file, so the
+      // chapter gate left Door43's order to the mirror. Unlocked since (or
+      // the lock read failed), the mirror did nothing and an order-only
+      // chapter went unapplied: withhold the watermark so the next night
+      // re-stages the file through the ordinary path and its order gate.
+      if (res.skipped === "not_locked") {
+        incomplete = true;
+        break;
+      }
       if (res.mirrored > 0) perResource[kind].mirrored = (perResource[kind].mirrored ?? 0) + res.mirrored;
       lockedChapters = Math.max(lockedChapters, res.skippedLocked);
       kept = res.kept; // re-counted by every step's plan: the last one stands
@@ -12156,7 +12203,14 @@ export async function runChunkedReimport(
       if (e.resource === "ult" || e.resource === "ust" || !e.r2Key) continue;
       const raw = await readStaged(env, e.r2Key);
       if (raw == null) continue;
-      out[e.resource] = [...(await changedTsvChapters(env, book, e.resource, raw))];
+      // #1411: order-only chapters too, except where the locked-book mirror
+      // (#1418) owns this file: it applies Door43's order itself, so the
+      // apply path must not reorder the same rows first. Same cutoff the
+      // chunk's applyTsvRows reads for its order plan.
+      const order = e.resource !== "twl" && !e.mirror
+        ? { confirmedAt: (await getMasterConfirmedAt(env, book, e.resource)).confirmedAt ?? null }
+        : undefined;
+      out[e.resource] = [...(await changedTsvChapters(env, book, e.resource, raw, order))];
     }
     return out;
   });
