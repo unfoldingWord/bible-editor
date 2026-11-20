@@ -469,8 +469,11 @@ console.log("\n[13. a refused night with translator-scale alignment loss does no
   ok(t.live(`export_align_shrink:${BOOK}:ult`).length === 0, "the lost-alignment banner is cleared");
 }
 
-console.log("\n[14. refused night N, guard not measured on night N+1 that ships → the refusal alert is cleared (#1434)]");
+console.log("\n[14. refused night N, guard not measured on night N+1 that ships → the refusal alert STAYS (#1434)]");
 {
+  // A not-measured night ships D1's unspliced render, which can carry the
+  // very verses the refusal warned about: an absent measurement is not a
+  // clean one, so the warning must outlive it.
   const d = door43();
   const t = freshEnv();
   await confirmedNight1(t, d);
@@ -497,26 +500,25 @@ console.log("\n[14. refused night N, guard not measured on night N+1 that ships 
   }
   ok(logs3.some((l) => l.includes("keep-master guard not measured")), "(setup: night N+1's verse guard did not measure)");
   ok(d.writes.length === 1 && n3.dcsSkippedReason == null, `night N+1 ships (got ${n3.dcsSkippedReason}, writes ${d.writes.length})`);
-  ok(t.live(`export_master_moved:${BOOK}:ult`).length === 0, "the refusal alert is cleared");
+  ok(t.live(`export_master_moved:${BOOK}:ult`).length === 1, "the refusal alert stays");
 }
 
-console.log("\n[15. refused night N, night N+1 a no-op against a stale branch that already holds the render → the refusal alert stays (#1434 A1)]");
+console.log("\n[14b. refused night N, guard measures and does not refuse on night N+1 → the refusal alert clears (#1434)]");
 {
   const d = door43();
   const t = freshEnv();
   await confirmedNight1(t, d);
+  const confirmed = d.master;
   const s3 = verseSpan(d.master, 3);
   d.master = (d.master.slice(0, s3.start) + d.master.slice(s3.start).replace(/^\\v 3\s*/, "")).replace(/\\v 2(?=\s)/, "\\v 2-3");
   const n2 = await t.exportOne("export-night-2");
   ok(String(n2.dcsSkippedReason).startsWith("master_moved_guard:"), `night N refused (got ${n2.dcsSkippedReason})`);
-  ok(t.r2.delete(`exports/export-night-1/${BOOK}/ult/${FILE}`), "(setup: base render removed, so night N+1 does not measure)");
-  t.editD1(4, "eagle", "hawk");
-  // An unmerged branch from earlier already holds exactly tonight's render;
-  // the stand-in's branch reset leaves it in place.
-  d.branch = await t.render("n3pre");
-  await t.exportOne("export-night-3");
-  ok(d.writes.length === 0, `nothing was written (writes ${d.writes.length})`);
-  ok(t.live(`export_master_moved:${BOOK}:ult`).length === 1, "the refusal alert stays");
+  ok(t.live(`export_master_moved:${BOOK}:ult`).length === 1, "night N records the refusal alert");
+  // Door43 undoes the bridge; the guard measures and finds nothing to refuse.
+  d.master = confirmed;
+  const n3 = await t.exportOne("export-night-3");
+  ok(n3.dcsSkippedReason === "unchanged", `night N+1 ships (got ${n3.dcsSkippedReason})`);
+  ok(t.live(`export_master_moved:${BOOK}:ult`).length === 0, "the refusal alert is cleared");
 }
 
 if (failed > 0) {

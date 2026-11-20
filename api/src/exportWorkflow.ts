@@ -1489,8 +1489,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             prReason: null,
           };
         }
-        // Not from an operator's override branch: the refusal alert is about
-        // the nightly branch, which tonight's run does not touch (#1434 A1).
+        // The ONLY place a refusal alert clears: the guard measured and did
+        // not refuse. A not-measured night ships D1's unspliced render, which
+        // can carry the very verses the alert warned about, so it must not
+        // clear it (#1434). Not from an operator's override branch either:
+        // the refusal is about the nightly branch, which that run does not
+        // touch (#1434 A1).
         if (branchOverride == null) await this.clearExportAlert(`export_master_moved:${book}:${resource}`);
         if (plan.unspliced.length > 0) {
           console.log(
@@ -1621,22 +1625,6 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       }
       dcsCommitSha = commit.commitSha || null;
       dcsChanged = commit.changed;
-      // The push went through, so an earlier night's keep-master refusal no
-      // longer holds, even on a night the verse guard could not measure and
-      // so never cleared it above (#1434). Only on proof: tonight's commit
-      // wrote the branch (changed), or master already equals the render
-      // (!branchTouched). A no-op against a stale, unmerged branch that
-      // already held this render proves neither, and that branch could still
-      // merge over Door43's change. Never from an operator's override branch:
-      // the refusal is about the nightly branch (review A1).
-      if (
-        (resource === "ult" || resource === "ust") &&
-        branchOverride == null &&
-        (commit.changed || !commit.branchTouched)
-      ) {
-        await this.clearExportAlert(`export_master_moved:${book}:${resource}`);
-      }
-
       // ONE write for two facts about this (book, resource), because both are
       // established by the same commitToDcs call and land on the same row:
       //
