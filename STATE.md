@@ -77,6 +77,12 @@
   verse-data-repair pattern) before the next export re-ships the straight quotes to Door43. Not yet located
   by book+chapter+verse+bible_version — that inventory is the first step of the repair.
 
+- **twl rows can still fold a stale create ancestor after the edit_log sweep (issue #1461, open for twl)** — the
+  tq half is fixed by a version-chain check in `reconstructTsvBases`; twl versions were inflated by unlogged reorder
+  bumps (see the #1461 lesson below), so the same check would flag thousands of twl rows `merge_no_base` once their
+  creates pass the 180-day horizon (from about 2026-12-12). Benjamin's choice: keep the possibly stale twl ancestor,
+  accept the false flags, or apply the check only where the entry before the gap postdates #687 (2026-09-03).
+
 ## Lessons learned (write durable, cross-session facts here — not in chat)
 
 For the full corpus, see the memory index at
@@ -409,7 +415,9 @@ Highlights that bite repeatedly:
 - **A tq row's version chain proves its edit_log history is complete; a twl row's does not (#1461).** The sweep keeps
   a tq/twl row's create and deletes its old updates, so `reconstructTsvBases` drops a tq fold's entries before any
   prev/new version gap the sweep could have made. That works because every tq version bump is a logged write
-  (measured 2026-11-20: 0 chain breaks across all 37 tq books). twl versions are not evidence:
+  (measured 2026-11-20: 0 chain breaks across all 37 tq books). Not every logged bump is content: a flag-only merge
+  write bumps the version too, so once swept it reads as a gap (a false merge_no_base, the safe failure). twl
+  versions are not evidence:
   `twlSortOrderApply` bumped them on pure reorders without an edit_log row from 3005039 (2026-07-13) until #687
   (2026-09-03), so about half of JER's create-only twl rows sit above version 1 with nothing deleted. twl keeps the
   stale-create hazard until someone picks a different signal.

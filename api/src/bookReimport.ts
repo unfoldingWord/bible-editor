@@ -3790,9 +3790,12 @@ interface SweptChainEntry {
 // A `create` restarts the chain at its new_version (a reclaim starts a new
 // life). Any other entry with both versions must continue it: prev_version
 // equal to the version reached so far. An entry missing either version
-// (sync_clear_review, tombstone_swept) moves nothing. A gap counts only when
-// the entry before it is older than `horizon` and `atOrBelowBoundary`; a gap
-// whose versions are unknown is not claimed, which leaves the fold as it was.
+// (sync_clear_review, tombstone_swept) moves nothing, and is not the gate
+// either: a gap counts when the entry that last SET the version is older than
+// `horizon` and `atOrBelowBoundary`, whatever un-versioned entries sit between
+// it and the gap (a recent clear says nothing about what was deleted before
+// it). A gap whose versions are unknown is not claimed, which leaves the fold
+// as it was.
 function sweptHistoryCut(
   chain: readonly SweptChainEntry[],
   rowVersion: number | null,
@@ -3802,17 +3805,18 @@ function sweptHistoryCut(
   const sweepCouldFollow = (e: SweptChainEntry) => e.at != null && e.at < horizon && atOrBelowBoundary(e);
   let cut: number | null = null;
   let version: number | null = null;
-  let last: SweptChainEntry | null = null;
+  let setBy: SweptChainEntry | null = null; // the entry that set `version`
   for (const e of chain) {
     if (e.action === "create") {
       version = e.next;
+      setBy = e;
     } else if (e.prev != null && e.next != null) {
-      if (version != null && last != null && e.prev !== version && sweepCouldFollow(last)) cut = e.id;
+      if (version != null && setBy != null && e.prev !== version && sweepCouldFollow(setBy)) cut = e.id;
       version = e.next;
+      setBy = e;
     }
-    last = e;
   }
-  if (rowVersion != null && version != null && last != null && rowVersion !== version && sweepCouldFollow(last)) {
+  if (rowVersion != null && version != null && setBy != null && rowVersion !== version && sweepCouldFollow(setBy)) {
     cut = Number.POSITIVE_INFINITY;
   }
   return cut;
@@ -3967,7 +3971,7 @@ async function reconstructTsvBases(
   // read count; tn and twl keep the create-only read.
   const checkSweptHistory = kind === "tq";
   const versionChain = new Map<string, SweptChainEntry[]>();
-  const currentLifeCreate = new Map<string, { aboveBoundary: boolean; entry: TsvEditLogEntry }>();
+  const currentLifeCreate = new Map<string, { aboveBoundary: boolean; logId: number | null; entry: TsvEditLogEntry }>();
   for (let i = 0; i < ids.length; i += WRITE_BATCH) {
     const slice = ids.slice(i, i + WRITE_BATCH);
     const inClause = slice.map((_, j) => `?${j + 3}`).join(", ");
@@ -4033,6 +4037,7 @@ async function reconstructTsvBases(
           : entryAt != null && !(entryAt < cutoff);
       currentLifeCreate.set(r.row_key, {
         aboveBoundary,
+        logId: entryId,
         entry: { action: r.action, payload, bookKnown: r.book != null },
       });
     }
@@ -4058,39 +4063,53 @@ async function reconstructTsvBases(
   //
   // The signal is the row's version chain. On tq every version bump is a
   // logged write with prev/new versions (PATCH update/restore/delete, reimport
-  // update/restore/create, AI apply), and non-content actions do not bump it
-  // (review_clear and reorder write no version; dismiss_review logs prev = new).
-  // So a surviving entry whose prev_version skips past the version the chain
-  // had reached, or a row version the chain never reaches, means a
-  // version-bumping entry is missing. sweptHistoryCut drops every entry before
-  // such a gap, from both folds, so the fields only the missing entries could
-  // vouch for come out absent (no_base, D1 kept and flagged).
+  // update/restore/create, the merge's own writes, AI apply). So a surviving
+  // entry whose prev_version skips past the version the chain had reached, or
+  // a row version the chain never reaches, means a version-bumping entry is
+  // missing. sweptHistoryCut drops every entry before such a gap, from both
+  // folds, so the fields only the missing entries could vouch for come out
+  // absent (no_base, D1 kept and flagged).
+  //
+  // NOT EVERY BUMP IS CONTENT. review_clear and reorder write no version and
+  // dismiss_review logs prev = new, so those never read as gaps. But a
+  // flag-only merge write (a keep_no_base or conflict mint) goes through
+  // buildTsvEditedWriteStmt, which bumps the version and logs an `update`
+  // holding only review fields. While it survives it continues the chain; once
+  // swept it reads as a gap, a false merge_no_base. That is the safe failure,
+  // and it is rare (measured 2026-11-20: at most 13 of prod's 5,650
+  // version-bumping tq updates carry no merge or reference field).
   //
   // Only gaps the SWEEP could have made count, so an old logging quirk never
-  // strips an ancestor that is merely old: the entry before the gap must be
-  // older than the retention horizon (the sweep deletes nothing newer, and ids
-  // are chronological per row) and at or below the boundary (a gap above it
-  // removed nothing the bounded fold reads).
+  // strips an ancestor that is merely old: the entry that last set the version
+  // before the gap must be older than the retention horizon (the sweep deletes
+  // nothing newer, and ids are chronological per row) and at or below the
+  // boundary (a gap above it removed nothing the bounded fold reads).
+  //
+  // A #653 provisional row's base IS its create, above the boundary, so for it
+  // the boundary test is waived and only gaps after that create count; a gap
+  // empties the base (the row stays provisional with no ancestor).
   //
   // Not applied to twl: measured 2026-11-20, twlSortOrderApply bumped twl
   // versions on pure reorders WITHOUT an edit_log entry from 3005039
   // (2026-07-13) until #687 (ebc2b76, 2026-09-03), so half of JER's
   // create-only twl rows sit above version 1 with nothing swept. tn is never
-  // swept (#1057). Provisional rows (#653) are left alone: their base already
-  // sits above the boundary, where no gap counts.
+  // swept (#1057).
   if (checkSweptHistory) {
     const horizon = Math.floor(Date.now() / 1000) - EDIT_LOG_RETENTION_SECONDS;
     const atOrBelowBoundary = (e: SweptChainEntry) =>
       boundaryId != null ? e.id <= boundaryId : e.at != null && e.at < cutoff;
     for (const id of ids) {
-      if (provisionalIds.has(id)) continue;
       const rowVersion = rowVersions.get(id);
-      const cut = sweptHistoryCut(
-        versionChain.get(id) ?? [],
-        typeof rowVersion === "number" && Number.isFinite(rowVersion) ? rowVersion : null,
-        horizon,
-        atOrBelowBoundary,
-      );
+      const version = typeof rowVersion === "number" && Number.isFinite(rowVersion) ? rowVersion : null;
+      const chain = versionChain.get(id) ?? [];
+      if (provisionalIds.has(id)) {
+        const createId = currentLifeCreate.get(id)?.logId;
+        if (createId == null) continue;
+        const life = chain.filter((e) => e.id >= createId);
+        if (sweptHistoryCut(life, version, horizon, () => true) != null) entriesById.set(id, []);
+        continue;
+      }
+      const cut = sweptHistoryCut(chain, version, horizon, atOrBelowBoundary);
       if (cut == null) continue;
       const entries = entriesById.get(id) ?? [];
       const logIds = entryLogIds.get(id) ?? [];
