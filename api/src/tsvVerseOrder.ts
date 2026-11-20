@@ -77,11 +77,16 @@ export interface VerseOrderPlan {
   renumberedVerses: number;
 }
 
-/** A person's in-app change that master has not yet been confirmed to hold. */
+/**
+ * A person's in-app change that master has not yet been confirmed to hold.
+ * A change stamped in the same second as the confirmation counts as pending
+ * (`>=`, matching the locked-book mirror; issue #1456): the safe direction,
+ * since master_confirmed_at alone cannot show which side of it the change fell.
+ */
 export function isPendingUserChange(r: LiveOrderRow, confirmedAt: number | null): boolean {
   if (r.last_change_source !== "user") return false;
   if (confirmedAt == null) return r.last_change_action === "reorder";
-  return (r.updated_at ?? 0) > confirmedAt;
+  return (r.updated_at ?? 0) >= confirmedAt;
 }
 
 // The export's order: sort_order ascending with NULLs last, then id.
