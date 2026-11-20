@@ -116,13 +116,16 @@
 // Everything else older than the cutoff is deleted exactly as before —
 // post-watermark rows, books/resources with no watermark at all, and every
 // kind other than verse and tn (tq, twl, verse_lane, verse_status), apart
-// from branch (6)'s tq/twl creates. (The TSV merge also folds edit_log for
+// from branch (6)'s tq/twl creates and branch (9)'s pending tq/twl entries on
+// a locked book (issue #1457: the locked-book mirror keeps a row only while
+// such an entry exists, so a lock & push left unmerged past 180 days would
+// otherwise let the mirror overwrite the edit it never shipped). (The TSV merge also folds edit_log for
 // its ancestors, but it is built to degrade gracefully when tq/twl patches
 // age out — see tsvMerge.test.mjs's "create aged out" cases — so their
 // updates are deliberately not exempted here.)
 //
 // SQL shape notes:
-//   - The exempt set is eight uncorrelated `NOT IN` subqueries, one per
+//   - The exempt set is nine uncorrelated `NOT IN` subqueries, one per
 //     branch, deliberately NOT one `NOT IN` over a `UNION ALL` of them: D1
 //     caps compound-SELECT terms at 5 (measured 2026-09-23 — a 6-term
 //     UNION ALL fails with "too many terms in compound SELECT"), so the
@@ -196,10 +199,18 @@
 
 export const EDIT_LOG_RETENTION_SECONDS = 180 * 86400;
 
+import { MIRROR_NON_CONTENT_ACTIONS } from "./lockedMirror.ts";
+
 // ?1 — the retention cutoff as unix seconds; rows strictly older are
 // deletion candidates. Bound once by the caller (index.ts computes
 // now - EDIT_LOG_RETENTION_SECONDS) so the outer DELETE and every exempt
 // subquery are guaranteed to cut at the same instant.
+// ?2 — publishedGuard.ts's PUBLISHED_BOOKS as a JSON array (branch (9)'s
+// default-locked books). The caller binds it rather than this file importing
+// it: publishedGuard.ts imports export.ts, which imports this file, so a
+// top-level read of PUBLISHED_BOOKS here would throw whenever publishedGuard.ts
+// is loaded first. Left unbound it is NULL, which shields only explicitly
+// locked books.
 export const EDIT_LOG_SWEEP_SQL = `
   DELETE FROM edit_log
    WHERE created_at < ?1
@@ -385,6 +396,36 @@ export const EDIT_LOG_SWEEP_SQL = `
             AND el.action = 'delete'
             AND el.created_at < ?1
           GROUP BY el.row_key
+     )
+     AND id NOT IN (
+         -- (9) issue #1457: the newest PENDING entry per tq/twl row of a
+         -- LOCKED book. bookReimport.ts's mirrorLockedTsv keeps D1's row over
+         -- Door43's while edit_log holds an entry for it past the
+         -- book+resource's confirmed-push boundary that the sync did not write
+         -- and whose action changes the export; this is the same test, so the
+         -- two agree. Locked is effectiveBookLock's rule: book_locks.locked = 1,
+         -- or no book_locks row and the book in PUBLISHED_BOOKS (?2); an
+         -- explicit locked = 0 row wins. No boundary (master_confirmed_at
+         -- NULL) means the mirror skips the book, so nothing is kept for it.
+         -- The mirror reads DISTINCT row_key, so one entry per row carries
+         -- the signal.
+         SELECT MAX(el.id) AS keep_id
+           FROM edit_log el INDEXED BY edit_log_kind_action_created
+           JOIN book_resource_syncs brs
+             ON brs.book = el.book AND brs.resource = el.kind
+           LEFT JOIN book_locks bl ON bl.book = el.book
+          WHERE el.kind IN ('tq', 'twl')
+            AND el.created_at < ?1
+            AND (el.source IS NULL OR el.source <> 'dcs_reimport')
+            AND el.action NOT IN (${MIRROR_NON_CONTENT_ACTIONS.map((a) => `'${a}'`).join(", ")})
+            AND brs.master_confirmed_at IS NOT NULL
+            AND ((brs.master_confirmed_edit_id IS NOT NULL
+                    AND el.id > brs.master_confirmed_edit_id)
+              OR (brs.master_confirmed_edit_id IS NULL
+                    AND el.created_at >= brs.master_confirmed_at))
+            AND (bl.locked = 1
+              OR (bl.book IS NULL AND el.book IN (SELECT value FROM json_each(?2))))
+          GROUP BY el.kind, el.book, el.row_key
      )`;
 
 // ---------------------------------------------------------------------------

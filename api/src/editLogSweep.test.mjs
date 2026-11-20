@@ -29,6 +29,7 @@ import {
   raiseEditLogSweepBoundaryAlerts,
 } from "./editLogSweep.ts";
 import { verseVersionFloorSql } from "./verseBridge.ts";
+import { PUBLISHED_BOOKS } from "./publishedGuard.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -68,8 +69,9 @@ function syncRow(d, { book, resource, confirmedAt = null, editId = null }) {
   ).run(book, resource, confirmedAt, editId);
 }
 
+// ?2 is bound exactly as index.ts binds it.
 function sweep(d, cutoff) {
-  d.prepare(EDIT_LOG_SWEEP_SQL).run(cutoff);
+  d.prepare(EDIT_LOG_SWEEP_SQL).run(cutoff, JSON.stringify([...PUBLISHED_BOOKS]));
 }
 
 function survivingIds(d) {
@@ -967,6 +969,108 @@ console.log("\n[raiseEditLogSweepBoundaryAlerts: two ACTIVE rows for one source 
   d.prepare(`UPDATE book_resource_syncs SET master_confirmed_at = ?1 WHERE book = 'JER' AND resource = 'ust'`).run(now - 86400);
   await raiseEditLogSweepBoundaryAlerts({ DB: makeD1(d) }, now);
   assert(activeCount() === 0, "duplicate active rows for a healed boundary both clear, not just one");
+}
+
+// ── issue #1457, branch (9): a locked book's pending tq/twl edit ─────────────
+// The locked-book mirror (bookReimport.ts mirrorLockedTsv) keeps D1's row over
+// Door43's only while the row reads as pending, and for a content edit the
+// durable record of that is an edit_log entry past the book+resource's
+// confirmed-push boundary. A lock & push left unmerged past 180 days would
+// otherwise lose that entry to the sweep. ZEC is in PUBLISHED_BOOKS (locked by
+// default); JER is not.
+function lockRow(d, book, locked) {
+  d.prepare(`INSERT INTO book_locks (book, locked) VALUES (?, ?)`).run(book, locked);
+}
+
+// The mirror's pending query, copied from mirrorLockedTsv (both boundary
+// variants) so the survival claim is proven against what the mirror reads.
+function mirrorPendingKeys(d, kind, book) {
+  const brs = d
+    .prepare(`SELECT master_confirmed_at AS at, master_confirmed_edit_id AS eid FROM book_resource_syncs WHERE book = ? AND resource = ?`)
+    .get(book, kind);
+  if (!brs || brs.at == null) return [];
+  return d
+    .prepare(
+      `SELECT DISTINCT row_key FROM edit_log
+        WHERE kind = ?1 AND book = ?2 AND ${brs.eid != null ? "id > ?3" : "created_at >= ?3"}
+          AND (source IS NULL OR source <> 'dcs_reimport')
+          AND action NOT IN ('dismiss_review', 'review_clear', 'preserve', 'unpreserve', 'hint', 'unhint')
+        ORDER BY row_key`,
+    )
+    .all(kind, book, brs.eid ?? brs.at)
+    .map((r) => r.row_key);
+}
+
+// One fixture per case: boundary edit id 10 (or timestamp 5000 when
+// editId is null); every entry is far past the 180-day cutoff.
+function seedLockedPending(d, { book, kind = "tq", editId = 10, confirmedAt = 5000 }) {
+  syncRow(d, { book, resource: kind, confirmedAt, editId });
+  logRow(d, { id: 5, kind, rowKey: "pre1", book, action: "update", createdAt: 4000, payload: '{"question":"exported"}' });
+  logRow(d, { id: 11, kind, rowKey: "pend", book, action: "update", createdAt: 6000, payload: '{"question":"fix one"}' });
+  logRow(d, { id: 12, kind, rowKey: "pend", book, action: "update", createdAt: 7000, payload: '{"question":"fix two"}' });
+  logRow(d, { id: 13, kind, rowKey: "sync", book, action: "update", createdAt: 7000, source: "dcs_reimport" });
+  logRow(d, { id: 14, kind, rowKey: "flag", book, action: "dismiss_review", createdAt: 7000 });
+}
+
+console.log("\n[#1457: a published (default-locked) book's post-boundary tq edit survives the sweep]");
+{
+  const d = freshDb();
+  seedLockedPending(d, { book: "ZEC" });
+  const before = mirrorPendingKeys(d, "tq", "ZEC");
+  sweep(d, 100000);
+  assert(before.join(",") === "pend", `sanity: the mirror reads 'pend' as pending before the sweep (got ${before})`);
+  assert(survivingIds(d).join(",") === "12", `only the newest pending entry survives (got ${survivingIds(d)})`);
+  assert(mirrorPendingKeys(d, "tq", "ZEC").join(",") === "pend", "the mirror still reads the row as pending after the sweep");
+}
+
+console.log("\n[#1457: an explicitly locked unpublished book is shielded too]");
+{
+  const d = freshDb();
+  lockRow(d, "JER", 1);
+  seedLockedPending(d, { book: "JER" });
+  sweep(d, 100000);
+  assert(survivingIds(d).join(",") === "12", `JER locked=1 keeps its pending entry (got ${survivingIds(d)})`);
+}
+
+console.log("\n[#1457: an unlocked book is swept as before]");
+{
+  const d = freshDb();
+  seedLockedPending(d, { book: "JER" });
+  sweep(d, 100000);
+  assert(survivingIds(d).length === 0, `JER (unpublished, no lock row) keeps nothing (got ${survivingIds(d)})`);
+}
+
+console.log("\n[#1457: an explicit unlock (locked=0) beats the published default]");
+{
+  const d = freshDb();
+  lockRow(d, "ZEC", 0);
+  seedLockedPending(d, { book: "ZEC" });
+  sweep(d, 100000);
+  assert(survivingIds(d).length === 0, `ZEC locked=0 keeps nothing (got ${survivingIds(d)})`);
+}
+
+console.log("\n[#1457: timestamp boundary (edit id still warming up) uses created_at >= confirmedAt]");
+{
+  const d = freshDb();
+  syncRow(d, { book: "ZEC", resource: "twl", confirmedAt: 5000, editId: null });
+  logRow(d, { id: 1, kind: "twl", rowKey: "same", book: "ZEC", action: "update", createdAt: 5000 });
+  logRow(d, { id: 2, kind: "twl", rowKey: "before", book: "ZEC", action: "update", createdAt: 4999 });
+  sweep(d, 100000);
+  assert(survivingIds(d).join(",") === "1", `the same-second entry is pending and kept; the earlier one is swept (got ${survivingIds(d)})`);
+  assert(mirrorPendingKeys(d, "twl", "ZEC").join(",") === "same", "the mirror agrees on the twl row");
+}
+
+console.log("\n[#1457: no boundary, or another kind's boundary, shields nothing]");
+{
+  const d = freshDb();
+  // ZEC tq has a row with no confirmed time (the mirror skips no_boundary);
+  // ZEC twl has no row at all; a tq boundary must not shield a twl entry.
+  syncRow(d, { book: "ZEC", resource: "tq", confirmedAt: null, editId: 10 });
+  logRow(d, { id: 11, kind: "tq", rowKey: "nob", book: "ZEC", action: "update", createdAt: 6000 });
+  syncRow(d, { book: "LAM", resource: "tq", confirmedAt: 5000, editId: 10 });
+  logRow(d, { id: 12, kind: "twl", rowKey: "other", book: "LAM", action: "update", createdAt: 6000 });
+  sweep(d, 100000);
+  assert(survivingIds(d).length === 0, `nothing survives (got ${survivingIds(d)})`);
 }
 
 if (failed > 0) {
