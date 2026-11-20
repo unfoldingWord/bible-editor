@@ -1387,6 +1387,16 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             basemode: guard.mode,
             ...(droppedIds.length > 0 && droppedIds.length <= 1024 ? { droppedids: droppedIds } : {}),
           };
+          // A retry must not erase an earlier attempt's committed=1 (#1455)
+          // before its own commit runs: when that attempt's committed drops
+          // on the same base cover this attempt's, the flag carries over.
+          if (markerMeta.droppedids) {
+            const prev = (await this.env.BLOBS.head(d1RenderKey(r2Key)))?.customMetadata;
+            if (prev?.committed === "1" && prev.basesha === markerMeta.basesha && prev.droppedids) {
+              const shipped = new Set(prev.droppedids.split(","));
+              if (markerMeta.droppedids.split(",").every((id) => shipped.has(id))) markerMeta.committed = "1";
+            }
+          }
           await this.env.BLOBS.put(d1RenderKey(r2Key), d1Render, {
             httpMetadata: { contentType: "text/tab-separated-values" },
             // Lowercase keys: R2 metadata travels as HTTP headers in some paths.
@@ -4000,7 +4010,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // kept nothing ships as before, the same as that attempt did. When that
   // attempt's push is the one recorded, the retry also keeps out the rows it
   // dropped (the marker's droppedids, #1452), so an unverified master read on
-  // the retry does not put them back.
+  // the retry does not put them back. An attempt that committed but died
+  // before recordPushedRender left committed=1 on the marker instead, and an
+  // unverified retry keeps those drops out too (#1455).
   private async masterMovedGuard(
     book: string,
     resource: "tn" | "tq" | "twl",
