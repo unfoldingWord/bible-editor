@@ -180,7 +180,7 @@ function freshEnv(door43File = DOOR43_OBA) {
   // The export as the Workflow runs it: one retried step per (book, resource),
   // whose failure after the retries is caught and recorded (#1450).
   const exportStep = (step, instanceId, dcsAllowed = true) =>
-    wf.runExportStep(step, BOOK, "ult", () => exportOne(instanceId, dcsAllowed));
+    wf.runExportStep(step, BOOK, "ult", null, () => exportOne(instanceId, dcsAllowed));
   return { sqlite, env, r2, exportOne, exportStep, live, reverts, render, editD1 };
 }
 
@@ -663,6 +663,21 @@ console.log("\n[16. Door43 rejects every write → after the retries an export_s
   const r2 = await t.exportStep(retryingStep(), "export-night-3");
   ok(d.writes.length === 1 && r2.dcsSkippedReason == null, `the export ships (got ${r2.dcsSkippedReason}, writes ${d.writes.length})`);
   ok(t.live(failSource).length === 0, "the export_step_failed alert is gone");
+}
+
+console.log("\n[16e. after a failed night, Door43 already matching D1's render (`unchanged`) also clears the alert]");
+{
+  const d = door43();
+  const t = freshEnv();
+  d.master = DOOR43_OBA;
+  d.commitFails = true;
+  await t.exportStep(retryingStep(), "export-night-1");
+  ok(t.live(`export_step_failed:${BOOK}:ult`).length === 1, "(setup: the failed night raised the alert)");
+  d.commitFails = false;
+  d.master = await t.render("n2");
+  const r = await t.exportStep(retryingStep(), "export-night-2");
+  ok(r.dcsSkippedReason === "unchanged", `(setup: unchanged, got ${r.dcsSkippedReason})`);
+  ok(t.live(`export_step_failed:${BOOK}:ult`).length === 0, "the export_step_failed alert is gone");
 }
 
 console.log("\n[16d. Door43 fails once, then the step's own retry ships → no alert]");

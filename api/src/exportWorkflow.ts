@@ -380,18 +380,36 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // One (book, resource) export as its own retried step. A failure after the
   // retries never throws out of here: it is recorded and returned as an
   // `error:` result so the run goes on to the next pair.
+  //
+  // #1450: that failure also raises an `export_step_failed:{book}:{resource}`
+  // alert, so a Door43 commit failure shows in the app and not only in logs
+  // and snapshots. It clears only when a later step reached Door43 and came
+  // back clean: it shipped (no skip reason) or found Door43 already matching
+  // (`unchanged`, decided after the commit call). A guard skip, a lock skip
+  // or a dry run returns before the Door43 write, so it did not re-measure the
+  // failure and leaves the alert up. A branchName override run writes to a
+  // different branch than the nightly does, so it leaves the alert up too,
+  // like the export_master_moved clear. Both the clear and the write sit
+  // inside steps that already exist, so the run spends no extra steps.
   private async runExportStep(
     step: WorkflowStep,
     book: string,
     resource: Resource,
+    branchOverride: string | null,
     exportPair: () => Promise<StepResult>,
   ): Promise<StepResult> {
     const stepName = `export-${book}-${resource}`;
+    const failSource = `export_step_failed:${book}:${resource}`;
     try {
       return await step.do(
         stepName,
         { retries: { limit: 3, delay: "5 seconds", backoff: "exponential" } },
-        async () => exportPair(),
+        async () => {
+          const result = await exportPair();
+          const reachedDoor43 = result.dcsSkippedReason == null || result.dcsSkippedReason === "unchanged";
+          if (reachedDoor43 && branchOverride == null) await this.clearExportAlert(failSource);
+          return result;
+        },
       );
     } catch (e) {
       // A single (book, resource) failure — most commonly a corrupt/dangling
@@ -404,9 +422,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       const reason = e instanceof Error ? e.message : String(e);
       console.error("export step failed", { book, resource, error: reason });
       try {
-        await step.do(`${stepName}-record-fail`, async () =>
-          this.recordSnapshot(book, resource, null, null, 0, `error:${reason.slice(0, 180)}`),
-        );
+        await step.do(`${stepName}-record-fail`, async () => {
+          // writeAlert never throws, so it goes first: a snapshot failure
+          // must not cost the alert.
+          await this.recordStepFailureAlert(book, resource, reason);
+          return this.recordSnapshot(book, resource, null, null, 0, `error:${reason.slice(0, 180)}`);
+        });
       } catch {
         /* recording the failure is best-effort; never let it abort the run */
       }
@@ -779,7 +800,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     for (const resource of resources) {
       for (const book of books) {
         const stepName = `export-${book}-${resource}`;
-        const itemResult = await this.runExportStep(step, book, resource, () =>
+        const itemResult = await this.runExportStep(step, book, resource, branchOverride, () =>
           this.exportOne(
             book,
             resource,
@@ -4329,6 +4350,18 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     const source = `export_hard_reject:${book}:${resource}`;
     const message = buildHardRejectAlertMessage(book, resource, rejects);
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
+  }
+
+  // #1450: a (book, resource) export step failed after its retries. The
+  // message states only what was measured: the step threw this error. A throw
+  // can come after the Door43 write landed, so it does not say whether
+  // anything reached Door43.
+  private async recordStepFailureAlert(book: string, resource: Resource, reason: string): Promise<void> {
+    const message =
+      `${book} ${resource.toUpperCase()}: the nightly export step failed after its retries: ${reason.slice(0, 300)}. ` +
+      `The next export tries again; this clears when one reaches Door43 cleanly. ` +
+      `Check the export snapshot and logs for whether this night's push landed.`;
+    await this.writeAlert(`export_step_failed:${book}:${resource}`, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 
   // Banner alert when the pre-export sync for a book failed outright (e.g. the
