@@ -202,6 +202,35 @@ export function renderPinStatus({ exportBlobSha, prevBlobSha, pushedBlobSha, kno
   return null;
 }
 
+// ── Reimport base (#1419) ────────────────────────────────────────────────────
+// When the previous export is not provably our render (prev_not_our_render),
+// the 2CH TN case: D1 was rebuilt from master after that export, so the
+// commit D1 last imported is the better base. `importedSha` is
+// book_resource_syncs.source_sha, passed only when its origin is 'reimport'.
+// It is used only when it sits in the file's history strictly between the
+// previous export and tonight's export (list POSITION, newest first, never
+// dates). Returns the sha or null.
+export function importBaseSha(commits, pick, importedSha) {
+  if (!/^[0-9a-f]{40}$/.test(String(importedSha ?? ""))) return null;
+  const at = (sha) => commits.findIndex((c) => c?.sha === sha);
+  const e = at(pick.exportSha);
+  const p = at(pick.prevExportSha);
+  const i = at(importedSha);
+  if (e < 0 || p < 0 || i < 0) return null;
+  return i > e && i < p ? importedSha : null;
+}
+
+// Pure: "unchanged on master since D1 imported it" clears a ref only when the
+// export itself labelled it probably ours (export_reverts.probably_ours = 1).
+// The export keeps a row loud exactly when D1 did not hold master's row at the
+// import (a kept conflict, a protected row), and then master not moving since
+// the import says nothing about a lost hand-edit; such a ref becomes unknown.
+export function restrictFalseToProbablyOurs(verdict, probablyOursRefs) {
+  const keep = verdict.falseRefs.filter((r) => probablyOursRefs.has(r));
+  const demoted = verdict.falseRefs.filter((r) => !probablyOursRefs.has(r));
+  return { ...verdict, falseRefs: keep, unknownRefs: [...verdict.unknownRefs, ...demoted] };
+}
+
 // ── export_revert vs revert_probably_ours (#1240) ───────────────────────────
 // Since #1231 one export-revert report writes up to two record alerts that
 // share a generation (planRevertReportAlerts, export.ts): `export_revert:` for
@@ -275,9 +304,10 @@ function exportRevertCount(message) {
 
 // "… replaced master's text on N verse(s) that are … not a lost hand-edit:
 // <ref>, <ref> (+K more). The stored Door43 edit history …"
+// ("row(s)" in the #1419 imported-head record, TSV).
 // {count, refs, unlisted}, or null when the wording does not match.
 function probablyOursList(message) {
-  const m = message.match(/ on (\d+) verse\(s\) that .*?not a lost hand-edit: (.*?)\. The stored Door43 edit history /s);
+  const m = message.match(/ on (\d+) (?:verse|row)\(s\) that .*?not a lost hand-edit: (.*?)\. The stored Door43 edit history /s);
   if (!m) return null;
   let list = m[2];
   let unlisted = 0;
@@ -304,10 +334,10 @@ function probablyOursList(message) {
 // every other row goes to the export_revert (loud) side, which collect.mjs
 // reports even with no export_revert alert to name.
 //
-// Counts are compared for USFM only, where one verse ref is one entry;
-// export.ts partitions USFM only (tsv_not_partitioned), so a probably-ours
-// record on a TSV resource is not expected, and if one appears its counts are
-// not comparable.
+// Counts are compared for USFM only, where one verse ref is one entry. A TSV
+// probably-ours record comes only from the #1419 imported-head partition; its
+// "N row(s)" counts rows, several of which can share one Reference, so its
+// counts are not comparable either.
 export function splitRevertRefs(rowRefs, group) {
   const rows = [...new Set(rowRefs)];
   if (!group.probablyOurs) return { exportRevertRefs: rows, probablyOursRefs: [], split: "exact" };
@@ -346,7 +376,7 @@ export function splitRevertRefs(rowRefs, group) {
 //     have no section, so they go to the export_revert (loud) side, flagged;
 //   - rows labelled 0 with no export_revert alert keep their side, but the
 //     split notes the loud alert is missing;
-//   - USFM only (TSV is never partitioned, see splitRevertRefs): each alert's
+//   - USFM only (TSV counts are rows, not refs, see splitRevertRefs): each alert's
 //     "on N" count must equal its labelled rows, else the split is unverified.
 export function splitRevertRows(rows, group) {
   const labelled = rows.length > 0 && rows.every((r) => r.probably_ours === 0 || r.probably_ours === 1);
@@ -429,6 +459,7 @@ export function revertSummaryLines(results, { failed = [] } = {}) {
   const list = (xs) => (xs.length ? `${xs.length} (${xs.slice(0, 15).join(", ")}${xs.length > 15 ? ", …" : ""})` : "0");
   const where = (r) =>
     `${r.status}; prev export ${r.prevExportSha?.slice(0, 10) ?? "none"}, ` +
+    (r.importBaseSha ? `base: D1's reimport of ${r.importBaseSha.slice(0, 10)}, ` : "") +
     `master ${r.masterSha?.slice(0, 10) ?? "none"}${r.exportSha ? ` (parent of ${r.exportSha.slice(0, 10)})` : ""}`;
   const splitNote = (r) => (r.split && r.split !== "exact" ? ` Ref split ${r.split}.` : "");
   const loud = [];
@@ -524,7 +555,12 @@ export function fetchFileAt(repo, path, sha, token) {
 // refs are this alert's); `knownRenders` is knownRenderShas() for the pair;
 // `pushedBlobSha` is book_resource_syncs.pushed_blob_sha (see renderPinStatus).
 // Throws on any Door43 failure; collect.mjs wraps this in step().
-export function checkExportRevertAlert({ alertId, book, resource, alertCreatedAtMs, refs, snapshot, knownRenders, pushedBlobSha }, token) {
+// `importedSha` / `probablyOursRefs` (#1419): see importBaseSha and
+// restrictFalseToProbablyOurs; both optional.
+export function checkExportRevertAlert(
+  { alertId, book, resource, alertCreatedAtMs, refs, snapshot, knownRenders, pushedBlobSha, importedSha = null, probablyOursRefs = new Set() },
+  token,
+) {
   const file = dcsResourceFile(book, resource);
   if (!file) throw new Error(`no Door43 file for ${book} ${resource}`);
   const base = { alertId, book, resource, repo: file.repo, path: file.path, refs: refs.length };
@@ -538,7 +574,26 @@ export function checkExportRevertAlert({ alertId, book, resource, alertCreatedAt
   const prev = fetchFileAt(file.repo, file.path, pick.prevExportSha, token);
   const pin = renderPinStatus({ exportBlobSha, prevBlobSha: prev.blobSha, pushedBlobSha, knownRenders });
   const shas = { exportBlobSha, prevBlobSha: prev.blobSha, pushedBlobSha: pushedBlobSha ?? null };
-  if (pin) return { ...base, ...pick, ...shas, status: pin, ...allUnknown(refs) };
+  if (pin) {
+    const importSha = pin === "prev_not_our_render" ? importBaseSha(commits, pick, importedSha) : null;
+    if (!importSha) return { ...base, ...pick, ...shas, status: pin, ...allUnknown(refs) };
+    const imported = fetchFileAt(file.repo, file.path, importSha, token);
+    const master = fetchFileAt(file.repo, file.path, pick.masterSha, token);
+    const verdict = restrictFalseToProbablyOurs(
+      classifyExportRevertRefs(refs, imported.text, master.text, resource),
+      probablyOursRefs,
+    );
+    return {
+      ...base,
+      ...pick,
+      ...shas,
+      status: "import_base",
+      importBaseSha: importSha,
+      importBlobSha: imported.blobSha,
+      masterBlobSha: master.blobSha,
+      ...verdict,
+    };
+  }
   const master = fetchFileAt(file.repo, file.path, pick.masterSha, token);
   const verdict = classifyExportRevertRefs(refs, prev.text, master.text, resource);
   return { ...base, ...pick, ...shas, masterBlobSha: master.blobSha, ...verdict };

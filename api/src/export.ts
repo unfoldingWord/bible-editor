@@ -1156,6 +1156,8 @@ export interface TsvRevertEntry {
   ref: string;
   class: "tags_only" | "whitespace_only" | "substantive";
   fields?: string[];
+  /** The row's ID (#1419: partitionTsvRevertEntriesByImport keys on it). Not stored. */
+  id?: string;
 }
 
 export interface TsvRevertReport {
@@ -1238,7 +1240,7 @@ export function tsvRevertReport(
     if (diffFields.length === 0) continue; // identical row, nothing overwritten
     const ref = masterCells[refIdx] ?? "";
     if (diffFields.length === 1 && diffFields[0] === "Tags") {
-      entries.push({ ref, class: "tags_only" });
+      entries.push({ ref, class: "tags_only", id });
       continue;
     }
     const allWhitespaceOnly = diffFields.every((field) => {
@@ -1249,10 +1251,10 @@ export function tsvRevertReport(
       );
     });
     if (allWhitespaceOnly) {
-      entries.push({ ref, class: "whitespace_only" });
+      entries.push({ ref, class: "whitespace_only", id });
       continue;
     }
-    entries.push({ ref, class: "substantive", fields: diffFields });
+    entries.push({ ref, class: "substantive", fields: diffFields, id });
   }
   return { entries, totalRows: master.size };
 }
@@ -1837,8 +1839,15 @@ export function planRevertReportAlerts(p: {
   mechanical: boolean;
   branch: string;
   generation: string;
+  /**
+   * Why `probablyOurs` rows are ours: the persisted master lineage (#1231,
+   * the default) or D1 having imported master's current file (#1419,
+   * partitionTsvRevertEntriesByImport), whose Door43 commit is `importedSha`.
+   */
+  probablyOursBasis?: { kind: "lineage" } | { kind: "imported_head"; importedSha: string };
 }): RevertReportAlert[] {
   const { book, resource, kind, attention, probablyOurs, mechanical, branch, generation } = p;
+  const basis = p.probablyOursBasis ?? { kind: "lineage" as const };
   const label = `${book} ${resource.toUpperCase()}`;
   const sample = (list: Array<{ ref: string }>, n = 10) =>
     `${list.slice(0, n).map((e) => e.ref).join(", ")}${list.length > n ? ` (+${list.length - n} more)` : ""}`;
@@ -1881,16 +1890,186 @@ export function planRevertReportAlerts(p: {
     }
   }
   if (probablyOurs.length > 0) {
+    // Both wordings keep the anchors scripts/watchdog/exportRevertCheck.mjs
+    // (probablyOursList) parses: "on N verse(s)|row(s) that … not a lost
+    // hand-edit: <refs>. The stored Door43 edit history ".
+    const why =
+      basis.kind === "imported_head"
+        ? `The stored Door43 edit history and sync record show Bible Editor imported master's current file ` +
+          `(Door43 commit ${basis.importedSha.slice(0, 10)}, which master still held at export) and held each of these ` +
+          `rows exactly as master has it, so every difference is an edit made in Bible Editor after that import.`
+        : `The stored Door43 edit history shows no person touched these verses since master last held our export.`;
+    const unit = basis.kind === "imported_head" ? "row(s)" : "verse(s)";
     out.push({
       source: `revert_probably_ours:${book}:${resource}`,
       message:
-        `${label}: tonight's export replaced master's text on ${probablyOurs.length} verse(s) that are most likely ` +
-        `our translators' own work, not a lost hand-edit: ${sample(probablyOurs, PROBABLY_OURS_LISTED_REFS)}. The stored Door43 edit history ` +
-        `shows no person touched these verses since master last held our export. They are included in tonight's ` +
+        `${label}: tonight's export replaced master's text on ${probablyOurs.length} ${unit} that are most likely ` +
+        `our translators' own work, not a lost hand-edit: ${sample(probablyOurs, PROBABLY_OURS_LISTED_REFS)}. ${why} ` +
+        `They are included in tonight's ` +
         `export-revert records for ${label}; nothing to do unless you expected a hand-edit at one of them.`,
       severity: "info",
       eventKey: `${generation}:revert_probably_ours:${book}:${resource}`,
     });
+  }
+  return out;
+}
+
+// ── Revert report after D1 imported master's current file (#1419) ─────────
+//
+// The 2CH TN false alarm (alert 1458, 2026-11-18): a person committed to
+// master, the nightly reimport adopted that file, translators edited rows in
+// Bible Editor, and the export's revert report called those edits Door43
+// overwrites. The lineage relaxations above do not cover it: #1231 does not
+// partition TSV, and #1159 counts reimport writes only when no PERSON
+// committed to the file.
+//
+// The evidence used here instead, all of it required:
+//   1. File level (importedHeadUnusableReason): book_resource_syncs has
+//      origin 'reimport' and source_sha equal to the master commit the report
+//      diffs against (fresh.masterSha). A clean reimport stamps that pair only
+//      when nothing was withheld (bookReimport.ts recordResourceSync); a
+//      withheld one stamps a sentinel sha that never matches. So master has
+//      not moved since the import read it.
+//   2. Row level (partitionTsvRevertEntriesByImport): D1's own row as of the
+//      import (the latest edit_log write at or before synced_at,
+//      loadPreImportTsvRows) equals master's row now on Reference and every
+//      content field. A full ParsedTsvRow payload (what the reimport logs when
+//      it creates, updates or restores from master) is the only shape that
+//      can match.
+// Together: D1 held master's exact row after the import and master has not
+// moved since, so whatever the render now changes was edited in Bible Editor
+// after the import. That row is labelled probably ours (nothing is dropped,
+// #1231 option B).
+//
+// A row the import did NOT take from master stays in attention, because its
+// latest pre-import write is D1's own text, a partial review-flag write
+// (merge_conflict / merge_no_base / ref_moved), or nothing at all: protected
+// rows (preserve / hint) the reimport skips, conflicts it kept D1's side of,
+// rows seeded without an edit_log entry. A live review_kind is NOT the test:
+// any content PATCH clears it (contentPatchClauses.ts), and the rows this
+// relaxes are exactly the ones edited after the import.
+//
+// Prose cells (Note / Question / Response) compare after normalizeNoteText and
+// canonicalizeForRevertCompare on both sides, so master's trailing literal
+// "\n" or doubled spaces that the import stored normalised still match; every
+// other cell compares exactly (tsvCell). Decided per Reference, not per row:
+// export_reverts is unique on (book, resource, ref), so one loud row at a ref
+// keeps every row at that ref loud.
+//
+// Known limit: an unlogged content write to a row (a script, a manual SQL fix)
+// is invisible here, so the latest logged payload can disagree with what D1
+// actually held. Every edit_log reader shares that hazard.
+export interface ImportedHeadSync {
+  sourceSha: string | null;
+  origin: string | null;
+  syncedAt: number | null;
+}
+
+/** "" when D1's last sync provably imported the master commit being diffed. */
+export function importedHeadUnusableReason(sync: ImportedHeadSync | null, masterSha: string | null): string {
+  if (sync == null) return "no_sync_row";
+  if (sync.origin !== "reimport") return "not_a_reimport";
+  if (typeof sync.sourceSha !== "string" || sync.sourceSha.length === 0) return "sha_unknown";
+  if (typeof masterSha !== "string" || masterSha.length === 0) return "sha_unknown";
+  if (sync.sourceSha !== masterSha) return "master_moved_since_import";
+  if (typeof sync.syncedAt !== "number" || !Number.isFinite(sync.syncedAt)) return "synced_at_unknown";
+  return "";
+}
+
+const IMPORT_MATCH_FIELDS: Record<"tn" | "tq" | "twl", Array<[string, string]>> = {
+  tn: [["SupportReference", "support_reference"], ["Quote", "quote"], ["Occurrence", "occurrence"], ["Note", "note"]],
+  tq: [["Quote", "quote"], ["Occurrence", "occurrence"], ["Question", "question"], ["Response", "response"]],
+  // TWL Tags ship as-is (only tn/tq blank them), so they count here.
+  twl: [["Tags", "tags"], ["OrigWords", "orig_words"], ["Occurrence", "occurrence"], ["TWLink", "tw_link"]],
+};
+const PROSE_KEYS = new Set(["note", "question", "response"]);
+
+function proseKey(v: string | null): string {
+  return canonicalizeForRevertCompare(normalizeNoteText(v) ?? "");
+}
+
+// True when a pre-import edit_log payload is master's row: same Reference
+// (payload.refRaw) and every content field present and equal. Fails closed.
+export function preImportRowMatchesMaster(
+  masterCells: string[],
+  payload: Record<string, unknown> | null | undefined,
+  kind: "tn" | "tq" | "twl",
+): boolean {
+  if (payload == null || typeof payload !== "object") return false;
+  const headers = kind === "tn" ? TN_HEADERS : kind === "tq" ? TQ_HEADERS : TWL_HEADERS;
+  const masterRef = masterCells[headers.indexOf("Reference")] ?? "";
+  if (typeof payload.refRaw !== "string" || payload.refRaw.trim() !== masterRef.trim()) return false;
+  return IMPORT_MATCH_FIELDS[kind].every(([header, key]) => {
+    if (!(key in payload)) return false;
+    const v = payload[key];
+    const m = masterCells[headers.indexOf(header)] ?? "";
+    if (PROSE_KEYS.has(key)) {
+      if (v != null && typeof v !== "string") return false;
+      return proseKey(v as string | null) === proseKey(m);
+    }
+    return tsvCell(v) === m;
+  });
+}
+
+export function partitionTsvRevertEntriesByImport<E extends { ref: string; id?: string }>(
+  entries: E[],
+  kind: "tn" | "tq" | "twl",
+  masterTsv: string,
+  preImport: ReadonlyMap<string, Record<string, unknown> | null>,
+): { attention: E[]; probablyOurs: E[] } {
+  const master = parseTsvRowsById(masterTsv);
+  if (master === null) return { attention: entries, probablyOurs: [] };
+  const ours = (e: E): boolean =>
+    typeof e.id === "string" &&
+    master.has(e.id) &&
+    preImportRowMatchesMaster(master.get(e.id) as string[], preImport.get(e.id), kind);
+  const loudRefs = new Set(entries.filter((e) => !ours(e)).map((e) => e.ref));
+  const attention: E[] = [];
+  const probablyOurs: E[] = [];
+  for (const e of entries) (loudRefs.has(e.ref) ? attention : probablyOurs).push(e);
+  return { attention, probablyOurs };
+}
+
+// D1's own row as of the import: per ID, the payload of the latest edit_log
+// write at or before `syncedAt`, or null when that write is not a create /
+// update / restore with a parseable object payload. IDs with no such write are
+// absent. Read only for the reported rows, in chunks under D1's 100-parameter
+// limit.
+const PRE_IMPORT_ID_CHUNK = 90;
+export async function loadPreImportTsvRows(
+  db: D1Database,
+  kind: "tn" | "tq" | "twl",
+  book: string,
+  ids: string[],
+  syncedAt: number,
+): Promise<Map<string, Record<string, unknown> | null>> {
+  const out = new Map<string, Record<string, unknown> | null>();
+  const unique = [...new Set(ids)];
+  for (let i = 0; i < unique.length; i += PRE_IMPORT_ID_CHUNK) {
+    const chunk = unique.slice(i, i + PRE_IMPORT_ID_CHUNK);
+    const marks = chunk.map((_, j) => `?${j + 4}`).join(", ");
+    const { results } = await db
+      .prepare(
+        `SELECT e.row_key, e.action, e.payload_json
+           FROM edit_log e
+          WHERE e.kind = ?1 AND e.book = ?2 AND e.row_key IN (${marks})
+            AND e.id = (SELECT MAX(x.id) FROM edit_log x
+                         WHERE x.kind = ?1 AND x.book = ?2 AND x.row_key = e.row_key AND x.created_at <= ?3)`,
+      )
+      .bind(kind, book, syncedAt, ...chunk)
+      .all<{ row_key: string; action: string; payload_json: string | null }>();
+    for (const r of results ?? []) {
+      let payload: Record<string, unknown> | null = null;
+      if ((r.action === "create" || r.action === "update" || r.action === "restore") && r.payload_json != null) {
+        try {
+          const p = JSON.parse(r.payload_json);
+          if (p && typeof p === "object" && !Array.isArray(p)) payload = p as Record<string, unknown>;
+        } catch {
+          /* unparseable payload: no evidence */
+        }
+      }
+      out.set(r.row_key, payload);
+    }
   }
   return out;
 }
