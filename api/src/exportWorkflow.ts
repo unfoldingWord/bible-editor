@@ -377,6 +377,55 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     }
   }
 
+  // One (book, resource) export as its own retried step. A failure after the
+  // retries never throws out of here: it is recorded and returned as an
+  // `error:` result so the run goes on to the next pair.
+  private async runExportStep(
+    step: WorkflowStep,
+    book: string,
+    resource: Resource,
+    exportPair: () => Promise<StepResult>,
+  ): Promise<StepResult> {
+    const stepName = `export-${book}-${resource}`;
+    try {
+      return await step.do(
+        stepName,
+        { retries: { limit: 3, delay: "5 seconds", backoff: "exponential" } },
+        async () => exportPair(),
+      );
+    } catch (e) {
+      // A single (book, resource) failure — most commonly a corrupt/dangling
+      // DCS branch ref that ensureBranchVisible can't heal — must not abort
+      // the whole instance and starve every other book (the resource-major
+      // loop means one bad branch on the first book would otherwise block
+      // all later books AND all later resources). Log, record the failure as
+      // a snapshot for observability, and continue. Same isolation shape as
+      // the pre-export reimport loop above.
+      const reason = e instanceof Error ? e.message : String(e);
+      console.error("export step failed", { book, resource, error: reason });
+      try {
+        await step.do(`${stepName}-record-fail`, async () =>
+          this.recordSnapshot(book, resource, null, null, 0, `error:${reason.slice(0, 180)}`),
+        );
+      } catch {
+        /* recording the failure is best-effort; never let it abort the run */
+      }
+      return {
+        book,
+        resource,
+        rowCount: 0,
+        bytes: 0,
+        r2Key: null,
+        branch: null,
+        dcsCommitSha: null,
+        dcsChanged: false,
+        dcsSkippedReason: `error:${reason.slice(0, 180)}`,
+        prNumber: null,
+        prReason: null,
+      };
+    }
+  }
+
   private ledgerCounts(results: StepResult[]) {
     let successCount = 0;
     let skipCount = 0;
@@ -730,58 +779,20 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     for (const resource of resources) {
       for (const book of books) {
         const stepName = `export-${book}-${resource}`;
-        let itemResult: StepResult;
-        try {
-          const result = await step.do(
-            stepName,
-            { retries: { limit: 3, delay: "5 seconds", backoff: "exponential" } },
-            async () =>
-              this.exportOne(
-                book,
-                resource,
-                instanceId,
-                dcsAllowed,
-                shrinkOverride,
-                lockedBooks,
-                lockOverride,
-                branchOverride,
-                alertObservedAt,
-              ),
-          );
-          results.push(result);
-          itemResult = result;
-        } catch (e) {
-          // A single (book, resource) failure — most commonly a corrupt/dangling
-          // DCS branch ref that ensureBranchVisible can't heal — must not abort
-          // the whole instance and starve every other book (the resource-major
-          // loop means one bad branch on the first book would otherwise block
-          // all later books AND all later resources). Log, record the failure as
-          // a snapshot for observability, and continue. Same isolation shape as
-          // the pre-export reimport loop above.
-          const reason = e instanceof Error ? e.message : String(e);
-          console.error("export step failed", { book, resource, error: reason });
-          try {
-            await step.do(`${stepName}-record-fail`, async () =>
-              this.recordSnapshot(book, resource, null, null, 0, `error:${reason.slice(0, 180)}`),
-            );
-          } catch {
-            /* recording the failure is best-effort; never let it abort the run */
-          }
-          itemResult = {
+        const itemResult = await this.runExportStep(step, book, resource, () =>
+          this.exportOne(
             book,
             resource,
-            rowCount: 0,
-            bytes: 0,
-            r2Key: null,
-            branch: null,
-            dcsCommitSha: null,
-            dcsChanged: false,
-            dcsSkippedReason: `error:${reason.slice(0, 180)}`,
-            prNumber: null,
-            prReason: null,
-          };
-          results.push(itemResult);
-        }
+            instanceId,
+            dcsAllowed,
+            shrinkOverride,
+            lockedBooks,
+            lockOverride,
+            branchOverride,
+            alertObservedAt,
+          ),
+        );
+        results.push(itemResult);
         // Ledger item_terminal is recorded OUTSIDE the export try/catch above:
         // a telemetry failure here must not re-enter the catch (which would
         // fabricate a second, error-flagged result for an export that actually
