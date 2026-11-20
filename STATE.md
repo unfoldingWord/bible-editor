@@ -996,8 +996,9 @@ Highlights that bite repeatedly:
   looser lens here only moves verses toward quiet. (2) The adoption's `canonizeAlignmentSource` output is NOT
   accepted: canonize can fold a Door43 person's x-lemma / x-content fix back to D1's stale UHB bytes, so a verse it
   changed stays loud (with Door43's own UHB it changes 0 of 21 OBA and 31-32 of 211 ZEC sample verses). (3) A
-  `verse_merge_conflicts` row keeps the verse loud when it is unresolved OR was recorded (`last_recorded_at`) since
-  the earlier of the last confirmed push and a day before `synced_at`, resolved or not: any app save of a verse
+  `verse_merge_conflicts` row keeps the verse loud when it is unresolved OR was recorded (`last_recorded_at`) or
+  resolved (`resolved_at`) since the earlier of the last confirmed push and a day before `synced_at` (an earlier
+  import's flag can stay open across a push and a later import, then be resolved by the save): any app save of a verse
   resolves its row in the same batch (`verses.ts`), so the very save that re-types text an `adopt_conflict`
   overwrote would otherwise have cleared the evidence by export time. No column names the run that wrote a row.
   In practice only pristine writes and creates go quiet. A source-attribute

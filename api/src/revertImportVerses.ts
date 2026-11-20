@@ -194,8 +194,9 @@ export async function loadPreImportVerses(
 }
 
 // The plain refs among `refs` that have a verse_merge_conflicts row for this
-// book and resource, of ANY action, that is either still unresolved or was
-// recorded at or after `recordedSince`, resolved or not (reviews A2, B1). Such
+// book and resource, of ANY action, that is still unresolved, or was recorded
+// at or after `recordedSince`, or was resolved at or after it (reviews A2, B1,
+// C1). Such
 // a verse stays loud: after an adopt_conflict, a translator restoring or
 // re-typing their overwritten text reverts the Door43 author's commit, and the
 // payload test alone would call that ours; a kept source_attr_divergent /
@@ -211,6 +212,13 @@ export async function loadPreImportVerses(
 // the latest reimport write to it (detected_at for rows from before migration
 // 0049), and a save's resolve does not touch it. The caller passes a bound no
 // later than the import (see exportWorkflow.ts).
+//
+// Why a row resolved since the bound counts (C1): an adopt_conflict recorded
+// by an EARLIER import can stay unresolved across our next confirmed push and
+// a later import; the translator's save after that import then resolves it,
+// and its last_recorded_at is older than the bound. resolved_at is unix
+// seconds, like the bound (verses.ts binds Math.floor(Date.now() / 1000);
+// the reimport's resolves use unixepoch()).
 //
 // Read per chapter, chunked under D1's 100-parameter limit; a failed read
 // throws, and the caller then keeps every verse in attention.
@@ -231,7 +239,7 @@ export async function loadVerseConflictRefs(
       .prepare(
         `SELECT chapter, verse FROM verse_merge_conflicts
           WHERE book = ?1 AND resource = ?2 AND chapter IN (${marks})
-            AND (resolved_at IS NULL OR COALESCE(last_recorded_at, detected_at) >= ?3)`,
+            AND (resolved_at IS NULL OR COALESCE(last_recorded_at, detected_at) >= ?3 OR resolved_at >= ?3)`,
       )
       .bind(book, resource, recordedSince, ...chunk)
       .all<{ chapter: number; verse: number }>();

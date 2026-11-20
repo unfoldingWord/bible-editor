@@ -270,8 +270,19 @@ console.log("\n[3. the real loader + matcher read those payloads: D1 held master
   sqlite.prepare(`UPDATE verse_merge_conflicts SET resolved_at = ?, resolved_by = 1 WHERE book = ?`).run(syncedAt + 100, BOOK);
   const afterSave = await loadVerseConflictRefs(env.DB, BOOK, "ult", refs, syncedAt - 86400);
   ok(JSON.stringify([...afterSave].sort()) === JSON.stringify(["1:2", "1:3"]), "resolved rows recorded at or after the bound still count");
-  const older = await loadVerseConflictRefs(env.DB, BOOK, "ult", refs, syncedAt + 1);
-  ok(older.size === 0, "a resolved row recorded before the bound does not count (an earlier import's settled flag)");
+  // Review C1: 1:3's adopt_conflict was recorded by an EARLIER import (before
+  // the bound), stayed unresolved across our confirmed push and this import,
+  // and the translator's save after this import resolved it: still counts.
+  // 1:2's row was recorded AND resolved before the bound (an earlier import's
+  // settled flag): does not count.
+  const DAY = 86400;
+  const setRow = sqlite.prepare(`UPDATE verse_merge_conflicts SET detected_at = ?, last_recorded_at = ?, resolved_at = ? WHERE book = ? AND verse = ?`);
+  setRow.run(syncedAt - 5 * DAY, syncedAt - 5 * DAY, syncedAt + 100, BOOK, 3);
+  setRow.run(syncedAt - 5 * DAY, syncedAt - 5 * DAY, syncedAt - 4 * DAY, BOOK, 2);
+  const c1 = await loadVerseConflictRefs(env.DB, BOOK, "ult", refs, syncedAt - DAY);
+  ok(JSON.stringify([...c1]) === JSON.stringify(["1:3"]), `recorded before the bound but resolved after it counts; recorded and resolved before it does not (got ${JSON.stringify([...c1])})`);
+  const pc1 = partitionUsfmRevertEntriesByImport([{ ref: "1:3", class: "substantive" }], asImported, forced, c1);
+  ok(pc1.probablyOurs.length === 0, "C1: the matching 1:3 with an earlier import's conflict, resolved after the bound, still needs attention");
   // The sweep floor: the same rows, read as if the import were ~179 days old.
   const late = await loadPreImportVerses(env.DB, BOOK, "ULT", refs, syncedAt, syncedAt + EDIT_LOG_RETENTION_SECONDS - 86400 + 1);
   ok(refs.every((r) => late.get(r) === null), "a picked row within a day of the retention cutoff is no evidence");
