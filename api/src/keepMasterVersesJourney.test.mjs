@@ -478,7 +478,19 @@ console.log("\n[14. refused night N, guard not measured on night N+1 that ships 
   // measure and the export ships as before.
   ok(t.r2.delete(`exports/export-night-1/${BOOK}/ult/${FILE}`), "(setup: base render removed)");
   t.editD1(4, "eagle", "hawk");
-  const n3 = await t.exportOne("export-night-3");
+  const logs3 = [];
+  const origLog3 = console.log;
+  console.log = (...a) => {
+    logs3.push(a.join(" "));
+    origLog3(...a);
+  };
+  let n3;
+  try {
+    n3 = await t.exportOne("export-night-3");
+  } finally {
+    console.log = origLog3;
+  }
+  ok(logs3.some((l) => l.includes("keep-master guard not measured")), "(setup: night N+1's verse guard did not measure)");
   ok(d.writes.length === 1 && n3.dcsSkippedReason == null, `night N+1 ships (got ${n3.dcsSkippedReason}, writes ${d.writes.length})`);
   ok(t.live(`export_master_moved:${BOOK}:ult`).length === 0, "the refusal alert is cleared");
 }
