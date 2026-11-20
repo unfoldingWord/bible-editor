@@ -61,10 +61,11 @@ const FILE = `tn_${BOOK}.tsv`;
 const b64 = (s) => Buffer.from(s, "utf8").toString("base64");
 const unb64 = (s) => Buffer.from(s, "base64").toString("utf8");
 
-// Door43 stand-in: master's head commit is always WATERMARK, which is also
-// the D1 sync watermark (the import adopted master's current file).
+// Door43 stand-in: master's head commit is `d.head`, by default WATERMARK,
+// which is also the D1 sync watermark (the import adopted master's current
+// file). Case 5 moves it to model a commit after the import.
 function door43() {
-  const d = { master: null, branch: null, writes: [] };
+  const d = { master: null, branch: null, writes: [], head: WATERMARK };
   globalThis.fetch = async (input, init = {}) => {
     const url = new URL(String(typeof input === "string" ? input : input.url));
     const method = (init.method ?? "GET").toUpperCase();
@@ -73,7 +74,7 @@ function door43() {
     const json = (body, status = 200) =>
       new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
     if (p.endsWith("/commits") && url.searchParams.get("sha") === "master") {
-      return json([{ sha: WATERMARK, commit: { message: `Update ${FILE}`, author: { email: "editor@example.test" } } }]);
+      return json([{ sha: d.head, commit: { message: `Update ${FILE}`, author: { email: "editor@example.test" } } }]);
     }
     if (p.endsWith(`/raw/${FILE}`)) {
       return d.master == null ? new Response("nf", { status: 404 }) : new Response(d.master);
@@ -81,7 +82,7 @@ function door43() {
     if (p.endsWith(`/contents/${FILE}`)) {
       if (method === "GET") {
         const ref = url.searchParams.get("ref");
-        const text = ref === "master" || ref === WATERMARK ? d.master : d.branch;
+        const text = ref === "master" || ref === d.head ? d.master : d.branch;
         if (text == null) return new Response("nf", { status: 404 });
         return json({ sha: "blob-" + text.length, size: Buffer.byteLength(text), content: b64(text), encoding: "base64" });
       }
@@ -90,7 +91,7 @@ function door43() {
       d.writes.push(d.branch);
       return json({ content: { sha: "newblob" }, commit: { sha: "c".repeat(40) } }, 201);
     }
-    if (p.endsWith("/git/refs/heads/master")) return json({ object: { sha: WATERMARK } });
+    if (p.endsWith("/git/refs/heads/master")) return json({ object: { sha: d.head } });
     if (p.includes("/git/refs/heads/") && method === "PATCH") return json({ ok: true });
     if (p.includes("/branches/") && method === "GET") return json({ name: "b" });
     return new Response("not found", { status: 404 });
@@ -334,6 +335,26 @@ console.log("\n[4. the sync watermark is not a clean reimport (origin export) â†
   await t.exportOne("export-night-2");
   ok(t.reverts().some((r) => r.ref === "1:2" && r.probably_ours === 0), "1:2 needs attention");
   ok(t.live(`export_revert:${BOOK}:tn`).length === 1, "export_revert alert raised");
+}
+
+console.log("\n[5. the 2CH shape, then a person commits to master again after the import â†’ no quiet path]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  d.master = editNote(d.master, "bb22", "Human fix on Door43.");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Human fix on Door43.' WHERE id = 'bb22'`).run();
+  logEdit(t, { id: "bb22", action: "create", source: "dcs_reimport", payload: parsedRow("bb22", 2, "Human fix on Door43."), at: IMPORT_WRITE_AT });
+  stampImport(t);
+  appEdit(t, "bb22", "Translator edit after the import.");
+  // A second person's commit after the import, not yet synced.
+  d.master = editNote(d.master, "bb22", "Second human fix after the import.");
+  d.head = "b".repeat(40);
+  const n2 = await t.exportOne("export-night-2");
+  console.log(`    (export result: dcsSkippedReason=${n2.dcsSkippedReason}, writes=${d.writes.length})`);
+  ok(d.writes.length === 0, "nothing is pushed over the newer master commit");
+  ok(t.live(`revert_probably_ours:${BOOK}:tn`).length === 0, "no quiet probably-ours record");
+  ok(!t.reverts().some((r) => r.probably_ours === 1), "no row labelled probably ours");
 }
 
 if (failed > 0) {

@@ -1863,6 +1863,9 @@ function parseTsvRow(r: Record<string, string>, kind: TsvKind): ParsedTsvRow | n
   }
   return base;
 }
+// #1419: export.ts's revert report matches these payloads (as logged to
+// edit_log) against master's row; revertImportPayloadShape.test.mjs pins that.
+export const parseTsvRowForTest = (r: Record<string, string>, kind: TsvKind): ParsedTsvRow | null => parseTsvRow(r, kind);
 
 
 // Upsert already-parsed TSV rows (any chapters). Batched to stay under the

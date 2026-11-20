@@ -165,6 +165,14 @@ const refs = (l) => l.map((e) => e.ref);
   const group = { book: "2CH", resource: "tn", exportRevert: null, probablyOurs: { id: 9, message: plan[0].message } };
   const split = splitRevertRefs(["1:2", "2:intro"], group);
   eq([split.probablyOursRefs, split.exportRevertRefs, split.split], [["1:2", "2:intro"], [], "exact"], "watchdog parses the imported-head record's ref list");
+  // Two rows at one Reference: the record counts rows, lists the ref once.
+  const shared = planRevertReportAlerts({
+    book: "2CH", resource: "tn", kind: "tsv", attention: [], probablyOurs: [sub("3:1"), sub("3:1"), sub("3:2")],
+    mechanical: false, branch: "b", generation: "g9", probablyOursBasis: { kind: "imported_head", importedSha: SHA },
+  });
+  eq(shared[0].message.includes("on 3 row(s)") && shared[0].message.includes("hand-edit: 3:1, 3:2."), true, "shared Reference: 3 rows counted, ref listed once");
+  const s2 = splitRevertRefs(["3:1", "3:2"], { book: "2CH", resource: "tn", exportRevert: null, probablyOurs: { id: 9, message: shared[0].message } });
+  eq(s2.split, "exact", "watchdog split is exact for a shared Reference");
   // The lineage wording is unchanged by default.
   const lineage = planRevertReportAlerts({
     book: "EZK", resource: "ust", kind: "usfm", attention: [], probablyOurs: [sub("10:1")], mechanical: false, branch: "b", generation: "g1",

@@ -16,6 +16,7 @@ import { findOverlappingRanges, VerseRangeOverlapError } from "./verseBridge.ts"
 import { verseCompareKey } from "./verseMerge.ts";
 import type { LockedPush } from "./verseMergeEditorAlerts.ts";
 import { masterMayHoldHumanEditForVerse, parseTsvRefColumn, type MasterLineageSummary } from "./masterLineage.ts";
+import { EDIT_LOG_RETENTION_SECONDS } from "./editLogSweep.ts";
 
 export type Resource = "tn" | "tq" | "twl" | "ult" | "ust";
 
@@ -1904,7 +1905,13 @@ export function planRevertReportAlerts(p: {
       source: `revert_probably_ours:${book}:${resource}`,
       message:
         `${label}: tonight's export replaced master's text on ${probablyOurs.length} ${unit} that are most likely ` +
-        `our translators' own work, not a lost hand-edit: ${sample(probablyOurs, PROBABLY_OURS_LISTED_REFS)}. ${why} ` +
+        // Each Reference once: several TSV rows can share one, and the
+        // watchdog's fallback parser matches listed refs against
+        // export_reverts, which holds one row per ref.
+        `our translators' own work, not a lost hand-edit: ${sample(
+          [...new Map(probablyOurs.map((e) => [e.ref, e])).values()],
+          PROBABLY_OURS_LISTED_REFS,
+        )}. ${why} ` +
         `They are included in tonight's ` +
         `export-revert records for ${label}; nothing to do unless you expected a hand-edit at one of them.`,
       severity: "info",
@@ -2035,6 +2042,13 @@ export function partitionTsvRevertEntriesByImport<E extends { ref: string; id?: 
 // update / restore with a parseable object payload. IDs with no such write are
 // absent. Read only for the reported rows, in chunks under D1's 100-parameter
 // limit.
+//
+// The hourly edit_log sweep (editLogSweep.ts) deletes tq/twl entries older
+// than EDIT_LOG_RETENTION_SECONDS but keeps each live row's 'create' forever,
+// so for those kinds an aged entry may be the survivor of a swept later edit:
+// "latest surviving" is then not "latest". A tq/twl entry older than the
+// retention window (plus a day of slack for the sweep's own clock) is no
+// evidence. tn history is never swept.
 const PRE_IMPORT_ID_CHUNK = 90;
 export async function loadPreImportTsvRows(
   db: D1Database,
@@ -2042,7 +2056,9 @@ export async function loadPreImportTsvRows(
   book: string,
   ids: string[],
   syncedAt: number,
+  nowS: number = Math.floor(Date.now() / 1000),
 ): Promise<Map<string, Record<string, unknown> | null>> {
+  const sweepFloor = kind === "tn" ? null : nowS - EDIT_LOG_RETENTION_SECONDS - 86400;
   const out = new Map<string, Record<string, unknown> | null>();
   const unique = [...new Set(ids)];
   for (let i = 0; i < unique.length; i += PRE_IMPORT_ID_CHUNK) {
@@ -2050,17 +2066,18 @@ export async function loadPreImportTsvRows(
     const marks = chunk.map((_, j) => `?${j + 4}`).join(", ");
     const { results } = await db
       .prepare(
-        `SELECT e.row_key, e.action, e.payload_json
+        `SELECT e.row_key, e.action, e.payload_json, e.created_at
            FROM edit_log e
           WHERE e.kind = ?1 AND e.book = ?2 AND e.row_key IN (${marks})
             AND e.id = (SELECT MAX(x.id) FROM edit_log x
                          WHERE x.kind = ?1 AND x.book = ?2 AND x.row_key = e.row_key AND x.created_at <= ?3)`,
       )
       .bind(kind, book, syncedAt, ...chunk)
-      .all<{ row_key: string; action: string; payload_json: string | null }>();
+      .all<{ row_key: string; action: string; payload_json: string | null; created_at: number }>();
     for (const r of results ?? []) {
       let payload: Record<string, unknown> | null = null;
-      if ((r.action === "create" || r.action === "update" || r.action === "restore") && r.payload_json != null) {
+      const aged = sweepFloor != null && !(Number(r.created_at) >= sweepFloor);
+      if (!aged && (r.action === "create" || r.action === "update" || r.action === "restore") && r.payload_json != null) {
         try {
           const p = JSON.parse(r.payload_json);
           if (p && typeof p === "object" && !Array.isArray(p)) payload = p as Record<string, unknown>;
