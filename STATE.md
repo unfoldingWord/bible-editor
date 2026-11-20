@@ -972,8 +972,10 @@ Highlights that bite repeatedly:
   `glOccurrence`, counted over the whole row, still lines up. A TN note whose ref spans several verses may quote
   any of them, so it is not scoped. The suggest route reads a bridged ULT row only under its start verse, so
   the client moves each suggestion to its x-ref verse (`regroupTwlSuggestionsByXref`, #1432) with the same run
-  picker the resolver uses; the route and the client count occurrences differently (`Solomon's` is its own span
-  on the route, `Solomon` + `s` tokens on the client), so a run can still land on the wrong word, bridge or not.
+  picker the resolver uses. Since #1436 the route numbers `glOccurrence` as the Nth run of the span's words in
+  the verse, folded like the client's `spanWords` (`api/src/twlGlOccurrence.ts`), so `Solomon's` and
+  `Yahweh of Armies` no longer hide a `Solomon`/`Yahweh` from the count. It reads `plain_text`, not `\w` tokens:
+  a `\w` with punctuation inside (`twenty-fourth`, `Jerusalem’s` as one token) still counts differently.
   Canonical TWL order takes the same `sourceRef` (#1437); the export/reimport `orderTwlRows` finds a bridged ULT
   row only for its start verse (exact `verse` match), so the bridge's later verses keep stored `sort_order` there
   while the client orders them by the ULT. Prod D1 had no bridged ULT rows on 2026-11-19, so this was not hit yet.

@@ -36,6 +36,8 @@ export interface VerseMatch {
   articles: string[];
   preferredArticle?: string;
   matchedText: string;
+  /** Offset of matchedText in the scanned verse text (after any backward possessive/brace extension). */
+  start: number;
   /** Verse text with the matched span wrapped in [brackets] — handy for debugging. */
   context: string;
   priority: number;
@@ -87,6 +89,7 @@ class PrefixTrie {
       term: string;
       articles: string[];
       matchedText: string;
+      start: number;
       length: number;
       originalLength: number;
       priority: number;
@@ -187,6 +190,7 @@ class PrefixTrie {
               term: termData.term,
               articles: termData.articles,
               matchedText: originalMatchedText,
+              start: extendedStartPos,
               length: originalMatchedText.length,
               originalLength: matchLength,
               priority: termData.priority,
@@ -305,6 +309,7 @@ export function scanVerseMatches(verseText: string, termTrie: PrefixTrie): Verse
         articles: bestMatch.articles,
         preferredArticle,
         matchedText,
+        start: bestMatch.start,
         context,
         priority: bestMatch.priority,
       });

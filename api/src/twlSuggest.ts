@@ -43,7 +43,7 @@ const TAG_BY_CATEGORY: Record<string, string> = { kt: "keyterm", names: "name", 
 export interface TwlSuggestion {
   /** The English ULT span that matched (case preserved; may carry {supplied} braces). */
   matchedText: string;
-  /** 1-based index of this exact (case-insensitive) span among all its occurrences in the verse. */
+  /** 1-based index of this span's words among every run of those words in the verse (possessives and longer matches included). */
   glOccurrence: number;
   /** Primary article id ("kt/god"); preferredArticle for the God/falsegod case, else the first. */
   articleId: string;
@@ -75,9 +75,8 @@ twlSuggest.get("/:book/:chapter/:verse", async (c) => {
   const trie = await getTrie(c.env);
   const matches = scanVerseMatches(text, trie);
 
-  // glOccurrence: the 1-based index of each exact (case-insensitive) span among
-  // its occurrences in the verse, in document order. The client resolver uses it
-  // to pick the right instance.
+  // glOccurrence: which run of the span's words in the verse this match is,
+  // counted the way the client resolver picks it (twlGlOccurrence.ts, #1436).
   //
   // Excluding links the verse already has is done CLIENT-side (Shell
   // isTwlSuggestionExcluded), not here: an existing TWL row stores the
