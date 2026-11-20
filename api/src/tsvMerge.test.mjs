@@ -1154,6 +1154,20 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
   // Master did move the field (a maintainer set it) while D1 never did -> adopt.
   const r = computeTsvMerge("tn", newBase, { quote: "q", note: "n", support_reference: null }, { ...theirs, support_reference: "rc://*/ta/man/translate/figs-simile" });
   eq(r.adopt, true, "#1458: a master-only set of a field the create left null is adopted");
+
+  // The logged null ancestor behaves exactly like the "" the app's tq/twl
+  // creates already send for their other fields (Shell.tsx), across every fate.
+  const tqSent = { book: "EZK", chapter: 1, verse: 2, ref_raw: "1:2", question: "", response: "" };
+  const nullBase = foldTsvBase("tq", [{ action: "create", payload: createLogPayload("tq", tqSent), bookKnown: true }]);
+  const blankBase = foldTsvBase("tq", [{ action: "create", payload: { ...tqSent, quote: "" }, bookKnown: true }]);
+  for (const [o, t] of [["a", ""], ["", "b"], ["a", "b"], ["a", "a"]]) {
+    const side = (quote) => ({ quote, question: "q", response: "r" });
+    eq(
+      JSON.stringify(computeTsvMerge("tq", nullBase, side(o), side(t))),
+      JSON.stringify(computeTsvMerge("tq", blankBase, side(o), side(t))),
+      `#1458: tq quote null ancestor == "" ancestor (ours ${JSON.stringify(o)}, master ${JSON.stringify(t)})`,
+    );
+  }
 }
 
 if (failed) {
