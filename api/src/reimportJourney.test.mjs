@@ -2674,6 +2674,38 @@ console.log("\n[#1461: a tq row whose updates the sweep removed has no ancestor,
     const row = sqlite.prepare(`SELECT chapter, verse, ref_raw FROM tq_rows WHERE id = 'sw10'`).all()[0];
     eq([row.chapter, row.verse, row.ref_raw], [9, 10, "9:10"], "…and D1's location is left as it was");
   }
+
+  // 10. HORIZON GATE. A version skip right after a RECENT create cannot be the
+  //     sweep's doing (it deletes nothing younger than 180 days), so an
+  //     unexplained bump there (a logging quirk, a non-content write) leaves
+  //     the ancestor alone: master equals the create, her edit stands clean.
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite, "sw11", { version: 3, response: "her edit" });
+    log(sqlite, { id: 10, rowKey: "sw11", action: "create", prev: null, next: 1, payload: CREATE, at: RECENT - 3 * 86400 });
+    log(sqlite, { id: 40, rowKey: "sw11", action: "update", prev: 2, next: 3, payload: { response: "her edit" }, at: RECENT });
+    const counts = await applyTsvRows(env, BOOK, "tq", masterRow("sw11", ""), null, {
+      confirmedAt: RECENT - 86400, editId: BOUNDARY,
+    });
+    eq(counts.merge_no_base, 0, "a version skip after a recent create is not a swept gap");
+    eq(sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id = 'sw11'`).all()[0].review_kind, null, "…no flag");
+  }
+
+  // 11. BOUNDARY GATE. The entry before the skip sits ABOVE the boundary, so
+  //     whatever is missing after it is above the boundary too, outside what
+  //     the bounded fold reads. The create stays the ancestor.
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite, "sw12", { version: 4, response: "her edit" });
+    log(sqlite, { id: 10, rowKey: "sw12", action: "create", prev: null, next: 1, payload: CREATE, at: OLD });
+    log(sqlite, { id: 35, rowKey: "sw12", action: "update", prev: 1, next: 2, payload: { response: "an older edit" }, at: OLD + 86400 });
+    log(sqlite, { id: 40, rowKey: "sw12", action: "update", prev: 3, next: 4, payload: { response: "her edit" }, at: RECENT });
+    const counts = await applyTsvRows(env, BOOK, "tq", masterRow("sw12", ""), null, {
+      confirmedAt: RECENT - 86400, editId: BOUNDARY,
+    });
+    eq(counts.merge_no_base, 0, "a gap above the boundary leaves the bounded ancestor alone");
+    eq(sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id = 'sw12'`).all()[0].review_kind, null, "…no flag");
+  }
 }
 
 console.log("\n[#653: with NO ancestor at all, the mint is gated on the measured lineage]");
