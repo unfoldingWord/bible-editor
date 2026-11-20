@@ -989,7 +989,21 @@ Highlights that bite repeatedly:
   `merge.writeFields`, review-flag writes) and tq/twl entries older than the edit_log retention window (the
   sweep keeps the `create`, deletes later updates) are deliberately no evidence. This is a "has master moved
   since the import" question, so `source_sha` is the right bound here, unlike the "since the ancestor" walks
-  above. USFM (ULT/UST) has the same false alarm and is not covered (#1439).
+  above. ULT/UST follow since #1439 (`revertImportVerses.ts`), with three differences. (1) A verse is matched
+  exactly against master's file run through `extractVersesForRange`, never against `verseTextByRef(master)`: the
+  import stores the extract, which differs from master's raw parse on up to 11% of verses of the sample files
+  (ZEC; OBA 0%: quotes and dashes moved out of `\w`, a leading `\q1`), and no comparison mask recovers those; a
+  looser lens here only moves verses toward quiet. (2) The adoption's `canonizeAlignmentSource` output is NOT
+  accepted: canonize can fold a Door43 person's x-lemma / x-content fix back to D1's stale UHB bytes, so a verse it
+  changed stays loud (with Door43's own UHB it changes 0 of 21 OBA and 31-32 of 211 ZEC sample verses). (3) A
+  `verse_merge_conflicts` row keeps the verse loud when it is unresolved OR was recorded (`last_recorded_at`) or
+  resolved (`resolved_at`) since the earlier of the last confirmed push and a day before `synced_at` (an earlier
+  import's flag can stay open across a push and a later import, then be resolved by the save): any app save of a verse
+  resolves its row in the same batch (`verses.ts`), so the very save that re-types text an `adopt_conflict`
+  overwrote would otherwise have cleared the evidence by export time. No column names the run that wrote a row.
+  In practice only pristine writes and creates go quiet. A source-attribute
+  reconcile logs a `dcs_reimport` 'update' with the adoption's payload keys, so only the content tells it apart
+  (`revertImportVersePayloadShape.test.mjs` pins all of this).
 
 ## Stop conditions / goals
 
