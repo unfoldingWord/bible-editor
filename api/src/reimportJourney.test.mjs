@@ -50,6 +50,8 @@ import {
   sweepStaleMergeNoBase,
 } from "./bookReimport.ts";
 import { contentPatchClearClauses } from "./contentPatchClauses.ts";
+import { EDIT_LOG_SWEEP_SQL, EDIT_LOG_RETENTION_SECONDS } from "./editLogSweep.ts";
+import { PUBLISHED_BOOKS } from "./publishedGuard.ts";
 import { lintTqRows } from "./lint.ts";
 import { shouldRecordResourceSync } from "./reimportSyncGate.ts";
 import { BRIDGE_DELETE_NEXT_SQL, BRIDGE_UPDATE_START_SQL } from "./verseBridge.ts";
@@ -2409,6 +2411,162 @@ console.log("\n[#653: a RECLAIMED id's old lifecycle never becomes a trusted anc
     const row = sqlite.prepare(`SELECT review_kind, question FROM tq_rows WHERE id='rc02'`).all()[0];
     eq(row.review_kind, null, "…no flag");
     eq(row.question, "her edit on the new life", "…and her edit stands");
+  }
+}
+
+// ── Issue #1461: the retention sweep must not leave a WRONG tq ancestor ──────
+//
+// The hourly sweep (editLogSweep.ts) deletes tq/twl entries older than 180
+// days but keeps each live row's newest `create` (branch 6). A row whose later
+// updates were swept then folds the create alone: an ancestor that is present
+// but stale. These cases build the history, run the REAL sweep SQL over it,
+// then drive the REAL applyTsvRows, so they cover what the sweep leaves behind
+// and what the merge makes of it.
+console.log("\n[#1461: a tq row whose updates the sweep removed has no ancestor, not a stale one]");
+{
+  const nowSec = Math.floor(Date.now() / 1000);
+  const OLD = nowSec - 200 * 86400; // past the retention window
+  const RECENT = nowSec - 5 * 86400;
+  const runSweep = (sqlite) =>
+    sqlite
+      .prepare(EDIT_LOG_SWEEP_SQL)
+      .run(nowSec - EDIT_LOG_RETENTION_SECONDS, JSON.stringify([...PUBLISHED_BOOKS]));
+  const seed = (sqlite, id, { version, response }) => {
+    sqlite.prepare(`INSERT OR IGNORE INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, quote, question, response, version, updated_by)
+         VALUES (?, ?, 9, 9, '9:9', NULL, '', ?, ?, 1)`,
+      )
+      .run(id, BOOK, response, version);
+  };
+  const log = (sqlite, { id, rowKey, action, prev, next, payload, at, source = null }) =>
+    sqlite
+      .prepare(
+        `INSERT INTO edit_log (id, kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at, source)
+         VALUES (?, 'tq', ?, ?, 1, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(id, rowKey, BOOK, prev, next, action, payload == null ? null : JSON.stringify(payload), at, source);
+  // The create the app sends for a new question (Shell.tsx; explicit null quote since #1462).
+  const CREATE = { book: BOOK, chapter: 9, verse: 9, ref_raw: "9:9", quote: null, question: "", response: "" };
+  const masterRow = (id, response) => [{
+    id, idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+    occurrence: null, tags: null, quote: null, question: "", response,
+  }];
+  const BOUNDARY = 30; // the export read: everything at or below id 30 was on master
+  const surviving = (sqlite, rowKey) =>
+    sqlite.prepare(`SELECT id FROM edit_log WHERE row_key = ? ORDER BY id`).all(rowKey).map((r) => r.id);
+
+  // 1. THE ISSUE'S SCENARIO. Created in the app, response set to "r" and
+  //    exported, that update ages out, then a translator edits to "r2". Master
+  //    still holds the exported "r". Folding the create alone reads master's "r"
+  //    as moved from "" and adopts it over "r2".
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite, "sw01", { version: 3, response: "r2" });
+    log(sqlite, { id: 10, rowKey: "sw01", action: "create", prev: null, next: 1, payload: CREATE, at: OLD });
+    log(sqlite, { id: 20, rowKey: "sw01", action: "update", prev: 1, next: 2, payload: { response: "r" }, at: OLD + 86400 });
+    log(sqlite, { id: 40, rowKey: "sw01", action: "update", prev: 2, next: 3, payload: { response: "r2" }, at: RECENT });
+    runSweep(sqlite);
+    eq(surviving(sqlite, "sw01"), [10, 40], "the sweep removed the exported update and kept the create");
+
+    const counts = await applyTsvRows(env, BOOK, "tq", masterRow("sw01", "r"), null, {
+      confirmedAt: RECENT - 86400, editId: BOUNDARY,
+    });
+    const row = sqlite.prepare(`SELECT response, review_kind FROM tq_rows WHERE id = 'sw01'`).all()[0];
+    eq(row.response, "r2", "the translator's newer edit is NOT overwritten by master's older value");
+    eq(counts.merge_conflicts, 0, "…no adopt_conflict on a stale ancestor");
+    eq(counts.merge_no_base, 1, "…the row reads as having no ancestor (keep_no_base)");
+    eq(row.review_kind, "merge_no_base", "…and is flagged for a person to check");
+  }
+
+  // 2. TAIL GAP: nothing survives after the swept update. D1 still holds the
+  //    exported "r"; a Door43 maintainer has since reverted the row to "".
+  //    Against the stale create, master looks unmoved and D1 would be kept
+  //    silently, so the next export would undo the maintainer's revert.
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite, "sw02", { version: 2, response: "r" });
+    log(sqlite, { id: 10, rowKey: "sw02", action: "create", prev: null, next: 1, payload: CREATE, at: OLD });
+    log(sqlite, { id: 20, rowKey: "sw02", action: "update", prev: 1, next: 2, payload: { response: "r" }, at: OLD + 86400 });
+    runSweep(sqlite);
+    eq(surviving(sqlite, "sw02"), [10], "only the create survives");
+
+    const counts = await applyTsvRows(env, BOOK, "tq", masterRow("sw02", ""), null, {
+      confirmedAt: RECENT - 86400, editId: BOUNDARY,
+    });
+    const row = sqlite.prepare(`SELECT response, review_kind FROM tq_rows WHERE id = 'sw02'`).all()[0];
+    eq(counts.merge_no_base, 1, "a version the surviving history cannot reach means no ancestor");
+    eq(row.review_kind, "merge_no_base", "…so the difference is flagged, not silently kept");
+  }
+
+  // 3. NON-CONTENT ACTIVITY KEEPS THE ANCESTOR. A dismissed review flag
+  //    (logged with prev = new, no version bump) and a sync_clear_review (no
+  //    versions) age out; neither moved content. The chain create v1 ->
+  //    translator edit (prev 1) is unbroken, so the create is still a true
+  //    ancestor: master never moved, the edit stands, no flag.
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite, "sw03", { version: 2, response: "her edit" });
+    log(sqlite, { id: 10, rowKey: "sw03", action: "create", prev: null, next: 1, payload: CREATE, at: OLD });
+    log(sqlite, { id: 15, rowKey: "sw03", action: "dismiss_review", prev: 1, next: 1, payload: { review_kind: "merge_no_base" }, at: OLD + 3600 });
+    log(sqlite, { id: 18, rowKey: "sw03", action: "sync_clear_review", prev: null, next: 0, payload: { review_kind: "merge_no_base" }, at: OLD + 7200, source: "dcs_reimport" });
+    log(sqlite, { id: 40, rowKey: "sw03", action: "update", prev: 1, next: 2, payload: { response: "her edit" }, at: RECENT });
+    runSweep(sqlite);
+    eq(surviving(sqlite, "sw03"), [10, 40], "the non-content entries aged out");
+
+    const counts = await applyTsvRows(env, BOOK, "tq", masterRow("sw03", ""), null, {
+      confirmedAt: RECENT - 86400, editId: BOUNDARY,
+    });
+    const row = sqlite.prepare(`SELECT response, review_kind FROM tq_rows WHERE id = 'sw03'`).all()[0];
+    eq(counts.merge_no_base, 0, "an unbroken version chain keeps the create as the ancestor");
+    eq(row.review_kind, null, "…no flag");
+    eq(row.response, "her edit", "…and her edit stands");
+  }
+
+  // 4. AGE ALONE IS NOT A GAP. Old history the sweep has not removed (here:
+  //    the sweep never ran) still folds normally, so master's exported "r"
+  //    matches the ancestor and the translator's newer "r2" stands cleanly.
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite, "sw04", { version: 3, response: "r2" });
+    log(sqlite, { id: 10, rowKey: "sw04", action: "create", prev: null, next: 1, payload: CREATE, at: OLD });
+    log(sqlite, { id: 20, rowKey: "sw04", action: "update", prev: 1, next: 2, payload: { response: "r" }, at: OLD + 86400 });
+    log(sqlite, { id: 40, rowKey: "sw04", action: "update", prev: 2, next: 3, payload: { response: "r2" }, at: RECENT });
+
+    const counts = await applyTsvRows(env, BOOK, "tq", masterRow("sw04", "r"), null, {
+      confirmedAt: RECENT - 86400, editId: BOUNDARY,
+    });
+    const row = sqlite.prepare(`SELECT response, review_kind FROM tq_rows WHERE id = 'sw04'`).all()[0];
+    eq(counts.merge_no_base, 0, "a complete old history keeps its ancestor");
+    eq(counts.merge_conflicts, 0, "…no conflict");
+    eq(row.review_kind, null, "…no flag");
+    eq(row.response, "r2", "…and the translator's edit stands");
+  }
+
+  // 5. A SYNC WRITE THAT SURVIVES is part of the chain, not a gap. The create
+  //    and a Door43 adoption (dcs_reimport update, full row) both sit below the
+  //    boundary and are recent; the translator then edits. Master unchanged
+  //    since the adoption -> clean keep.
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite, "sw05", { version: 3, response: "her edit" });
+    log(sqlite, { id: 10, rowKey: "sw05", action: "create", prev: null, next: 1, payload: CREATE, at: OLD });
+    log(sqlite, {
+      id: 20, rowKey: "sw05", action: "update", prev: 1, next: 2, at: RECENT - 3 * 86400, source: "dcs_reimport",
+      payload: { id: "sw05", refRaw: "9:9", chapter: 9, verse: 9, occurrence: null, tags: null, quote: null, question: "", response: "door43 text" },
+    });
+    log(sqlite, { id: 40, rowKey: "sw05", action: "update", prev: 2, next: 3, payload: { response: "her edit" }, at: RECENT });
+    runSweep(sqlite);
+    eq(surviving(sqlite, "sw05"), [10, 20, 40], "nothing in this chain was old enough to sweep");
+
+    const counts = await applyTsvRows(env, BOOK, "tq", masterRow("sw05", "door43 text"), null, {
+      confirmedAt: RECENT - 86400, editId: BOUNDARY,
+    });
+    const row = sqlite.prepare(`SELECT response, review_kind FROM tq_rows WHERE id = 'sw05'`).all()[0];
+    eq(counts.merge_no_base, 0, "the sync write is the ancestor");
+    eq(row.review_kind, null, "…no flag");
+    eq(row.response, "her edit", "…and her edit stands");
   }
 }
 
