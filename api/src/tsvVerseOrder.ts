@@ -16,7 +16,7 @@
 //
 //  1. Who owns the verse's order. If a person changed anything in the verse
 //     in-app since the last export master is confirmed to hold (a live row
-//     with `last_change_source='user'` and `updated_at` after
+//     with `last_change_source='user'` and `updated_at` at or after
 //     `master_confirmed_at`), D1's order stands: that person's reorder (the
 //     HOS 11 reorder-revert fix) may not have reached master yet. Any user
 //     action counts, not only `reorder`, because a later edit, preserve or
@@ -77,11 +77,16 @@ export interface VerseOrderPlan {
   renumberedVerses: number;
 }
 
-/** A person's in-app change that master has not yet been confirmed to hold. */
+/**
+ * A person's in-app change that master has not yet been confirmed to hold.
+ * A change stamped in the same second as the confirmation counts as pending
+ * (`>=`, matching the locked-book mirror; issue #1456): the safe direction,
+ * since master_confirmed_at alone cannot show which side of it the change fell.
+ */
 export function isPendingUserChange(r: LiveOrderRow, confirmedAt: number | null): boolean {
   if (r.last_change_source !== "user") return false;
   if (confirmedAt == null) return r.last_change_action === "reorder";
-  return (r.updated_at ?? 0) > confirmedAt;
+  return (r.updated_at ?? 0) >= confirmedAt;
 }
 
 // The export's order: sort_order ascending with NULLs last, then id.
