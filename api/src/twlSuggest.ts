@@ -15,6 +15,7 @@ import {
   scanVerseMatches,
   type TwArticleLite,
 } from "./twlMatcher";
+import { glOccurrences } from "./twlGlOccurrence";
 
 export const twlSuggest = new Hono<{ Bindings: Env }>();
 
@@ -85,13 +86,10 @@ twlSuggest.get("/:book/:chapter/:verse", async (c) => {
   // mis-identify which occurrence is covered and could re-suggest an
   // already-linked one (or hide an unlinked occurrence). So the route returns
   // every match and the client filters by resolved (tw_link, orig_words, occurrence).
-  const occCount = new Map<string, number>();
+  const occurrences = glOccurrences(text, matches);
   const suggestions: TwlSuggestion[] = [];
-  for (const m of matches) {
-    const key = m.matchedText.toLowerCase();
-    const glOccurrence = (occCount.get(key) ?? 0) + 1;
-    occCount.set(key, glOccurrence);
-
+  for (const [i, m] of matches.entries()) {
+    const glOccurrence = occurrences[i];
     const primary = m.preferredArticle ?? m.articles[0];
     if (!primary) continue;
     const category = primary.split("/")[0] ?? "";
