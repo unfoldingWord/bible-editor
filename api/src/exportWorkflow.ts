@@ -302,6 +302,18 @@ export interface StepResult {
   prReason: string | null;
 }
 
+// #1450: the stable part of an export step error, for the alert message. The
+// DCS helpers throw `code: [METHOD ]status <response body>`; the body is
+// Gitea's raw text (sometimes HTML) and can change from night to night, which
+// would defeat writeAlert's "a dismissed identical message stays dismissed"
+// rule (#458). So a `code: [METHOD ]status` prefix is kept alone; any other
+// error keeps its first line, capped.
+export function stepFailureSummary(reason: string): string {
+  const coded = /^([a-z][a-z0-9_]*): ((?:[A-Z]+ )?\d{3})(?=\s|$)/.exec(reason);
+  if (coded) return `${coded[1]}: ${coded[2]}`;
+  return reason.split("\n")[0].slice(0, 160);
+}
+
 const isResource = (s: string): s is Resource => (ALL_RESOURCES as string[]).includes(s);
 
 export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
@@ -387,15 +399,17 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // back clean: it shipped (no skip reason) or found Door43 already matching
   // (`unchanged`, decided after the commit call). A guard skip, a lock skip
   // or a dry run returns before the Door43 write, so it did not re-measure the
-  // failure and leaves the alert up. A branchName override run writes to a
-  // different branch than the nightly does, so it leaves the alert up too,
-  // like the export_master_moved clear. Both the clear and the write sit
-  // inside steps that already exist, so the run spends no extra steps.
+  // failure and leaves the alert up. The alert is about Door43 writes
+  // failing, not about which branch they went to, so a branchName override
+  // run that reaches Door43 cleanly clears it too. The clear removes only rows
+  // written no later than this attempt started: a failure an overlapping run
+  // wrote after that is newer than what this attempt measured, and stays.
+  // Both the clear and the write sit inside steps that already exist, so the
+  // run spends no extra steps.
   private async runExportStep(
     step: WorkflowStep,
     book: string,
     resource: Resource,
-    branchOverride: string | null,
     exportPair: () => Promise<StepResult>,
   ): Promise<StepResult> {
     const stepName = `export-${book}-${resource}`;
@@ -405,9 +419,11 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         stepName,
         { retries: { limit: 3, delay: "5 seconds", backoff: "exponential" } },
         async () => {
+          // system_alerts.created_at is unixepoch() seconds.
+          const startedAt = Math.floor(Date.now() / 1000);
           const result = await exportPair();
           const reachedDoor43 = result.dcsSkippedReason == null || result.dcsSkippedReason === "unchanged";
-          if (reachedDoor43 && branchOverride == null) await this.endStepFailureEpisode(failSource);
+          if (reachedDoor43) await this.endStepFailureEpisode(failSource, startedAt);
           return result;
         },
       );
@@ -800,7 +816,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     for (const resource of resources) {
       for (const book of books) {
         const stepName = `export-${book}-${resource}`;
-        const itemResult = await this.runExportStep(step, book, resource, branchOverride, () =>
+        const itemResult = await this.runExportStep(step, book, resource, () =>
           this.exportOne(
             book,
             resource,
@@ -4356,11 +4372,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // ones too. clearExportAlert keeps dismissed rows, and writeAlert keeps a
   // condition dismissed while its newest row is dismissed with the same
   // message: a later failure with the same error would then raise nothing.
-  // Best-effort, like clearExportAlert.
-  private async endStepFailureEpisode(source: string): Promise<void> {
+  // Only rows created at or before `startedAt` (seconds) go; see
+  // runExportStep. Best-effort, like clearExportAlert.
+  private async endStepFailureEpisode(source: string, startedAt: number): Promise<void> {
     try {
-      await this.env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2`)
-        .bind(EXPORT_ALERT_USERNAME, source)
+      await this.env.DB.prepare(
+        `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND created_at <= ?3`,
+      )
+        .bind(EXPORT_ALERT_USERNAME, source, startedAt)
         .run();
     } catch (err) {
       console.error(`export alert clear failed for ${source}:`, err);
@@ -4370,12 +4389,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // #1450: a (book, resource) export step failed after its retries. The
   // message states only what was measured: the step threw this error. A throw
   // can come after the Door43 write landed, so it does not say whether
-  // anything reached Door43.
+  // anything reached Door43. It fires on any run (nightly, manual, dry), so
+  // the wording names no night. The error is cut to its stable part (see
+  // stepFailureSummary); the full text is in the "export step failed" log.
   private async recordStepFailureAlert(book: string, resource: Resource, reason: string): Promise<void> {
     const message =
-      `${book} ${resource.toUpperCase()}: the nightly export step failed after its retries: ${reason.slice(0, 300)}. ` +
-      `The next export tries again; this clears when one reaches Door43 cleanly. ` +
-      `Check the export snapshot and logs for whether this night's push landed.`;
+      `The export step for ${book} ${resource.toUpperCase()} failed after its retries: ${stepFailureSummary(reason)}. ` +
+      `A later export tries again; this clears when one reaches Door43 cleanly. ` +
+      `The full error is in the logs; check them and the export snapshot for whether the push landed.`;
     await this.writeAlert(`export_step_failed:${book}:${resource}`, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 

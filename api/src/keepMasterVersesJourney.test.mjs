@@ -37,7 +37,7 @@ registerHooks({
   },
 });
 
-const { ExportWorkflow } = await import("./exportWorkflow.ts");
+const { ExportWorkflow, stepFailureSummary } = await import("./exportWorkflow.ts");
 const { extractVersesForRange } = await import("./importParsers.ts");
 const EXPORT_ALERT_USERNAME = "deferredreward"; // module-private in exportWorkflow.ts
 
@@ -180,7 +180,7 @@ function freshEnv(door43File = DOOR43_OBA) {
   // The export as the Workflow runs it: one retried step per (book, resource),
   // whose failure after the retries is caught and recorded (#1450).
   const exportStep = (step, instanceId, dcsAllowed = true) =>
-    wf.runExportStep(step, BOOK, "ult", null, () => exportOne(instanceId, dcsAllowed));
+    wf.runExportStep(step, BOOK, "ult", () => exportOne(instanceId, dcsAllowed));
   return { sqlite, env, r2, wf, exportOne, exportStep, live, reverts, render, editD1 };
 }
 
@@ -649,9 +649,11 @@ console.log("\n[16. Door43 rejects every write → after the retries an export_s
   ok(d.writes.length === 0, "nothing committed");
   const failed1 = t.live(failSource);
   ok(
-    failed1.length === 1 && failed1[0].message.includes("dcs_commit_failed"),
-    `one export_step_failed alert carries the error (${failed1.map((a) => a.message).join(" | ")})`,
+    failed1.length === 1 && failed1[0].message.includes("dcs_commit_failed: POST 500."),
+    `one export_step_failed alert carries the error code and status (${failed1.map((a) => a.message).join(" | ")})`,
   );
+  ok(!failed1[0]?.message.includes("boom"), "the alert leaves out Door43's response body");
+  ok(!/night/.test(failed1[0]?.message ?? ""), "the wording names no night (it fires on manual runs too)");
 
   console.log("\n[16b. a dry run the next night does not reach Door43 → the alert stays]");
   const dry = await t.exportStep(retryingStep(), "dry-night-2", false);
@@ -710,7 +712,7 @@ console.log("\n[16f. a dismissed failure, a clean night, then the same failure a
   ok(t.live(failSource).length === 1, `the new failure is a live alert (got ${t.live(failSource).length})`);
 }
 
-console.log("\n[16h. a locked book, and a branchName override run, do not clear the alert]");
+console.log("\n[16h. a locked book does not clear the alert; a branchName override run that reaches Door43 does]");
 {
   const d = door43();
   const t = freshEnv();
@@ -719,16 +721,50 @@ console.log("\n[16h. a locked book, and a branchName override run, do not clear 
   d.commitFails = true;
   await t.exportStep(retryingStep(), "export-night-1");
   d.commitFails = false;
-  const locked = await t.wf.runExportStep(retryingStep(), BOOK, "ult", null, () =>
+  const locked = await t.wf.runExportStep(retryingStep(), BOOK, "ult", () =>
     t.wf.exportOne(BOOK, "ult", "export-night-2", true, false, new Set([BOOK]), false),
   );
   ok(locked.dcsSkippedReason != null && d.writes.length === 0, `(setup: the lock skips, got ${locked.dcsSkippedReason})`);
   ok(t.live(failSource).length === 1, "the lock skip leaves the alert up");
-  const override = await t.wf.runExportStep(retryingStep(), BOOK, "ult", "custom-branch", () =>
-    t.exportOne("export-night-3"),
+  const override = await t.wf.runExportStep(retryingStep(), BOOK, "ult", () =>
+    t.wf.exportOne(BOOK, "ult", "export-night-3", true, false, new Set(), false, "admin-fix"),
   );
-  ok(override.dcsSkippedReason == null && d.writes.length === 1, `(setup: the override run ships, got ${override.dcsSkippedReason})`);
-  ok(t.live(failSource).length === 1, "the branchName override run leaves the alert up");
+  ok(
+    override.dcsSkippedReason == null && d.writes.length === 1 && override.branch === "admin-fix",
+    `(setup: the override run ships to its branch, got ${override.dcsSkippedReason} on ${override.branch})`,
+  );
+  ok(t.live(failSource).length === 0, "the override run that reached Door43 clears the alert");
+}
+
+console.log("\n[16i. a failure an overlapping run writes after a clean run started survives that run's clear]");
+{
+  const d = door43();
+  const t = freshEnv();
+  const failSource = `export_step_failed:${BOOK}:ult`;
+  const insertFailure = (createdAt, message) =>
+    t.sqlite
+      .prepare(`INSERT INTO system_alerts (username, severity, source, message, link_url, created_at) VALUES (?, 'error', ?, ?, '', ?)`)
+      .run(EXPORT_ALERT_USERNAME, failSource, message, createdAt);
+  const now = () => Math.floor(Date.now() / 1000);
+  insertFailure(now() - 60, "older failure");
+  d.master = DOOR43_OBA;
+  const r = await t.wf.runExportStep(retryingStep(), BOOK, "ult", async () => {
+    const out = await t.exportOne("export-night-1");
+    // The other run's failure lands while this one is still in its step.
+    insertFailure(now() + 60, "newer failure");
+    return out;
+  });
+  ok(r.dcsSkippedReason == null, `(setup: the clean run ships, got ${r.dcsSkippedReason})`);
+  const left = t.live(failSource).map((a) => a.message);
+  ok(left.length === 1 && left[0] === "newer failure", `only the newer failure is left (${left.join(" | ")})`);
+}
+
+console.log("\n[16j. stepFailureSummary keeps the stable code and status, not the body]");
+{
+  ok(stepFailureSummary("dcs_commit_failed: POST 500 <html>oops</html>") === "dcs_commit_failed: POST 500", "commit error → code + method + status");
+  ok(stepFailureSummary("dcs_branch_get_failed: 404 not found") === "dcs_branch_get_failed: 404", "status-only error → code + status");
+  ok(stepFailureSummary("dcs_branch_not_visible: OBA-be-x") === "dcs_branch_not_visible: OBA-be-x", "uncoded error keeps its first line");
+  ok(stepFailureSummary("x".repeat(500) + "\nmore").length === 160, "an uncoded error is capped at 160 characters, first line only");
 }
 
 console.log("\n[16d. Door43 fails once, then the step's own retry ships → no alert]");
