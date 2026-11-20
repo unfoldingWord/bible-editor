@@ -970,7 +970,10 @@ Highlights that bite repeatedly:
   row (`findSourceForTargetText`, `resolveSpanToSource`) need `sourceRef` too (#1426): another verse's English
   stays in place as a word that cannot match, so runs never join across it and the suggest route's
   `glOccurrence`, counted over the whole row, still lines up. A TN note whose ref spans several verses may quote
-  any of them, so it is not scoped.
+  any of them, so it is not scoped. The suggest route reads a bridged ULT row only under its start verse, so
+  the client moves each suggestion to its x-ref verse (`regroupTwlSuggestionsByXref`, #1432) with the same run
+  picker the resolver uses; the route and the client count occurrences differently (`Solomon's` is its own span
+  on the route, `Solomon` + `s` tokens on the client), so a run can still land on the wrong word, bridge or not.
 
 ## Stop conditions / goals
 
