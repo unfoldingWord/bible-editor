@@ -84,6 +84,8 @@ function door43() {
         const size = d.noSize ? undefined : Buffer.byteLength(text);
         return json({ sha: "blob-" + text.length, size, content: b64(text), encoding: "base64" });
       }
+      // d.commitFails: Door43 rejects the write, so commitToDcs throws.
+      if (d.commitFails) return new Response("boom", { status: 500 });
       const body = JSON.parse(init.body);
       d.branch = unb64(body.content);
       d.writes.push(d.branch);
@@ -572,6 +574,25 @@ console.log("\n[15b. the same loss on a night that ships → the \"shipped … b
   ok(
     align.length === 1 && align[0].message.includes("shipped to Door43, but with alignment to fix"),
     `the alert says it shipped with alignment to fix (${align[0]?.message})`,
+  );
+}
+
+console.log("\n[15c. the same loss when the Door43 commit fails → the step fails and no \"shipped\" wording (#1448)]");
+{
+  const { d, t } = alignLossNight(false);
+  d.commitFails = true;
+  let error = null;
+  try {
+    await t.exportOne("export-night-1");
+  } catch (e) {
+    error = e;
+  }
+  ok(error && String(error.message).startsWith("dcs_commit_failed"), `the commit throws (got ${error?.message})`);
+  ok(d.writes.length === 0, "nothing committed");
+  const align = t.live(`export_align_shrink:${BOOK}:ult`);
+  ok(
+    !align.some((a) => /shipped|is on Door43/.test(a.message)),
+    `no alert says the book shipped (${align.map((a) => a.message).join(" | ")})`,
   );
 }
 
