@@ -15,6 +15,7 @@ import {
   scanVerseMatches,
   type TwArticleLite,
 } from "./twlMatcher";
+import { glOccurrences } from "./twlGlOccurrence";
 
 export const twlSuggest = new Hono<{ Bindings: Env }>();
 
@@ -42,7 +43,7 @@ const TAG_BY_CATEGORY: Record<string, string> = { kt: "keyterm", names: "name", 
 export interface TwlSuggestion {
   /** The English ULT span that matched (case preserved; may carry {supplied} braces). */
   matchedText: string;
-  /** 1-based index of this exact (case-insensitive) span among all its occurrences in the verse. */
+  /** 1-based index of this span's words among every run of those words in the verse (possessives and longer matches included). */
   glOccurrence: number;
   /** Primary article id ("kt/god"); preferredArticle for the God/falsegod case, else the first. */
   articleId: string;
@@ -74,9 +75,8 @@ twlSuggest.get("/:book/:chapter/:verse", async (c) => {
   const trie = await getTrie(c.env);
   const matches = scanVerseMatches(text, trie);
 
-  // glOccurrence: the 1-based index of each exact (case-insensitive) span among
-  // its occurrences in the verse, in document order. The client resolver uses it
-  // to pick the right instance.
+  // glOccurrence: which run of the span's words in the verse this match is,
+  // counted the way the client resolver picks it (twlGlOccurrence.ts, #1436).
   //
   // Excluding links the verse already has is done CLIENT-side (Shell
   // isTwlSuggestionExcluded), not here: an existing TWL row stores the
@@ -85,13 +85,10 @@ twlSuggest.get("/:book/:chapter/:verse", async (c) => {
   // mis-identify which occurrence is covered and could re-suggest an
   // already-linked one (or hide an unlinked occurrence). So the route returns
   // every match and the client filters by resolved (tw_link, orig_words, occurrence).
-  const occCount = new Map<string, number>();
+  const occurrences = glOccurrences(text, matches);
   const suggestions: TwlSuggestion[] = [];
-  for (const m of matches) {
-    const key = m.matchedText.toLowerCase();
-    const glOccurrence = (occCount.get(key) ?? 0) + 1;
-    occCount.set(key, glOccurrence);
-
+  for (const [i, m] of matches.entries()) {
+    const glOccurrence = occurrences[i];
     const primary = m.preferredArticle ?? m.articles[0];
     if (!primary) continue;
     const category = primary.split("/")[0] ?? "";
