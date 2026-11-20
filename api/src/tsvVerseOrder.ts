@@ -16,7 +16,7 @@
 //
 //  1. Who owns the verse's order. If a person changed anything in the verse
 //     in-app since the last export master is confirmed to hold (a live row
-//     with `last_change_source='user'` and `updated_at` after
+//     with `last_change_source='user'` and `updated_at` at or after
 //     `master_confirmed_at`), D1's order stands: that person's reorder (the
 //     HOS 11 reorder-revert fix) may not have reached master yet. Any user
 //     action counts, not only `reorder`, because a later edit, preserve or
