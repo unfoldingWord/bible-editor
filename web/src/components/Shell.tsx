@@ -2181,6 +2181,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     },
     [verseIndexByVersion],
   );
+  // Companion to ultVerseObjectsFor: the verse as x-ref spells it when the ULT
+  // row is a bridge, so canonical TWL order reads only that verse's words (#1437).
+  const ultSourceRefFor = useCallback(
+    (verse: number): string | undefined => ultSourceRef(verseIndexByVersion, verse),
+    [verseIndexByVersion],
+  );
 
   // The widest range row across all versions that covers activeVerse. Used to
   // scope TN filtering in ResourceColumn — if UST 6-9 covers the active
@@ -2651,7 +2657,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       };
       const ult = grab("ULT");
       const uhb = grab("UHB") ?? grab("UGNT");
-      const resolved = resolveSpanToSource(ult, uhb, s.matchedText, s.glOccurrence, ultSourceRef(verseIndexByVersion, verse));
+      // In a bridged ULT, `verse` as x-ref spells it: the resolve and both
+      // canonical orders below read only this verse's words (#1426, #1437).
+      const sourceRef = ultSourceRef(verseIndexByVersion, verse);
+      const resolved = resolveSpanToSource(ult, uhb, s.matchedText, s.glOccurrence, sourceRef);
 
       const twLink = `rc://*/tw/dict/bible/${chosenArticleId}`;
       // Tag follows the CHOSEN article's category, not the server's primary — a
@@ -2693,6 +2702,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         ],
         ult ?? null,
         twTitles,
+        sourceRef,
       );
       const at = withNew.findIndex((r) => r.id === STUB);
       const prev = at > 0 ? withNew[at - 1] : null;
@@ -2705,7 +2715,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // rather than re-deriving one they've already overridden.
       const slotList = lockedTwlVerses.has(verse)
         ? manualTwlOrder(list)
-        : canonicalTwlOrder(list, ult ?? null, twTitles);
+        : canonicalTwlOrder(list, ult ?? null, twTitles, sourceRef);
       const sort_order =
         list.length === 0
           ? 100
@@ -5106,6 +5116,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           tq={data.tq}
           twl={data.twl}
           ultVerseObjectsFor={ultVerseObjectsFor}
+          ultSourceRefFor={ultSourceRefFor}
           commentCountsForRow={commentCountsForRow}
           onOpenRowComments={onOpenRowComments}
           activeNoteId={activeNoteId}
@@ -5487,7 +5498,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             // and the list being renumbered would not be the list on screen.
             const sorted = wasLocked
               ? manualTwlOrder(rowsForVerse)
-              : canonicalTwlOrder(rowsForVerse, ultVerseObjectsFor(verse), twTitles);
+              : canonicalTwlOrder(rowsForVerse, ultVerseObjectsFor(verse), twTitles, ultSourceRefFor(verse));
             const changes = reorderSequential(sorted, draggedId, refId, position);
             for (const { row, sort_order } of changes) {
               enqueueRow("twl", row, { sort_order });

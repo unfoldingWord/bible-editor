@@ -237,6 +237,9 @@ interface Props {
   // ULT alignment changes, not on every render. Null when unavailable → order
   // falls back to sort_order.
   ultVerseObjectsFor?: (verse: number) => unknown[] | null;
+  // The verse as x-ref spells it ("9:11") when the ULT row is a bridge, so the
+  // canonical order reads only that verse's words (#1437). Undefined otherwise.
+  ultSourceRefFor?: (verse: number) => string | undefined;
   // Report the raw (pre-exclusion) suggestions, grouped by verse, up to Shell so
   // it can merge the matcher's candidates onto committed rows (twlRowAlternatives).
   onTwlSuggestions?: (groups: TwlVerseSuggestions[]) => void;
@@ -440,6 +443,7 @@ export function ResourceColumn({
   onAddTwlSuggestion,
   isTwlSuggestionExcluded,
   ultVerseObjectsFor,
+  ultSourceRefFor,
   onTwlSuggestions,
   twlRowAlternatives,
   twlBlockedArticleIds,
@@ -579,9 +583,10 @@ export function ResourceColumn({
   const twlForVerse = useMemo(
     () =>
       groupByVerse(twl.filter((r) => r.verse >= ultStart && r.verse <= ultEnd)).flatMap(
-        ([v, rows]) => twlDisplayOrder(rows, ultVerseObjectsFor?.(v) ?? null, twTitles, lockedTwlVerses.has(v)),
+        ([v, rows]) =>
+          twlDisplayOrder(rows, ultVerseObjectsFor?.(v) ?? null, twTitles, lockedTwlVerses.has(v), ultSourceRefFor?.(v)),
       ),
-    [twl, ultStart, ultEnd, ultVerseObjectsFor, twTitles, lockedTwlVerses],
+    [twl, ultStart, ultEnd, ultVerseObjectsFor, ultSourceRefFor, twTitles, lockedTwlVerses],
   );
 
   // Pinned sections show the whole chapter, grouped by verse. Within each
@@ -613,13 +618,16 @@ export function ResourceColumn({
       pinned.words
         ? groupByVerse(twl).map(
             ([v, rows]) =>
-              [v, twlDisplayOrder(rows, ultVerseObjectsFor?.(v) ?? null, twTitles, lockedTwlVerses.has(v))] as [
+              [
+                v,
+                twlDisplayOrder(rows, ultVerseObjectsFor?.(v) ?? null, twTitles, lockedTwlVerses.has(v), ultSourceRefFor?.(v)),
+              ] as [
                 number,
                 TwlRow[],
               ],
           )
         : null,
-    [pinned.words, twl, ultVerseObjectsFor, twTitles, lockedTwlVerses],
+    [pinned.words, twl, ultVerseObjectsFor, ultSourceRefFor, twTitles, lockedTwlVerses],
   );
 
   // Trashed notes stay visible in `tn`/`tnForVerse` (sorted to the bottom via
@@ -648,10 +656,10 @@ export function ResourceColumn({
     for (const [v, rows] of groupByVerse(twl)) {
       if (!lockedTwlVerses.has(v)) continue;
       if (!pinned.words && (v < ultStart || v > ultEnd)) continue;
-      map.set(v, canonicalTwlOrder(rows, ultVerseObjectsFor?.(v) ?? null, twTitles));
+      map.set(v, canonicalTwlOrder(rows, ultVerseObjectsFor?.(v) ?? null, twTitles, ultSourceRefFor?.(v)));
     }
     return map;
-  }, [twl, lockedTwlVerses, ultVerseObjectsFor, twTitles, pinned.words, ultStart, ultEnd]);
+  }, [twl, lockedTwlVerses, ultVerseObjectsFor, ultSourceRefFor, twTitles, pinned.words, ultStart, ultEnd]);
 
   // Verses currently showing a live "automatic order" preview from the chip
   // strip. Purely visual: swaps which row array a verse's WordsTable renders
