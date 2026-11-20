@@ -749,6 +749,31 @@ console.log("\n[16g. a retry whose guard drops nothing still clears the committe
   ok(hasRow(d.branch, "bb22"), "the unverified third attempt does not drop bb22");
 }
 
+console.log("\n[16h. the committed-drops read fails on an unverified night: the guard still keeps Door43's edit (#1455)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  d.master = editNote(d.master, "bb22", "Second note, fixed on Door43.");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  d.noSize = true;
+  // The first R2 head of the night (keepMasterBase's committed-drops read) fails.
+  const head = t.env.BLOBS.head;
+  let failNext = true;
+  t.env.BLOBS.head = async (key) => {
+    if (failNext && key.endsWith(".d1-render")) {
+      failNext = false;
+      throw new Error("simulated: R2 head failed");
+    }
+    return head(key);
+  };
+  await t.exportOne("export-night-2");
+  t.env.BLOBS.head = head;
+  ok(!failNext, "(setup: the read failed)");
+  ok(noteOf(d.branch, "bb22") === "Second note, fixed on Door43.", "Door43's edit to bb22 is kept, not reverted");
+  ok(noteOf(d.branch, "aa11") === "Translator edit.", "…and the translator's edit ships");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
