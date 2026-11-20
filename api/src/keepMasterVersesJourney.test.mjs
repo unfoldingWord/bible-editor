@@ -428,6 +428,99 @@ console.log("\n[12. a refused push still records the alignment backstop's findin
   ok(t.live(`export_align_shrink:${BOOK}:ult`).length === 1, "the lost-alignment alert for D1's render is still recorded");
 }
 
+console.log("\n[13. a refused night with translator-scale alignment loss does not say the book shipped (#1434)]");
+{
+  // D1 holds 1:5 with ONE word unaligned (translator-scale: alerts, would not
+  // block on its own); Door43 aligns it AND bridges 1:2-3 (cannot place).
+  const s5 = verseSpan(DOOR43_OBA, 5);
+  const v5 = DOOR43_OBA.slice(s5.start, s5.end);
+  const oneOff = v5.replace(/\\zaln-s \|[^\\]*\\\*/, "").replace(/\\zaln-e\\\*/, "");
+  const d = door43();
+  const t = freshEnv(DOOR43_OBA.slice(0, s5.start) + oneOff + DOOR43_OBA.slice(s5.end));
+  await confirmedNight1(t, d);
+  const m5 = verseSpan(d.master, 5);
+  d.master = d.master.slice(0, m5.start) + v5 + d.master.slice(m5.end);
+  const s3 = verseSpan(d.master, 3);
+  d.master = (d.master.slice(0, s3.start) + d.master.slice(s3.start).replace(/^\\v 3\s*/, "")).replace(/\\v 2(?=\s)/, "\\v 2-3");
+  const logs = [];
+  const origLog = console.log;
+  console.log = (...a) => {
+    logs.push(a.join(" "));
+    origLog(...a);
+  };
+  let r;
+  try {
+    r = await t.exportOne("export-night-2");
+  } finally {
+    console.log = origLog;
+  }
+  ok(String(r.dcsSkippedReason).startsWith("master_moved_guard:"), `refused (got ${r.dcsSkippedReason})`);
+  ok(d.writes.length === 0, "nothing committed");
+  const align = t.live(`export_align_shrink:${BOOK}:ult`);
+  ok(align.length === 1, `the lost-alignment alert is recorded (${align.length})`);
+  ok(align[0] && !align[0].message.includes("BLOCKED"), `(setup: the loss is translator-scale, not blocking: ${align[0]?.message})`);
+  ok(align[0] && !/shipped|is on Door43/.test(align[0].message), `the alert does not say the book shipped (${align[0]?.message})`);
+  ok(align[0] && align[0].message.includes("not pushed"), `the alert says it was not pushed (${align[0]?.message})`);
+  ok(!logs.some((l) => l.includes("shipping")), `no "shipping" log line (${logs.filter((l) => l.includes("shipping")).join(" | ")})`);
+
+  console.log("\n[13b. the next export that measures alignment clean clears that banner (#1434 A2)]");
+  d.master = await t.render("n3pre"); // Door43 takes Bible Editor's text: nothing lost, nothing moved
+  await t.exportOne("export-night-3");
+  ok(t.live(`export_align_shrink:${BOOK}:ult`).length === 0, "the lost-alignment banner is cleared");
+}
+
+console.log("\n[14. refused night N, guard not measured on night N+1 that ships → the refusal alert STAYS (#1434)]");
+{
+  // A not-measured night ships D1's unspliced render, which can carry the
+  // very verses the refusal warned about: an absent measurement is not a
+  // clean one, so the warning must outlive it.
+  const d = door43();
+  const t = freshEnv();
+  await confirmedNight1(t, d);
+  const s3 = verseSpan(d.master, 3);
+  d.master = (d.master.slice(0, s3.start) + d.master.slice(s3.start).replace(/^\\v 3\s*/, "")).replace(/\\v 2(?=\s)/, "\\v 2-3");
+  const n2 = await t.exportOne("export-night-2");
+  ok(String(n2.dcsSkippedReason).startsWith("master_moved_guard:"), `night N refused (got ${n2.dcsSkippedReason})`);
+  ok(t.live(`export_master_moved:${BOOK}:ult`).length === 1, "night N records the refusal alert");
+  // Night N+1: the base push's render is gone from R2, so the guard cannot
+  // measure and the export ships as before.
+  ok(t.r2.delete(`exports/export-night-1/${BOOK}/ult/${FILE}`), "(setup: base render removed)");
+  t.editD1(4, "eagle", "hawk");
+  const logs3 = [];
+  const origLog3 = console.log;
+  console.log = (...a) => {
+    logs3.push(a.join(" "));
+    origLog3(...a);
+  };
+  let n3;
+  try {
+    n3 = await t.exportOne("export-night-3");
+  } finally {
+    console.log = origLog3;
+  }
+  ok(logs3.some((l) => l.includes("keep-master guard not measured")), "(setup: night N+1's verse guard did not measure)");
+  ok(d.writes.length === 1 && n3.dcsSkippedReason == null, `night N+1 ships (got ${n3.dcsSkippedReason}, writes ${d.writes.length})`);
+  ok(t.live(`export_master_moved:${BOOK}:ult`).length === 1, "the refusal alert stays");
+}
+
+console.log("\n[14b. refused night N, guard measures and does not refuse on night N+1 → the refusal alert clears (#1434)]");
+{
+  const d = door43();
+  const t = freshEnv();
+  await confirmedNight1(t, d);
+  const confirmed = d.master;
+  const s3 = verseSpan(d.master, 3);
+  d.master = (d.master.slice(0, s3.start) + d.master.slice(s3.start).replace(/^\\v 3\s*/, "")).replace(/\\v 2(?=\s)/, "\\v 2-3");
+  const n2 = await t.exportOne("export-night-2");
+  ok(String(n2.dcsSkippedReason).startsWith("master_moved_guard:"), `night N refused (got ${n2.dcsSkippedReason})`);
+  ok(t.live(`export_master_moved:${BOOK}:ult`).length === 1, "night N records the refusal alert");
+  // Door43 undoes the bridge; the guard measures and finds nothing to refuse.
+  d.master = confirmed;
+  const n3 = await t.exportOne("export-night-3");
+  ok(n3.dcsSkippedReason === "unchanged", `night N+1 ships (got ${n3.dcsSkippedReason})`);
+  ok(t.live(`export_master_moved:${BOOK}:ult`).length === 0, "the refusal alert is cleared");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);

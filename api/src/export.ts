@@ -2720,12 +2720,18 @@ export function buildAlignmentShrinkAlertMessage(args: {
   // wording it as "BLOCKED" when nothing was blocked would be its own
   // unmeasured claim.
   blocking: boolean;
+  // True when another guard (the keep-master verse refusal, #1412) already
+  // stopped tonight's push before this loss was judged. A non-blocking alert
+  // must then not claim the book shipped (#1434).
+  notPushed?: boolean;
 }): string {
-  const { label, book, resource, detail, offenders, provenance, blocking } = args;
+  const { label, book, resource, detail, offenders, provenance, blocking, notPushed = false } = args;
   const classification = classifyAlignmentShrinkOffenders(offenders);
   const head = blocking
     ? `Benjamin fix this — nightly export BLOCKED ${label}: `
-    : `${label} shipped to Door43, but with alignment to fix: `;
+    : notPushed
+      ? `${label} was not pushed to Door43 by the export that found this, for another reason (see its own alert), and also has alignment to fix: `
+      : `${label} shipped to Door43, but with alignment to fix: `;
 
   if (classification.kind === "none") {
     return (
@@ -2801,7 +2807,9 @@ export function buildAlignmentShrinkAlertMessage(args: {
   }
   const tail = blocking
     ? ""
-    : ` Nothing is held up — the book is on Door43 and the affected verses show the broken-link icon in the editor.`;
+    : notPushed
+      ? ` This alignment loss alone would not hold the book back; the affected verses show the broken-link icon in the editor.`
+      : ` Nothing is held up — the book is on Door43 and the affected verses show the broken-link icon in the editor.`;
   return `${head}${parts.join(" SEPARATELY, ")}${tail}`;
 }
 

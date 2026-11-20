@@ -1470,8 +1470,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         if (masterMovedVerseGuardRefuses(plan)) {
           await this.recordMasterMovedVerseRefusal(book, resource, plan);
           // Nothing ships, but the alignment backstop's measurement of D1's
-          // render still clears or records its alert (review A4).
-          if (alignGuard) await this.reportAlignmentVerdict(book, resource, alignGuard);
+          // render still clears or records its alert (review A4), worded as
+          // not pushed (#1434).
+          if (alignGuard) await this.reportAlignmentVerdict(book, resource, alignGuard, { pushed: false });
           const reason = `master_moved_guard:${plan.kept.length}_kept_${plan.cannotPlace.length}_cannot_place`;
           await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
           return {
@@ -1488,7 +1489,13 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             prReason: null,
           };
         }
-        await this.clearExportAlert(`export_master_moved:${book}:${resource}`);
+        // The ONLY place a refusal alert clears: the guard measured and did
+        // not refuse. A not-measured night ships D1's unspliced render, which
+        // can carry the very verses the alert warned about, so it must not
+        // clear it (#1434). Not from an operator's override branch either:
+        // the refusal is about the nightly branch, which that run does not
+        // touch (#1434 A1).
+        if (branchOverride == null) await this.clearExportAlert(`export_master_moved:${book}:${resource}`);
         if (plan.unspliced.length > 0) {
           console.log(
             `export: found ${plan.unspliced.length} ${book} ${resource} verse(s) Door43 changed and Bible Editor did not ` +
@@ -1618,7 +1625,6 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       }
       dcsCommitSha = commit.commitSha || null;
       dcsChanged = commit.changed;
-
       // ONE write for two facts about this (book, resource), because both are
       // established by the same commitToDcs call and land on the same row:
       //
@@ -3069,6 +3075,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     book: string,
     resource: Resource,
     guard: { ok: boolean; detail: string; offenders?: AlignmentShrinkResult["offenders"] },
+    // pushed:false: another guard already refused tonight's push, so the
+    // alert and log must not say the book ships (#1434).
+    { pushed = true }: { pushed?: boolean } = {},
   ): Promise<{ block: boolean; reason: string } | null> {
     if (guard.ok && guard.detail === "ok") {
       // Checked this book+resource against master and found no alignment
@@ -3077,11 +3086,19 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // `guard.ok`) excludes "no_file" (the book has no ult/ust file at
       // all, so nothing was actually checked) from counting as clean.
       await this.clearAlignmentAttention(book, resource);
+      // The banner too: it was only ever replaced by the next night that
+      // found loss again, so an old one outlived the loss it named (#1434 A2).
+      await this.clearExportAlert(`export_align_shrink:${book}:${resource}`);
     }
     if (guard.ok) return null;
     const severity = classifyAlignmentLossSeverity(guard.offenders ?? []);
-    await this.recordAlignmentShrinkSkipAlert(book, resource, guard.detail, guard.offenders ?? [], severity.block);
-    if (!severity.block) {
+    await this.recordAlignmentShrinkSkipAlert(book, resource, guard.detail, guard.offenders ?? [], severity.block, !pushed);
+    if (!severity.block && !pushed) {
+      console.log(
+        `export: not pushing ${book} ${resource} tonight (another guard refused it); also found translator-scale ` +
+          `alignment loss (${severity.reason}; ${guard.detail}) — alerted`,
+      );
+    } else if (!severity.block) {
       // A night where the guard found loss and shipped anyway should be
       // visible in the log, not only in a dismissible banner.
       console.log(
@@ -3147,6 +3164,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     detail: string,
     offenders: AlignmentShrinkResult["offenders"],
     blocking: boolean,
+    notPushed = false,
   ): Promise<void> {
     const source = `export_align_shrink:${book}:${resource}`;
     const label = `${book} ${resource.toUpperCase()}`;
@@ -3164,6 +3182,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       offenders,
       provenance,
       blocking,
+      notPushed,
     });
     await this.writeAlert(
       source,
