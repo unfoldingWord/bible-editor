@@ -90,6 +90,14 @@ export function d1RenderKey(r2Key: string): string {
   return `${r2Key}.d1-render`;
 }
 
+// Longest id list the d1-render marker stores, per key (droppedids,
+// committedids). Two lists plus the shas, the mode and basekey (an r2Key,
+// under 100 characters) stay under R2's 2 KB of custom metadata. A longer
+// list is left off, never cut: the marker then protects nothing, as before
+// #1452. At most MASTER_MOVED_REFUSE_THRESHOLD (20) ids of 4 characters reach
+// it, so a list is at most 99 characters in practice.
+const MARKER_IDS_CAP = 768;
+
 // IDs whose line differs between D1's render and the bytes pushed for it:
 // the rows that push kept from master (#1403 carry mode), plus the rows it
 // left out because Door43 had deleted them (#1415).
@@ -1198,6 +1206,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     let tsvMasterContentForRevertReport: string | null = null;
     let tsvMasterVerified = false;
     let keepMaster: Awaited<ReturnType<ExportWorkflow["masterMovedGuard"]>> | null = null;
+    // The d1-render marker this attempt wrote, put again with committedids
+    // once commitToDcs returns (#1455).
+    let tsvMarker: { body: string; meta: Record<string, string> } | null = null;
     let shrinkRows = built.rowCount;
     if (dcsAllowed && (resource === "tn" || resource === "tq" || resource === "twl")) {
       const master = await this.fetchTsvMaster(book, resource, fresh.masterSha);
@@ -1378,16 +1389,29 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           // At most MASTER_MOVED_REFUSE_THRESHOLD ids reach this line.
           const pushedSha = await gitBlobSha(built.content);
           const droppedIds = plan.dropped.map((r) => encodeURIComponent(r.id)).join(",");
+          const markerMeta: Record<string, string> = {
+            pushedsha: pushedSha,
+            basesha: guard.baseBlobSha,
+            basemode: guard.mode,
+            // Which push the base is, not just its bytes: an overlapping
+            // instance can record a push with the same sha (#1455).
+            ...(guard.baseR2Key ? { basekey: guard.baseR2Key } : {}),
+            ...(droppedIds.length > 0 && droppedIds.length <= MARKER_IDS_CAP ? { droppedids: droppedIds } : {}),
+          };
+          // committedids: the rows this instance's last successful commit
+          // left off the branch (#1455), set only after commitToDcs returns.
+          // The branch has not changed yet, so a retry carries the previous
+          // marker's list over unchanged, on the same base push only.
+          const prev = (await this.env.BLOBS.head(d1RenderKey(r2Key)))?.customMetadata;
+          if (prev?.committedids && prev.basesha === markerMeta.basesha && prev.basekey === markerMeta.basekey) {
+            markerMeta.committedids = prev.committedids;
+          }
           await this.env.BLOBS.put(d1RenderKey(r2Key), d1Render, {
             httpMetadata: { contentType: "text/tab-separated-values" },
             // Lowercase keys: R2 metadata travels as HTTP headers in some paths.
-            customMetadata: {
-              pushedsha: pushedSha,
-              basesha: guard.baseBlobSha,
-              basemode: guard.mode,
-              ...(droppedIds.length > 0 && droppedIds.length <= 1024 ? { droppedids: droppedIds } : {}),
-            },
+            customMetadata: markerMeta,
           });
+          tsvMarker = { body: d1Render, meta: markerMeta };
           // The R2 copy at r2Key must hold the bytes that ship: it is the
           // pushed render the next export and the sync read back by hash.
           await this.env.BLOBS.put(r2Key, built.content, {
@@ -1704,6 +1728,43 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       };
       const message = `bible-editor export: ${book} ${resource} → ${branch} (${instanceId})`;
       const commit = await commitToDcs(dcsCfg, filename, built.content, message);
+      // The branch now holds this render. If the step dies before
+      // recordPushedRender, pushed_r2_key still names an older push, so a
+      // retry is not seen as one; the marker's committedids tell it which
+      // rows this commit left off (#1455). Exactly this attempt's drops: none
+      // when it dropped nothing, so a commit that shipped a row back clears
+      // it. Also when the commit changed nothing: master then equals this
+      // render, so those rows are off master too. Best-effort: when this
+      // fails, recordPushedRender below still makes the next attempt a
+      // retry, which reads droppedids instead (#1452).
+      if (resource === "tn" || resource === "tq" || resource === "twl") {
+        try {
+          let marker = tsvMarker;
+          if (marker == null) {
+            // No marker written this attempt: only an earlier attempt's
+            // committedids need clearing, and the body is needed to put it.
+            const prev = await this.env.BLOBS.head(d1RenderKey(r2Key));
+            if (prev?.customMetadata?.committedids) {
+              const obj = await this.env.BLOBS.get(d1RenderKey(r2Key));
+              if (obj != null) marker = { body: await obj.text(), meta: { ...(obj.customMetadata ?? {}) } };
+            }
+          }
+          if (marker != null && (marker.meta.committedids ?? "") !== (tsvMarker?.meta.droppedids ?? "")) {
+            const { committedids: _old, ...meta } = marker.meta;
+            const shipped = tsvMarker?.meta.droppedids;
+            await this.env.BLOBS.put(d1RenderKey(r2Key), marker.body, {
+              httpMetadata: { contentType: "text/tab-separated-values" },
+              customMetadata: shipped ? { ...meta, committedids: shipped } : meta,
+            });
+          }
+        } catch (e) {
+          console.error("export: committed marker write failed", {
+            book,
+            resource,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
       if (alignLossToReport) await this.reportAlignmentVerdict(book, resource, alignLossToReport);
       if (!commit.branchTouched) {
         // Rendered content matches master — nothing to merge. Close any open PR
@@ -3976,7 +4037,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // kept nothing ships as before, the same as that attempt did. When that
   // attempt's push is the one recorded, the retry also keeps out the rows it
   // dropped (the marker's droppedids, #1452), so an unverified master read on
-  // the retry does not put them back.
+  // the retry does not put them back. An attempt that committed but died
+  // before recordPushedRender left the rows that commit dropped in the
+  // marker's committedids instead, and an unverified retry keeps them out
+  // too (#1455).
   private async masterMovedGuard(
     book: string,
     resource: "tn" | "tq" | "twl",
@@ -3988,10 +4052,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // push already left out (#1424; keepMasterBase's droppedKeys).
     masterVerified: boolean,
   ): Promise<
-    | { measured: true; plan: KeepMasterPlan; baseBlobSha: string; mode: "full" | "carry" }
+    | { measured: true; plan: KeepMasterPlan; baseBlobSha: string; baseR2Key: string | null; mode: "full" | "carry" }
     | { measured: false; reason: string }
   > {
-    const base = await this.keepMasterBase(book, resource, r2Key);
+    const base = await this.keepMasterBase(book, resource, r2Key, masterVerified);
     if (!base.ok) return { measured: false, reason: base.reason };
     try {
       const plan = planKeepMasterRows(
@@ -4004,7 +4068,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         base.droppedKeys,
       );
       if (plan == null) return this.keepMasterNotMeasured(book, resource, "unparseable");
-      return { measured: true, plan, baseBlobSha: base.baseBlobSha, mode: base.mode };
+      return { measured: true, plan, baseBlobSha: base.baseBlobSha, baseR2Key: base.baseR2Key, mode: base.mode };
     } catch (e) {
       return this.keepMasterFailed(book, resource, e);
     }
@@ -4022,7 +4086,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     | { measured: true; plan: KeepMasterVersePlan; baseBlobSha: string; mode: "full" | "carry" }
     | { measured: false; reason: string }
   > {
-    const base = await this.keepMasterBase(book, resource, r2Key);
+    const base = await this.keepMasterBase(book, resource, r2Key, masterVerified);
     if (!base.ok) return { measured: false, reason: base.reason };
     try {
       const plan = planKeepMasterVerses(rendered, base.baseText, masterUsfm, base.onlyKeys, masterVerified);
@@ -4054,6 +4118,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     book: string,
     resource: Resource,
     r2Key: string,
+    masterVerified: boolean,
   ): Promise<
     | {
         ok: true;
@@ -4063,6 +4128,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         // null when it dropped none or its pushed bytes could not be read.
         droppedKeys: Set<string> | null;
         baseBlobSha: string;
+        baseR2Key: string | null;
         mode: "full" | "carry";
       }
     | { ok: false; reason: string }
@@ -4124,6 +4190,28 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           .first<{ hit: number }>();
         if (hit != null) mode = "full";
       }
+      // An earlier attempt of this instance that committed but died before
+      // recordPushedRender (#1455): pushed_* still names the base it measured
+      // against, so the base and mode here are its own; only the rows its
+      // last commit left off (committedids) need carrying. Read only when it
+      // matters: a verified master read drops
+      // them again on its own, and ULT/UST drop nothing.
+      // A failed read means no committed drops, not an unmeasured guard: the
+      // guard must still keep Door43's edits on this attempt.
+      if (!retry && !masterVerified && resource !== "ult" && resource !== "ust") {
+        try {
+          const meta = (await this.env.BLOBS.head(d1RenderKey(r2Key)))?.customMetadata;
+          if (meta?.committedids && meta.basesha === pointer.blobSha && meta.basekey != null && meta.basekey === pointer.r2Key) {
+            ownDropped = meta.committedids.split(",").map((id) => decodeURIComponent(id));
+          }
+        } catch (e) {
+          console.error("export: committed-drops marker read failed; none carried", {
+            book,
+            resource,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
       // D1's render for the base push, when that push kept rows.
       let d1Base: string | null = null;
       if (pointer.r2Key) {
@@ -4159,7 +4247,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // base and master still lacks it.
       if (ownDropped.length > 0 && !isVerse) droppedKeys = new Set([...(droppedKeys ?? []), ...ownDropped]);
       if (baseText == null) return notMeasured("base_unreadable");
-      return { ok: true, baseText, onlyKeys, droppedKeys, baseBlobSha: pointer.blobSha, mode };
+      return { ok: true, baseText, onlyKeys, droppedKeys, baseBlobSha: pointer.blobSha, baseR2Key: pointer.r2Key, mode };
     } catch (e) {
       return { ok: false, ...this.keepMasterFailed(book, resource, e) };
     }

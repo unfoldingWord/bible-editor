@@ -173,7 +173,7 @@ function freshEnv(rows) {
     await exportOne(`dry-${tag}`, false);
     return r2.get(`exports/dry-${tag}/${BOOK}/tn/${FILE}`).body;
   };
-  return { sqlite, env, r2, exportOne, live, reverts, render };
+  return { sqlite, env, r2, wf, exportOne, live, reverts, render };
 }
 
 // Replace one row's Note in a rendered TSV (a person editing Door43).
@@ -584,6 +584,215 @@ console.log("\n[15. a step.do retry whose master read is unverified keeps its fi
   t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator restored it.' WHERE id = 'bb22'`).run();
   await t.exportOne("export-night-2");
   ok(noteOf(d.branch, "bb22") === "Translator restored it.", "the edited row is committed on the retry");
+}
+
+console.log("\n[16. an attempt that committed but died before recording its push: the unverified retry keeps its drop (#1455)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  d.master = deleteRow(d.master, "bb22");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  // Attempt 1 (verified): drops bb22 and commits, then the step dies before
+  // recordPushedRender, so pushed_r2_key still names night 1's push.
+  const record = t.wf.recordPushedRender;
+  t.wf.recordPushedRender = async () => {
+    throw new Error("simulated: the step died after the commit");
+  };
+  let threw = false;
+  try {
+    await t.exportOne("export-night-2");
+  } catch {
+    threw = true;
+  }
+  t.wf.recordPushedRender = record;
+  ok(
+    threw && !hasRow(d.branch, "bb22") && noteOf(d.branch, "aa11") === "Translator edit.",
+    "(setup: attempt 1 committed without bb22, then threw before recording its push)",
+  );
+  d.noSize = true; // the retry's master read cannot be proven complete
+  await t.exportOne("export-night-2");
+  ok(!hasRow(d.branch, "bb22"), "the unverified retry does not add bb22 back");
+  ok(!hasRow(t.r2.get(`exports/export-night-2/${BOOK}/tn/${FILE}`).body, "bb22"), "the retry's R2 render leaves bb22 out");
+  ok(noteOf(d.branch, "aa11") === "Translator edit.", "…and the translator's edit still ships");
+
+  console.log("\n[16a. a further unverified retry (the push now recorded) still leaves it out]");
+  await t.exportOne("export-night-2");
+  ok(!hasRow(d.branch, "bb22"), "the third attempt does not add bb22 back");
+
+  console.log("\n[16b. a translator edits bb22 before another retry → it ships]");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator restored it.' WHERE id = 'bb22'`).run();
+  await t.exportOne("export-night-2");
+  ok(noteOf(d.branch, "bb22") === "Translator restored it.", "the edited row is committed on the retry");
+}
+
+// Runs `run` with ExportWorkflow method `name` throwing; true when it threw.
+async function failOnce(t, name, run) {
+  const real = t.wf[name];
+  t.wf[name] = async () => {
+    throw new Error(`simulated: ${name} failed`);
+  };
+  try {
+    await run();
+    return false;
+  } catch {
+    return true;
+  } finally {
+    t.wf[name] = real;
+  }
+}
+
+console.log("\n[16c. the retry dies before its own commit: a third, unverified attempt still keeps the drop (#1455)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  d.master = deleteRow(d.master, "bb22");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  // Attempt 1 (verified) commits without bb22, then dies before recording it.
+  const a1 = await failOnce(t, "recordPushedRender", () => t.exportOne("export-night-2"));
+  d.noSize = true;
+  // Attempt 2 (unverified) re-writes the marker, then dies before committing.
+  const a2 = await failOnce(t, "recordKeptMasterRows", () => t.exportOne("export-night-2"));
+  ok(
+    a1 && a2 && d.writes.length === 1 && !hasRow(d.branch, "bb22") && noteOf(d.branch, "aa11") === "Translator edit.",
+    "(setup: attempt 1 committed without bb22; both attempts threw)",
+  );
+  await t.exportOne("export-night-2");
+  ok(!hasRow(d.branch, "bb22"), "the third attempt does not add bb22 back");
+  ok(!hasRow(t.r2.get(`exports/export-night-2/${BOOK}/tn/${FILE}`).body, "bb22"), "its R2 render leaves bb22 out");
+}
+
+console.log("\n[16d. the retry drops MORE than the committed attempt, then dies before its commit (#1455)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  d.master = deleteRow(d.master, "bb22");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  // Attempt 1 (verified) commits without bb22, then dies before recording it.
+  const a1 = await failOnce(t, "recordPushedRender", () => t.exportOne("export-night-2"));
+  // Door43 then deletes cc33 too; attempt 2 (verified) drops both, then dies
+  // before its own commit.
+  d.master = deleteRow(d.master, "cc33");
+  const a2 = await failOnce(t, "recordKeptMasterRows", () => t.exportOne("export-night-2"));
+  ok(
+    a1 && a2 && d.writes.length === 1 && !hasRow(d.branch, "bb22") && hasRow(d.branch, "cc33"),
+    "(setup: the branch lacks bb22 only; both attempts threw)",
+  );
+  d.noSize = true;
+  await t.exportOne("export-night-2");
+  ok(!hasRow(d.branch, "bb22"), "the unverified third attempt does not add bb22 back");
+  ok(!hasRow(t.r2.get(`exports/export-night-2/${BOOK}/tn/${FILE}`).body, "bb22"), "its R2 render leaves bb22 out");
+  ok(noteOf(d.branch, "aa11") === "Translator edit.", "…and the translator's edit still ships");
+}
+
+console.log("\n[16e. a drop the retry only planned (it died before committing) is not treated as committed (#1455)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  d.master = deleteRow(d.master, "bb22");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  // Attempt 1 (verified) commits without bb22, then dies before recording it.
+  const a1 = await failOnce(t, "recordPushedRender", () => t.exportOne("export-night-2"));
+  // Attempt 2 (verified) also plans to drop cc33, then dies before committing.
+  d.master = deleteRow(d.master, "cc33");
+  const a2 = await failOnce(t, "recordKeptMasterRows", () => t.exportOne("export-night-2"));
+  ok(a1 && a2 && d.writes.length === 1 && hasRow(d.branch, "cc33"), "(setup: only attempt 1 committed; the branch has cc33)");
+  d.noSize = true;
+  await t.exportOne("export-night-2");
+  ok(!hasRow(d.branch, "bb22"), "the unverified third attempt keeps bb22 off");
+  ok(hasRow(d.branch, "cc33"), "…and does not drop cc33, which no commit left out");
+}
+
+console.log("\n[16f. a later commit that shipped the row back clears it from the committed drops (#1455)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  const n1Master = d.master;
+  d.master = deleteRow(n1Master, "bb22");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  // Attempt 1 (verified) commits without bb22, then dies before recording it.
+  const a1 = await failOnce(t, "recordPushedRender", () => t.exportOne("export-night-2"));
+  // Door43 puts bb22 back and deletes cc33. Attempt 2 (verified) ships bb22,
+  // drops cc33, commits, and dies before recording it.
+  d.master = deleteRow(n1Master, "cc33");
+  const a2 = await failOnce(t, "recordPushedRender", () => t.exportOne("export-night-2"));
+  ok(a1 && a2 && d.writes.length === 2 && hasRow(d.branch, "bb22") && !hasRow(d.branch, "cc33"), "(setup: attempt 2 committed bb22 back, cc33 off)");
+  // Attempt 3 reads master unverified and short of bb22.
+  d.master = deleteRow(d.master, "bb22");
+  d.noSize = true;
+  await t.exportOne("export-night-2");
+  ok(hasRow(d.branch, "bb22"), "the unverified third attempt does not drop bb22, which the last commit shipped");
+  ok(!hasRow(d.branch, "cc33"), "…and keeps cc33 off");
+}
+
+console.log("\n[16g. a retry whose guard drops nothing still clears the committed drops its commit undid (#1455)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  const n1Master = d.master;
+  d.master = deleteRow(n1Master, "bb22");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  const a1 = await failOnce(t, "recordPushedRender", () => t.exportOne("export-night-2"));
+  // Door43 puts bb22 back; attempt 2 (verified) keeps and drops nothing,
+  // commits bb22 back, and dies before recording it.
+  d.master = n1Master;
+  const a2 = await failOnce(t, "recordPushedRender", () => t.exportOne("export-night-2"));
+  ok(a1 && a2 && d.writes.length === 2 && hasRow(d.branch, "bb22"), "(setup: attempt 2 committed bb22 back)");
+  d.master = deleteRow(n1Master, "bb22");
+  d.noSize = true;
+  await t.exportOne("export-night-2");
+  ok(hasRow(d.branch, "bb22"), "the unverified third attempt does not drop bb22");
+}
+
+console.log("\n[16h. the committed-drops read fails on an unverified night: the guard still keeps Door43's edit (#1455)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  d.master = editNote(d.master, "bb22", "Second note, fixed on Door43.");
+  t.sqlite.prepare(`UPDATE tn_rows SET note = 'Translator edit.' WHERE id = 'aa11'`).run();
+  d.noSize = true;
+  // The first R2 head of the night (keepMasterBase's committed-drops read) fails.
+  const head = t.env.BLOBS.head;
+  let failNext = true;
+  t.env.BLOBS.head = async (key) => {
+    if (failNext && key.endsWith(".d1-render")) {
+      failNext = false;
+      throw new Error("simulated: R2 head failed");
+    }
+    return head(key);
+  };
+  await t.exportOne("export-night-2");
+  t.env.BLOBS.head = head;
+  ok(!failNext, "(setup: the read failed)");
+  ok(noteOf(d.branch, "bb22") === "Second note, fixed on Door43.", "Door43's edit to bb22 is kept, not reverted");
+  ok(noteOf(d.branch, "aa11") === "Translator edit.", "…and the translator's edit ships");
+}
+
+console.log("\n[16i. an overlapping instance records a push with the same bytes as the base: stale committed drops are not trusted (#1455)]");
+{
+  const d = door43();
+  const t = freshEnv(ROWS);
+  await confirmedNight1(t, d);
+  const n1Master = d.master;
+  d.master = deleteRow(n1Master, "bb22");
+  // Instance A (verified) drops bb22, commits, dies before recording it.
+  const a1 = await failOnce(t, "recordPushedRender", () => t.exportOne("export-night-2"));
+  // Door43 puts bb22 back; overlapping instance B ships night 1's bytes again
+  // and records that push.
+  d.master = n1Master;
+  await t.exportOne("export-manual-b");
+  // A's retry reads master unverified and short of bb22.
+  d.master = deleteRow(n1Master, "bb22");
+  d.noSize = true;
+  await t.exportOne("export-night-2");
+  ok(a1, "(setup: instance A threw after its commit)");
+  ok(hasRow(t.r2.get(`exports/export-night-2/${BOOK}/tn/${FILE}`).body, "bb22"), "A's retry does not drop bb22 on B's push");
 }
 
 if (failed > 0) {
