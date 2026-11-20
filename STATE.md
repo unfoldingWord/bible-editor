@@ -416,8 +416,14 @@ Highlights that bite repeatedly:
   a tq/twl row's create and deletes its old updates, so `reconstructTsvBases` drops a tq fold's entries before any
   prev/new version gap the sweep could have made. That works because every tq version bump is a logged write
   (measured 2026-11-20: 0 chain breaks across all 37 tq books). Not every logged bump is content: a flag-only merge
-  write bumps the version too, so once swept it reads as a gap (a false merge_no_base, the safe failure). twl
-  versions are not evidence:
+  write bumps the version too, so once swept it reads as a gap (a false merge_no_base, the safe failure). A gap
+  counts only when its missing entries must sit at or below the export boundary (the next surviving entry is below
+  it, or the boundary was read after the 180-day horizon); under a boundary frozen past the horizon (locked books,
+  stuck exports) a gap reaching above it is ambiguous and keeps the old fold. Once a gap is counted the row has no
+  ancestor, for good, for every field no later entry carries (the create is never swept), so later Door43 changes
+  to that field always keep D1 and flag. A writer that bumps the version in one batch and logs in a separate one
+  (prune, pristine/reseed/resurrect, edited-merge batches) would leave a real unlogged bump if the second batch
+  failed; prod had 0 chain breaks on 2026-11-20. twl versions are not evidence:
   `twlSortOrderApply` bumped them on pure reorders without an edit_log row from 3005039 (2026-07-13) until #687
   (2026-09-03), so about half of JER's create-only twl rows sit above version 1 with nothing deleted. twl keeps the
   stale-create hazard until someone picks a different signal.
