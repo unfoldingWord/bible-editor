@@ -4188,10 +4188,20 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // last commit left off (committedids) need carrying. Read only when it
       // matters: a verified master read drops
       // them again on its own, and ULT/UST drop nothing.
+      // A failed read means no committed drops, not an unmeasured guard: the
+      // guard must still keep Door43's edits on this attempt.
       if (!retry && !masterVerified && resource !== "ult" && resource !== "ust") {
-        const meta = (await this.env.BLOBS.head(d1RenderKey(r2Key)))?.customMetadata;
-        if (meta?.committedids && meta.basesha === pointer.blobSha) {
-          ownDropped = meta.committedids.split(",").map((id) => decodeURIComponent(id));
+        try {
+          const meta = (await this.env.BLOBS.head(d1RenderKey(r2Key)))?.customMetadata;
+          if (meta?.committedids && meta.basesha === pointer.blobSha) {
+            ownDropped = meta.committedids.split(",").map((id) => decodeURIComponent(id));
+          }
+        } catch (e) {
+          console.error("export: committed-drops marker read failed; none carried", {
+            book,
+            resource,
+            error: e instanceof Error ? e.message : String(e),
+          });
         }
       }
       // D1's render for the base push, when that push kept rows.
