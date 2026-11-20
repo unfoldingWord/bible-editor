@@ -112,16 +112,25 @@ function anchorInto(base: string[], order: string[], others: Set<string>): strin
   return target;
 }
 
-export function planVerseSortOrders(
+interface VerseTarget {
+  chapter: number;
+  verse: number;
+  /** D1's live rows in the export's order. */
+  local: LiveOrderRow[];
+  /** The order the verse should have (steps 1 and 2 above). */
+  target: string[];
+  localOwned: boolean;
+}
+
+// Steps 1 and 2 for every verse master's file carries. Shared by the plan
+// and by the nightly chapter gate (orderChangedChapters), so the two cannot
+// disagree about which verses master's order would move.
+function verseTargets(
   kind: "tn" | "tq",
   incoming: IncomingOrderRow[],
   live: LiveOrderRow[],
   confirmedAt: number | null,
-): VerseOrderPlan {
-  const planned = new Map<string, number>();
-  let localOwnedVerses = 0;
-  let renumberedVerses = 0;
-
+): VerseTarget[] {
   // Master's ids per verse, in file order (a duplicated id keeps its first slot).
   const masterByVerse = new Map<string, { chapter: number; verse: number; ids: string[] }>();
   for (const r of incoming) {
@@ -138,22 +147,64 @@ export function planVerseSortOrders(
     v.push(r);
   }
 
+  const out: VerseTarget[] = [];
   for (const [k, { chapter, verse, ids: masterIds }] of masterByVerse) {
     const local = (liveByVerse.get(k) ?? []).slice().sort(compareLive);
     const localIds = local.map((r) => r.id);
     const localSet = new Set(localIds);
     const masterSet = new Set(masterIds);
 
-    let target: string[];
-    if (kind === "tn" && local.some((r) => isPendingUserChange(r, confirmedAt))) {
-      localOwnedVerses++;
-      // D1's order; rows entering from master go after their master predecessor.
-      target = anchorInto(localIds, masterIds, new Set(masterIds.filter((id) => !localSet.has(id))));
-    } else {
-      // Master's order; D1-only rows stay after the row they follow in D1.
-      target = anchorInto(masterIds, localIds, new Set(localIds.filter((id) => !masterSet.has(id))));
-    }
+    const localOwned = kind === "tn" && local.some((r) => isPendingUserChange(r, confirmedAt));
+    const target = localOwned
+      ? // D1's order; rows entering from master go after their master predecessor.
+        anchorInto(localIds, masterIds, new Set(masterIds.filter((id) => !localSet.has(id))))
+      : // Master's order; D1-only rows stay after the row they follow in D1.
+        anchorInto(masterIds, localIds, new Set(localIds.filter((id) => !masterSet.has(id))));
+    out.push({ chapter, verse, local, target, localOwned });
+  }
+  return out;
+}
 
+/**
+ * Chapters where master's file would move a row D1 already holds in that
+ * verse (issue #1411). The nightly chapter gate compares content only, so a
+ * chapter whose only Door43 change is note order was never applied. Only an
+ * ORDER difference counts: a verse already in the target order is not flagged
+ * even when its numbers are NULL or on an odd scale, so a chapter with no
+ * order change is never rewritten for its numbering alone. A verse a person
+ * reordered (or otherwise changed) in-app since the last confirmed export
+ * keeps D1's order, exactly as in planVerseSortOrders, so it does not flag
+ * its chapter either. Rows entering from master or leaving it are content
+ * changes the gate already catches.
+ */
+export function orderChangedChapters(
+  kind: "tn" | "tq",
+  incoming: IncomingOrderRow[],
+  live: LiveOrderRow[],
+  confirmedAt: number | null,
+): Set<number> {
+  const changed = new Set<number>();
+  for (const { chapter, local, target } of verseTargets(kind, incoming, live, confirmedAt)) {
+    if (changed.has(chapter)) continue;
+    const localSet = new Set(local.map((r) => r.id));
+    const want = target.filter((id) => localSet.has(id));
+    if (want.some((id, i) => id !== local[i].id)) changed.add(chapter);
+  }
+  return changed;
+}
+
+export function planVerseSortOrders(
+  kind: "tn" | "tq",
+  incoming: IncomingOrderRow[],
+  live: LiveOrderRow[],
+  confirmedAt: number | null,
+): VerseOrderPlan {
+  const planned = new Map<string, number>();
+  let localOwnedVerses = 0;
+  let renumberedVerses = 0;
+
+  for (const { chapter, verse, local, target, localOwned } of verseTargets(kind, incoming, live, confirmedAt)) {
+    if (localOwned) localOwnedVerses++;
     const numbers = keepNumbers(target, new Map(local.map((r) => [r.id, r.sort_order])));
     const key = (id: string) => verseOrderKey(id, chapter, verse);
     if (numbers) {
