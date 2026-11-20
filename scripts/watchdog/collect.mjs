@@ -263,7 +263,9 @@ for (const g of erc && revertMeta ? erc.groupRevertAlerts(revertMeta) : []) {
       `SELECT ref, detected_at${hasProbablyOurs ? ", probably_ours" : ""} FROM export_reverts WHERE ${pair} ORDER BY id`,
     );
     const [generation] = q(`SELECT generation, observed_at FROM export_revert_generations WHERE ${pair}`);
-    const [sync] = q(`SELECT pushed_blob_sha, prev_pushed_blob_sha, unconfirmed_renders_json FROM book_resource_syncs WHERE ${pair}`);
+    const [sync] = q(
+      `SELECT pushed_blob_sha, prev_pushed_blob_sha, unconfirmed_renders_json, source_sha, origin FROM book_resource_syncs WHERE ${pair}`,
+    );
     const snapshot = erc.snapshotStatus({
       alert: anchor,
       book,
@@ -282,6 +284,11 @@ for (const g of erc && revertMeta ? erc.groupRevertAlerts(revertMeta) : []) {
         snapshot,
         knownRenders: erc.knownRenderShas(sync ?? null),
         pushedBlobSha: sync?.pushed_blob_sha ?? null,
+        // #1419: the commit D1 last imported, the base when the previous
+        // export is not our render; it clears only rows the export labelled
+        // probably ours.
+        importedSha: sync?.origin === "reimport" ? (sync.source_sha ?? null) : null,
+        probablyOursRefs: new Set(rows.filter((r) => r.probably_ours === 1).map((r) => r.ref)),
       },
       process.env.DOOR43_TOKEN,
     );

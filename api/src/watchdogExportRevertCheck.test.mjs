@@ -9,10 +9,12 @@ import {
   classifyExportRevertRefs,
   fetchFileAt,
   groupRevertAlerts,
+  importBaseSha,
   isOurExportSubject,
   knownRenderShas,
   pickExportCommits,
   renderPinStatus,
+  restrictFalseToProbablyOurs,
   revertSummaryLines,
   snapshotStatus,
   splitResults,
@@ -460,6 +462,32 @@ assert(!isOurExportSubject("bible-editor: EZKX ust → master", "EZK", "ust"), "
     assert(g7.newerAlertId === null, "group: a malformed newer alert does not supersede a valid report");
     assert(junk && junk.newerAlertId === null && snapshotStatus({ alert: junk.anchor, book: "EZK", resource: "ust", newerAlertId: null, generation: { generation: "g7" }, detectedAt: [1792820390] }) === "snapshot_generation_mismatch", "group: the malformed alert's own group fails the snapshot tie");
   }
+}
+
+// --- #1419: reimport base when the previous export is not our render -----
+{
+  const s = (c) => c.repeat(40);
+  // Newest first: tonight's export, the reimported human commit, an older
+  // human commit, our previous export.
+  const commits = [{ sha: s("e") }, { sha: s("1") }, { sha: s("2") }, { sha: s("9") }];
+  const pick = { exportSha: s("e"), prevExportSha: s("9"), masterSha: s("1") };
+  assert(importBaseSha(commits, pick, s("1")) === s("1"), "import base: the reimported commit between prev export and tonight's -> used");
+  assert(importBaseSha(commits, pick, s("2")) === s("2"), "import base: an older commit still after prev export -> used");
+  assert(importBaseSha(commits, pick, s("9")) === null, "import base: equal to the previous export -> not used");
+  assert(importBaseSha(commits, pick, s("e")) === null, "import base: equal to tonight's export -> not used");
+  assert(importBaseSha(commits, pick, s("7")) === null, "import base: not in the walked history -> not used");
+  assert(importBaseSha(commits, pick, null) === null, "import base: no reimport sha (origin not reimport) -> not used");
+  assert(importBaseSha(commits, pick, "1111111") === null, "import base: a short sha is refused");
+  assert(importBaseSha([...commits].reverse(), pick, s("1")) === null, "import base: decided by list position (after the previous export) -> not used");
+
+  const verdict = { falseRefs: ["1:2", "1:3"], realRefs: ["1:4"], unknownRefs: ["1:5"] };
+  const r = restrictFalseToProbablyOurs(verdict, new Set(["1:2"]));
+  assert(
+    same(r.falseRefs, ["1:2"]) && same(r.realRefs, ["1:4"]) && same(r.unknownRefs, ["1:5", "1:3"]),
+    "import base: a ref the export kept loud is never called false, only unknown",
+  );
+  const none = restrictFalseToProbablyOurs(verdict, new Set());
+  assert(none.falseRefs.length === 0 && same(none.unknownRefs, ["1:5", "1:2", "1:3"]), "import base: no probably-ours labels -> nothing called false");
 }
 
 console.log("watchdogExportRevertCheck: all passed");

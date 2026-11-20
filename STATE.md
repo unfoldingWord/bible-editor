@@ -974,6 +974,17 @@ Highlights that bite repeatedly:
   the client moves each suggestion to its x-ref verse (`regroupTwlSuggestionsByXref`, #1432) with the same run
   picker the resolver uses; the route and the client count occurrences differently (`Solomon's` is its own span
   on the route, `Solomon` + `s` tokens on the client), so a run can still land on the wrong word, bridge or not.
+- **The TSV revert report's quiet path reads the reimport's edit_log payload shape (#1419).** When
+  `book_resource_syncs` says origin `reimport` with `source_sha` equal to the master commit the export diffs
+  against, a tn/tq/twl row is labelled probably ours if its latest edit_log write at or before `synced_at` is a
+  full `ParsedTsvRow` payload (`refRaw` plus every content field) equal to master's row
+  (`partitionTsvRevertEntriesByImport`). `revertImportPayloadShape.test.mjs` drives the real parser and
+  `applyTsvRows` to pin that shape: a reimport writer that stops logging `refRaw` or a content field silently
+  sends every row back to the loud export_revert alert. Partial payloads (3-way adoptions log only
+  `merge.writeFields`, review-flag writes) and tq/twl entries older than the edit_log retention window (the
+  sweep keeps the `create`, deletes later updates) are deliberately no evidence. This is a "has master moved
+  since the import" question, so `source_sha` is the right bound here, unlike the "since the ancestor" walks
+  above. USFM (ULT/UST) has the same false alarm and is not covered (#1439).
 
 ## Stop conditions / goals
 

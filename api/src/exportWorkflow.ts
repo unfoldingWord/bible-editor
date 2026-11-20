@@ -47,6 +47,10 @@ import {
   tsvRevertReport,
   partitionRevertEntriesByLineage,
   planRevertReportAlerts,
+  importedHeadUnusableReason,
+  loadPreImportTsvRows,
+  partitionTsvRevertEntriesByImport,
+  type ImportedHeadSync,
   type StoredMasterLineage,
   shouldRecordRevertReport,
   shouldComputeRevertEntries,
@@ -1662,11 +1666,16 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // touched and rows that are most likely ours
       // (partitionRevertEntriesByLineage). Null keeps every row in attention.
       let storedLineage: StoredMasterLineage | null = null;
+      // #1419: the sync watermark, so the TSV revert report can tell that D1
+      // imported the master commit it diffs against
+      // (partitionTsvRevertEntriesByImport). Null keeps every row in attention.
+      let importedSync: ImportedHeadSync | null = null;
       try {
         const prior = await this.env.DB.prepare(
           `SELECT pushed_blob_sha, pushed_r2_key, prev_pushed_blob_sha, prev_pushed_r2_key,
                   unconfirmed_renders_json, master_confirmed_edit_id, master_confirmed_at,
-                  master_lineage_json, master_lineage_sha, master_lineage_confirmed_at
+                  master_lineage_json, master_lineage_sha, master_lineage_confirmed_at,
+                  source_sha, origin, synced_at
              FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
         )
           .bind(book, resource)
@@ -1681,7 +1690,13 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             master_lineage_json: string | null;
             master_lineage_sha: string | null;
             master_lineage_confirmed_at: number | null;
+            source_sha: string | null;
+            origin: string | null;
+            synced_at: number | null;
           }>();
+        importedSync = prior
+          ? { sourceSha: prior.source_sha ?? null, origin: prior.origin ?? null, syncedAt: prior.synced_at ?? null }
+          : null;
         priorConfirmed = {
           editId: prior?.master_confirmed_edit_id ?? null,
           at: prior?.master_confirmed_at ?? null,
@@ -1967,7 +1982,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             });
           }
         }
-        const report = partitionByLineage(
+        const lineageReport = partitionByLineage(
           "tsv",
           computeEntries
             ? tsvRevertReport(
@@ -1979,6 +1994,60 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
               ).entries
             : [],
         );
+        // #1419: when D1's last sync imported the very master commit this
+        // report diffs against, a row D1 held exactly as master has it at that
+        // import was changed in Bible Editor afterwards: label it probably
+        // ours. See partitionTsvRevertEntriesByImport. Any failure keeps
+        // every row in attention.
+        let report: {
+          attention: Array<UsfmRevertEntry | TsvRevertEntry>;
+          probablyOurs: Array<UsfmRevertEntry | TsvRevertEntry>;
+          importedHead?: { importedSha: string; rows: ReadonlyArray<UsfmRevertEntry | TsvRevertEntry> };
+        } = lineageReport;
+        const importReason = importedHeadUnusableReason(importedSync, fresh.masterSha);
+        if (lineageReport.attention.length > 0) {
+          if (importReason !== "") {
+            console.log("export: revert report import partition skipped", { book, resource, reason: importReason });
+          } else {
+            try {
+              const attention = lineageReport.attention as TsvRevertEntry[];
+              const preImport = await loadPreImportTsvRows(
+                this.env.DB,
+                resource as "tn" | "tq" | "twl",
+                book,
+                attention.flatMap((e) => (typeof e.id === "string" ? [e.id] : [])),
+                importedSync!.syncedAt as number,
+              );
+              const split = partitionTsvRevertEntriesByImport(
+                attention,
+                resource as "tn" | "tq" | "twl",
+                tsvMasterContentForRevertReport as string,
+                preImport,
+              );
+              console.log("export: revert report import partition", {
+                book,
+                resource,
+                attention: split.attention.length,
+                probablyOurs: split.probablyOurs.length,
+              });
+              if (split.probablyOurs.length > 0) {
+                report = {
+                  attention: split.attention,
+                  probablyOurs: [...lineageReport.probablyOurs, ...split.probablyOurs],
+                  // Only these rows are worded with the import evidence; any
+                  // lineage-labelled rows keep their own reason in the record.
+                  importedHead: { importedSha: importedSync!.sourceSha as string, rows: split.probablyOurs },
+                };
+              }
+            } catch (e) {
+              console.error("export: revert report import partition failed; every row stays in attention", {
+                book,
+                resource,
+                error: e instanceof Error ? e.message : String(e),
+              });
+            }
+          }
+        }
         await this.recordExportRevertReport(book, resource, "tsv", report, mechanical, branch, instanceId, alertObservedAt);
       }
 
@@ -3510,6 +3579,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     report: {
       attention: Array<UsfmRevertEntry | TsvRevertEntry>;
       probablyOurs: Array<UsfmRevertEntry | TsvRevertEntry>;
+      // #1419: the probablyOurs rows the imported-head partition labelled
+      // (the rest are lineage-labelled); planRevertReportAlerts words each
+      // group with its own reason.
+      importedHead?: { importedSha: string; rows: ReadonlyArray<UsfmRevertEntry | TsvRevertEntry> };
     },
     mechanical: boolean,
     branch: string,
@@ -3567,6 +3640,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       mechanical,
       branch,
       generation,
+      importedHead: report.importedHead,
     });
     for (const a of alerts) {
       await this.writeAlert(
