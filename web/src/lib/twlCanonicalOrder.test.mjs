@@ -21,6 +21,10 @@ import {
   twlSortPosition,
   twlAnchorContext,
 } from "./twlCanonicalOrder.ts";
+import usfm from "usfm-js";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -680,6 +684,109 @@ function ultVerseOccSpans(chapter, verse, spans) {
   // rows were never renumbered must not shuffle at random.
   const rows = [twl("x", "א", 1, null), twl("y", "ב", 1, null), twl("z", "ג", 1, null)];
   assert(ids(manualTwlOrder(rows)).join(",") === "x,y,z", "all-null sort_order keeps input order");
+}
+
+// --- a bridged ULT row with x-ref (#1437) -----------------------------------
+// Real Door43 2CH 9:10-12 (the UST bridge stands in for a bridged ULT, as in
+// twlResolve.test.mjs). tCore counts x-occurrence per source verse and names it
+// in x-ref, so אֶת is 1/1 in 9:12 ("many things in Jerusalem", English 5-8) AND
+// 1/1 in 9:11 ("that wood … it", English 74-75, 91); the English reads 9:12,
+// 9:10, 9:11. A 9:11 link must sort by 9:11's copy, not 9:12's.
+{
+  console.log("\n[x-ref] bridged ULT: a verse's links sort by that verse's copy of a word");
+  const here = dirname(fileURLToPath(import.meta.url));
+  const ustRaw = readFileSync(resolve(here, "../../../docs/samples/en_ust_14-2CH-9_10-12.usfm"), "utf8");
+  const bridge = usfm.toJSON(ustRaw).chapters["9"]["10-12"].verseObjects;
+  const legacy = usfm.toJSON(ustRaw.replace(/ x-ref="[^"]*"/g, "")).chapters["9"]["10-12"].verseObjects;
+  // Milestone contents (outer → inner) above the first English `text` aligned
+  // to `ref`, read from the fixture so the Hebrew is never retyped.
+  const contentsOver = (vo, ref, text) => {
+    let found = null;
+    const walk = (nodes, stack) => {
+      for (const n of nodes ?? []) {
+        if (found || !n || typeof n !== "object") continue;
+        if (n.type === "milestone" && n.tag === "zaln") {
+          walk(n.children, [...stack, n]);
+        } else if (n.type === "word" && n.tag === "w") {
+          if (n.text === text && stack.length > 0 && stack[0].ref === ref) found = stack.map((m) => m.content);
+        } else walk(n.children, stack);
+      }
+    };
+    walk(vo, []);
+    return found;
+  };
+  const et = contentsOver(bridge, "9:11", "that")[0]; // אֶת, also 1/1 in 9:12
+  const king11 = contentsOver(bridge, "9:11", "King")[0]; // הַמֶּלֶךְ, 9:11 only
+  const asher = contentsOver(bridge, "9:10", "When")[1]; // אֲשֶׁר, also 1/1 in 9:12
+  const hiram = contentsOver(bridge, "9:10", "Hiram")[0];
+  const pos = (orig, ref, vo = bridge) => twlSortPosition({ orig_words: orig, occurrence: 1 }, buildUltSequenceMap(vo, ref));
+
+  // "that wood": "that" is skipped as a function word (tier 2).
+  assert(pos(et, "9:11") === 75, `9:11's אֶת sorts at its own "wood" (75), got ${pos(et, "9:11")}`);
+  assert(pos(et, "9:12") === 5, `9:12's אֶת sorts at its own "many" (5), got ${pos(et, "9:12")}`);
+  // "When … took": "When" is skipped as a function word (tier 2).
+  assert(pos(asher, "9:10") === 50, `9:10's אֲשֶׁר sorts at its own "took" (50), got ${pos(asher, "9:10")}`);
+  // "He gave her more than": "He" is skipped as a function word (tier 2).
+  assert(pos(asher, "9:12") === 21, `9:12's אֲשֶׁר sorts at its own "gave" (21), got ${pos(asher, "9:12")}`);
+  assert(pos(hiram, "9:11") === null, "a 9:10 word does not resolve when ordering 9:11");
+
+  // The order a translator sees: 9:11 reads "King Solomon … that wood", so the
+  // king link comes first even though its stored sort_order says otherwise.
+  const rows11 = [twl("et", et, 1, 100), twl("king", king11, 1, 200)];
+  assert(
+    ids(canonicalTwlOrder(rows11, bridge, null, "9:11")).join(",") === "king,et",
+    `9:11 links follow 9:11's English: king, et (got ${ids(canonicalTwlOrder(rows11, bridge, null, "9:11")).join(",")})`,
+  );
+  assert(
+    ids(twlDisplayOrder(rows11, bridge, null, false, "9:11")).join(",") === "king,et",
+    "twlDisplayOrder passes the verse through",
+  );
+  assert(
+    ids(twlDisplayOrder(rows11, bridge, null, true, "9:11")).join(",") === "et,king",
+    "a locked verse still shows the human's order",
+  );
+  // The issue's own case: a 9:12 link for a word that also occurs in 9:10. The
+  // bare position matches either way (9:12 reads first), so it only shows when
+  // the TW headword ("take") picks 9:10's "took" (50) out of the merged span:
+  // the link then sorted after 9:12's king ("him", 29) instead of before it.
+  const king12 = contentsOver(bridge, "9:12", "him")[0];
+  const takeLink = "rc://en/tw/dict/bible/other/take";
+  const titles = new Map([[takeLink, "take"]]);
+  const rows12 = [twl("king", king12, 1, 100), twl("asher", asher, 1, 200, takeLink)];
+  assert(
+    ids(canonicalTwlOrder(rows12, bridge, titles, "9:12")).join(",") === "asher,king",
+    `9:12 link sorts by its 9:12 position, not 9:10's "took": asher, king (got ${ids(canonicalTwlOrder(rows12, bridge, titles, "9:12")).join(",")})`,
+  );
+  // 9:10 reads "King Hiram's sailors took …": Hiram (46) before אֲשֶׁר (50).
+  const rows10 = [twl("asher", asher, 1, 100), twl("hiram", hiram, 1, 200)];
+  assert(
+    ids(canonicalTwlOrder(rows10, bridge, null, "9:10")).join(",") === "hiram,asher",
+    `9:10 links follow 9:10's English: hiram, asher (got ${ids(canonicalTwlOrder(rows10, bridge, null, "9:10")).join(",")})`,
+  );
+
+  // Without x-ref (the older whole-bridge convention) the verse changes nothing.
+  const flat = (m) => JSON.stringify([...m]);
+  assert(
+    flat(buildUltSequenceMap(legacy, "9:11")) === flat(buildUltSequenceMap(legacy)),
+    "a bridge without x-ref builds the same map with or without the verse",
+  );
+  assert(
+    flat(buildUltSequenceMap(bridge)) !== flat(buildUltSequenceMap(bridge, "9:11")),
+    "no verse given: the whole x-ref'd bridge is used, as before",
+  );
+}
+
+{
+  console.log("\n[x-ref] an ordinary verse ignores the verse argument");
+  const vo = ultVerseObjects([
+    { content: "א", text: "alpha" },
+    { content: "ב", text: "beta" },
+  ]);
+  const rows = [twl("b", "ב", 1, 100), twl("a", "א", 1, 200)];
+  assert(
+    ids(canonicalTwlOrder(rows, vo, null, "1:1")).join(",") === ids(canonicalTwlOrder(rows, vo, null)).join(","),
+    "milestones without x-ref order the same with a verse given",
+  );
 }
 
 if (failed > 0) {
