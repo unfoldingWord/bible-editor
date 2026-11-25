@@ -3553,6 +3553,109 @@ console.log("\n[locked book: Door43 master is authoritative, and a resolved flag
   eq(threw, true, "a failed lock read throws (the Workflow step retries)");
 }
 
+console.log("\n[issue #1472: a data-repair restore_master_verse row is the locked book's base]");
+{
+  // A data repair restored the verse to master's text (v6) and logged
+  // `restore_master_verse` with no content. That row was invisible to the
+  // ancestor read, so the older human `update` (v5) became the base, ours !=
+  // base, and a later Door43 change raised a false both_changed alert.
+  const KEY = (ch) => `${BOOK}/${ch}/1/${VERSION}`;
+  function seedRepaired(sqlite, ch, { locked = true, version = 6 } = {}) {
+    sqlite.prepare(`INSERT OR IGNORE INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
+    sqlite.prepare(`INSERT OR REPLACE INTO book_locks (book, locked, set_at, set_by) VALUES (?, ?, 100, 1)`).run(BOOK, locked ? 1 : 0);
+    sqlite
+      .prepare(
+        `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+         VALUES (?, ?, 1, NULL, ?, ?, ?, ?, 1)`,
+      )
+      .run(BOOK, ch, VERSION, contentJson("the repaired master text"), "the repaired master text", version);
+    sqlite
+      .prepare(
+        `INSERT INTO edit_log (id, kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+         VALUES (?, 'verse', ?, ?, 1, 4, 5, 'update', ?, 500)`,
+      )
+      .run(ch * 100 + 10, KEY(ch), BOOK, JSON.stringify({ content: JSON.parse(contentJson("the old human text")) }));
+    sqlite
+      .prepare(
+        `INSERT INTO edit_log (id, kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at, source)
+         VALUES (?, 'verse', ?, ?, NULL, 5, 6, 'restore_master_verse', ?, 600, 'data_repair')`,
+      )
+      .run(ch * 100 + 11, KEY(ch), BOOK, JSON.stringify({ incident: "test", sourceCommit: "abc", chapter: ch, verse: 1, from: 5, to: 6 }));
+  }
+  const conflictsFor = (sqlite, ch) =>
+    sqlite.prepare("SELECT action, reason FROM verse_merge_conflicts WHERE book = ? AND chapter = ?").all(BOOK, ch);
+  const alertableFor = (sqlite, ch) =>
+    sqlite.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(BOOK, "ult").filter((r) => r.chapter === ch);
+
+  {
+    // Main case: the repair row is the newest at/below the watermark and D1
+    // still holds its version, so D1 is master's text: a clean adopt.
+    const { env, sqlite } = freshEnv();
+    seedRepaired(sqlite, 7);
+    const counts = await applyVerseRowsForTest(
+      env, BOOK, VERSION, [verse(7, 1, "a Door43 rewording")], null,
+      { confirmedAt: 1000, editId: 7 * 100 + 20 }, false,
+    );
+    eq(counts.merge_adopted, 1, "#1472: master's rewording is adopted");
+    eq(conflictsFor(sqlite, 7).map((r) => [r.action, r.reason]), [["adopt", "book_locked"]], "#1472: adopt/book_locked, not adopt_conflict");
+    eq(alertableFor(sqlite, 7).length, 0, "#1472: no false alert");
+  }
+
+  {
+    // The confirmed render, when one exists for the verse, is the base ahead of
+    // D1's content. Here it differs from D1, so the outcome shows it was used.
+    const { env, sqlite } = freshEnv();
+    seedRepaired(sqlite, 8);
+    await applyVerseRowsForTest(
+      env, BOOK, VERSION, [verse(8, 1, "a Door43 rewording")], null,
+      { confirmedAt: 1000, editId: 8 * 100 + 20, confirmedVerseBases: new Map([["8:1", contentJson("a different confirmed render")]]) },
+      false,
+    );
+    eq(conflictsFor(sqlite, 8).map((r) => r.action), ["adopt_conflict"], "#1472: the confirmed render is preferred as the base");
+  }
+
+  {
+    // Control: a human update above the watermark still alerts.
+    const { env, sqlite } = freshEnv();
+    seedRepaired(sqlite, 9, { version: 7 });
+    sqlite.prepare(`UPDATE verses SET content_json = ?, plain_text = 'an app edit' WHERE book = ? AND chapter = 9`).run(contentJson("an app edit"), BOOK);
+    sqlite
+      .prepare(
+        `INSERT INTO edit_log (id, kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+         VALUES (?, 'verse', ?, ?, 1, 6, 7, 'update', ?, 1500)`,
+      )
+      .run(9 * 100 + 21, KEY(9), BOOK, JSON.stringify({ content: JSON.parse(contentJson("an app edit")) }));
+    await applyVerseRowsForTest(
+      env, BOOK, VERSION, [verse(9, 1, "a Door43 rewording")], null,
+      { confirmedAt: 1000, editId: 9 * 100 + 20 }, false,
+    );
+    eq(alertableFor(sqlite, 9).map((r) => r.action), ["adopt_conflict"], "#1472 control: a later human edit still alerts");
+  }
+
+  {
+    // Control: D1 moved since the repair (version 7, no logged row) — the
+    // repair no longer proves D1 holds master's text, so the old base stands.
+    const { env, sqlite } = freshEnv();
+    seedRepaired(sqlite, 10, { version: 7 });
+    await applyVerseRowsForTest(
+      env, BOOK, VERSION, [verse(10, 1, "a Door43 rewording")], null,
+      { confirmedAt: 1000, editId: 10 * 100 + 20 }, false,
+    );
+    eq(conflictsFor(sqlite, 10).map((r) => [r.action, r.reason]), [["adopt_conflict", "both_changed_wording"]], "#1472 control: version moved since repair keeps the old base");
+  }
+
+  {
+    // Control: an unlocked book is deliberately unchanged by #1472.
+    const { env, sqlite } = freshEnv();
+    seedRepaired(sqlite, 11, { locked: false });
+    await applyVerseRowsForTest(
+      env, BOOK, VERSION, [verse(11, 1, "a Door43 rewording")], null,
+      { confirmedAt: 1000, editId: 11 * 100 + 20 }, false,
+    );
+    eq(conflictsFor(sqlite, 11).map((r) => [r.action, r.reason]), [["adopt_conflict", "both_changed_wording"]], "#1472 control: unlocked outcome unchanged");
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
