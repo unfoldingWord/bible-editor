@@ -6766,9 +6766,32 @@ interface ExistingVerseRow {
   latest_source: string | null;
   base_payload?: string | null;
   base_row_exists?: number | null;
+  restore_master_version?: number | null;
   human_edit_after_export?: number | null;
   structural_edit_id?: number | null;
   structural_edit_at?: number | null;
+}
+
+// Issue #1472: the merge base for a verse a historical data repair set to
+// master's text. scripts/restore-master-verses.mjs (before #822/#823) logged
+// that as `restore_master_verse` with no content, and only after its
+// version-checked write landed, so when that row is the newest content-or-repair
+// row at/below the boundary and its new_version still equals the verse's
+// version, D1 holds master's text as of the repair. The base is then the
+// confirmed render for the verse when one exists, else D1's own content.
+// Locked books only (master-authoritative); an unlocked book keeps the older
+// logged ancestor, which leaves the #540 keep_ai_master policy untouched.
+// Returns null when the case does not apply, so callers fall back as before.
+function repairedToMasterBase(
+  row: ExistingVerseRow,
+  bookLocked: boolean,
+  confirmedBases: Map<string, string> | null | undefined,
+  chapter: number,
+  verse: number,
+): string | null {
+  if (!bookLocked || row.restore_master_version == null) return null;
+  if (Number(row.restore_master_version) !== Number(row.version)) return null;
+  return confirmedBases?.get(`${chapter}:${verse}`) ?? row.content_json;
 }
 
 // Issue #728: the anchor row of a structural adoption, with the content the
@@ -7072,6 +7095,19 @@ export function existingVerseRowsSql(
                    OR (action = 'baseline' AND created_at < ?${baselineBoundaryParam})
                  )
             ) AS base_row_exists,
+            -- Issue #1472: new_version of the newest content-or-repair row
+            -- at/below the boundary when that row is a data repair's
+            -- 'restore_master_verse' (payload carries no content), else NULL.
+            -- See repairedToMasterBase. One action IN arm, no OR: no
+            -- MULTI-INDEX OR to fear, and the hint keeps it on edit_log_row.
+            (SELECT CASE WHEN action = 'restore_master_verse' THEN new_version END
+               FROM edit_log INDEXED BY edit_log_row
+               WHERE kind = 'verse'
+                 AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
+                 AND (book = ?1 OR book IS NULL)
+                 AND action IN ('create', 'update', 'bridge', 'split', 'restore_master_verse')
+                 AND ${baseBoundary}
+               ORDER BY created_at DESC, id DESC LIMIT 1) AS restore_master_version,
             EXISTS (
               SELECT 1 FROM edit_log
                WHERE kind = 'verse'
@@ -7431,7 +7467,9 @@ async function applyVerseRows(
           const renderedAncestor = Number(same.base_row_exists ?? 0) === 0
             ? cutoff?.confirmedVerseBases?.get(`${kl.chapter}:${m.verse}`) ?? null
             : null;
-          const ancestor = loggedAncestor ?? renderedAncestor;
+          const ancestor =
+            repairedToMasterBase(same, bookLocked, cutoff?.confirmedVerseBases, kl.chapter, m.verse) ??
+            loggedAncestor ?? renderedAncestor;
           if (ancestor != null) {
             if (!verseContentConverged(ancestor, m.contentJson)) {
               mergeConflicts.push({
@@ -7636,7 +7674,8 @@ async function applyVerseRows(
           ? cutoff?.confirmedVerseBases?.get(`${v.chapter}:${v.verse}`) ?? null
           : null;
         const merge = computeVerseMerge({
-          base: loggedBase ?? confirmedBase,
+          base: repairedToMasterBase(ex, bookLocked, cutoff?.confirmedVerseBases, v.chapter, v.verse) ??
+            loggedBase ?? confirmedBase,
           ours: ex.content_json,
           theirs: v.contentJson,
           humanEditedSinceExport: Number(ex.human_edit_after_export ?? 0) !== 0,

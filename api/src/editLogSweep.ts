@@ -74,9 +74,13 @@
 //      (`restore`, `restore_master_verse`, `normalize-source-occurrences`,
 //      `normalize-align-order`, `heal-replacement-chars`,
 //      `heal-export-align-loss`, `remove-doubled-q1` — 543 rows corpus-wide
-//      as of 2026-08-20). None of these is wired into the merge as an
-//      ancestor yet — #548's payload-shape review of them is still open —
-//      but exempting them from an irreversible DELETE now is cheap (at most
+//      as of 2026-08-20). Only `restore_master_verse` is read by the merge
+//      (issue #1472, bookReimport.ts `restore_master_version`): on a locked
+//      book, when it is a verse's newest content-or-repair row at/below the
+//      boundary and D1 is still at its new_version, the base becomes the
+//      confirmed render or D1's content (its payload carries none). The
+//      others are not wired in yet — #548's payload-shape review of them is
+//      still open — but exempting them from an irreversible DELETE now is cheap (at most
 //      one row per verse per action present) and preserves the option;
 //      deleting first and reviewing later would not.
 //   7. issue #727/#728 (PR #731 review) — the GLOBAL newest 'bridge'/'split'
